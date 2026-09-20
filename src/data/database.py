@@ -221,6 +221,14 @@ class Database:
                 (transcript, sub_id),
             )
 
+    def clear_transcript(self, sub_id: str):
+        """Discard an unusable ASR result so a later run transcribes again."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE lectures SET transcript = NULL WHERE sub_id = ?",
+                (sub_id,),
+            )
+
     def mark_processed(self, sub_id: str):
         with self._lock, self.conn:
             self.conn.execute(
@@ -441,6 +449,16 @@ class Database:
                 (sub_id,),
             ).fetchone()
         return int(row[0]) if row and row[0] is not None else 0
+
+    def get_ppt_status_counts(self, sub_id: str) -> dict[str, int]:
+        """Return persisted PPT status counts for content-quality checks."""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT ocr_status, COUNT(*) AS count
+                   FROM ppt_pages WHERE sub_id = ? GROUP BY ocr_status""",
+                (sub_id,),
+            ).fetchall()
+        return {str(row["ocr_status"]): int(row["count"]) for row in rows}
 
     def update_summary(self, sub_id: str, summary: str, model: str):
         """Save summary and model name."""

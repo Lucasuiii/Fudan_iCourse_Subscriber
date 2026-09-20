@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from scripts.validate_db import validate_database
+from src.data.database import Database
 from src.data.schema import SCHEMA_SQL
 
 
@@ -38,3 +39,34 @@ class DatabaseSafetyTests(unittest.TestCase):
             conn.close()
             with self.assertRaises(ValueError):
                 validate_database(str(path))
+
+    def test_unusable_transcript_can_be_cleared_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "icourse.db"
+            db = Database(str(path))
+            db.upsert_course("course", "课程", "教师")
+            db.insert_lecture("lecture", "course", "课次", "2026-09-20")
+            db.update_transcript("lecture", "unusable")
+            db.clear_transcript("lecture")
+            self.assertIsNone(db.get_lecture("lecture")["transcript"])
+            db.conn.close()
+
+    def test_ppt_status_counts_include_persisted_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "icourse.db"
+            db = Database(str(path))
+            db.upsert_course("course", "课程", "教师")
+            db.insert_lecture("lecture", "course", "课次", "2026-09-20")
+            with db.conn:
+                db.conn.executemany(
+                    """INSERT INTO ppt_pages
+                       (sub_id, page_num, created_sec, ocr_status)
+                       VALUES ('lecture', ?, ?, ?)""",
+                    [(1, 0, "failed"), (2, 30, "failed"),
+                     (3, 60, "dedup_dropped")],
+                )
+            self.assertEqual(
+                db.get_ppt_status_counts("lecture"),
+                {"failed": 2, "dedup_dropped": 1},
+            )
+            db.conn.close()

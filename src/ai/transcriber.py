@@ -206,6 +206,16 @@ class Transcriber:
         self._last_segments: list[dict] = []
         self._media_duration: Optional[float] = None
 
+    @property
+    def last_audio_duration(self) -> float:
+        """Decoded audio seconds consumed by the most recent ASR pass."""
+        return self._last_duration
+
+    @property
+    def last_media_duration(self) -> Optional[float]:
+        """Container duration parsed for the most recent ASR pass."""
+        return self._media_duration
+
     # ── Model lifecycle ─────────────────────────────────────────────────
 
     def _init(self):

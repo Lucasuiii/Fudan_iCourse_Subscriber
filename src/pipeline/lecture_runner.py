@@ -21,6 +21,7 @@ log greps):
      ``Transcriber.transcribe_tail`` reads PCM from the disk file with
      tail-f semantics while ffmpeg keeps writing.
   E  ``handle.drain()`` submits the deferred OCR jobs and blocks for them.
+  E1 reject consistently empty audio + visual material before the LLM.
   E2 ``PPTPipeline.prefetch_and_ocr`` spawns a background thread that
      collects + dedups + OCRs the next lecture's pages, overlapping with
      this lecture's LLM wait; leftovers are absorbed by the next
@@ -44,6 +45,7 @@ from src.ai import bucketer
 from src.pipeline.ppt_pipeline import PPTPipeline
 from src.ai.transcriber import IncompleteAudioError, NoAudioStreamError
 from src.runtime import config
+from src.runtime.content_quality import assess_content_quality
 from src.runtime.transcript_policy import (
     assess_official_transcript,
     merge_timed_segments,
@@ -76,6 +78,9 @@ class LectureRunner:
         # (``_needs_audio``), keyed by sub_id, so ``_get_transcript`` doesn't
         # re-fetch them one lecture later.
         self._official_cache: dict[str, list[dict]] = {}
+        self._transcript_source = "unknown"
+        self._asr_actual_duration = 0.0
+        self._asr_expected_duration = 0.0
 
     # ── Public entry point ──────────────────────────────────────────────
 
@@ -91,6 +96,9 @@ class LectureRunner:
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
+        self._transcript_source = "unknown"
+        self._asr_actual_duration = 0.0
+        self._asr_expected_duration = 0.0
         self._reporter.lecture_start(course_title, sub_title, date)
 
         existing = self._db.get_lecture(sub_id)
@@ -136,7 +144,59 @@ class LectureRunner:
 
         # ── Phase E — drain remaining OCR work ─────────────────────────
         ppt_stats = ppt_handle.drain()
-        _ = ppt_stats  # stats are emitted by PPTAsyncHandle.drain via reporter
+
+        # ── Phase E1 — reject empty/uncertain material before the LLM ───
+        # A complete long recording with almost no speech and no useful PPT
+        # is terminal "No Content" (for example, the teacher never arrived).
+        # Ambiguous technical cases are retried instead of being summarized.
+        ppt_pages = self._db.get_done_ppt_pages(sub_id)
+        ppt_status_counts = self._db.get_ppt_status_counts(sub_id)
+        ppt_uncertain = (
+            ppt_status_counts.get("failed", 0)
+            + ppt_status_counts.get("pending", 0)
+        )
+        quality = assess_content_quality(
+            transcript=transcript,
+            segments=transcript_segments,
+            ppt_pages=ppt_pages,
+            transcript_source=self._transcript_source,
+            actual_audio_seconds=self._asr_actual_duration,
+            expected_audio_seconds=self._asr_expected_duration,
+            ppt_failed_count=max(ppt_stats.failed, ppt_uncertain),
+        )
+        if quality.action != "summarize":
+            self._reporter.info(
+                "    [Quality] Insufficient lecture material "
+                f"(audio={self._asr_actual_duration / 60:.1f} min, "
+                f"transcript={quality.transcript_chars} chars/"
+                f"{quality.segment_count} segments, "
+                f"PPT={quality.ppt_page_count} usable pages)."
+            )
+            self._release_audio(sub_id)
+            if quality.action == "skip_no_content":
+                self._reporter.info(
+                    "    [SKIP] No effective lecture content detected; "
+                    "summary and email suppressed."
+                )
+                self._db.update_transcript(sub_id, transcript)
+                self._db.mark_processed(sub_id)
+                self._db.clear_error(sub_id)
+            else:
+                self._reporter.info(
+                    "    [RETRY] Material quality is uncertain; will retry."
+                )
+                self._db.clear_transcript(sub_id)
+                self._db.update_error(
+                    sub_id,
+                    "content_quality",
+                    "insufficient reliable lecture material",
+                )
+            return None
+
+        # Persist only after the material has passed the gate. This preserves
+        # ASR work across a later LLM failure without allowing a crash between
+        # transcription and quality assessment to bypass the gate next run.
+        self._db.update_transcript(sub_id, transcript)
 
         # ── Phase E2 — kick off next lecture's OCR (runs during LLM) ───
         # Images were prefetched in Phase C; prefetch_and_ocr spawns a
@@ -283,6 +343,7 @@ class LectureRunner:
         step entirely, saving ~5 min of CPU time per lecture.
         """
         if existing and existing.get("transcript"):
+            self._transcript_source = "cached"
             self._reporter.info(
                 f"    Transcript exists "
                 f"({len(existing['transcript'])} chars), "
@@ -315,6 +376,7 @@ class LectureRunner:
                         f"({len(text)} chars, {len(official)} segments)"
                     )
                     self._db.update_transcript(sub_id, text)
+                    self._transcript_source = "official"
                     # The audio may have been prefetched before we knew the
                     # official transcript was usable — stop that download
                     # now instead of letting it run until Phase H.
@@ -362,6 +424,7 @@ class LectureRunner:
             return None, None
 
         try:
+            used_full_local_asr = not (hybrid_intervals and official)
             if hybrid_intervals and official:
                 gap_text, gap_segments = self._transcriber.transcribe_tail_intervals(
                     handle.path, handle.process, handle.stderr_chunks,
@@ -378,6 +441,7 @@ class LectureRunner:
                     transcript, segments = self._transcriber.transcribe_tail(
                         handle.path, handle.process, handle.stderr_chunks,
                     )
+                    used_full_local_asr = True
             else:
                 transcript, segments = self._transcriber.transcribe_tail(
                     handle.path, handle.process, handle.stderr_chunks,
@@ -408,7 +472,14 @@ class LectureRunner:
             self._release_audio(sub_id)
             raise
 
-        self._db.update_transcript(sub_id, transcript)
+        if used_full_local_asr:
+            self._transcript_source = "local_asr"
+            self._asr_actual_duration = self._transcriber.last_audio_duration
+            self._asr_expected_duration = (
+                self._transcriber.last_media_duration or 0.0
+            )
+        else:
+            self._transcript_source = "hybrid"
         return transcript, segments
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,

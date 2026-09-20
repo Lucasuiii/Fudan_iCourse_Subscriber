@@ -379,6 +379,7 @@ class Emailer:
             "no_video": "录播暂不可用",
             "no_audio": "录播没有音轨",
             "transcribe": "语音转写",
+            "content_quality": "授课材料质量",
             "summarize": "摘要生成",
             "pipeline": "课程处理",
         }
