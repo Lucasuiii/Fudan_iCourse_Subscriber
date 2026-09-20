@@ -144,6 +144,23 @@ class EmailDeliveryTests(unittest.TestCase):
         self.assertIn("摘要生成", body)
         self.assertNotIn("secret signed URL", body)
 
+    @patch("src.api.emailer.smtplib.SMTP_SSL", _FakeSMTP)
+    def test_quality_failure_notice_has_readable_stage(self):
+        item = {
+            "course_title": "课程 A",
+            "sub_title": "第 1 讲",
+            "error_stage": "content_quality",
+            "error_count": 3,
+        }
+        self.assertTrue(self._emailer().send_failure_notice([item]))
+        message = email.message_from_string(_FakeSMTP.calls[-1][2])
+        body = "\n".join(
+            part.get_payload(decode=True).decode(part.get_content_charset())
+            for part in message.walk()
+            if part.get_content_type() in {"text/plain", "text/html"}
+        )
+        self.assertIn("授课材料质量", body)
+
 
 if __name__ == "__main__":
     unittest.main()
