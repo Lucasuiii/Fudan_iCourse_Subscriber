@@ -44,6 +44,7 @@
 | `UISPSW` | ✅ | UIS 统一身份认证密码 | `your_password` |
 | `COURSE_IDS` | ✅ | 要监控的课程 ID，多个用英文逗号分隔 | `35472,30251` |
 | `COURSE_SESSION_RULES` | ⬜ | 私密课次白名单；未列出的课程处理全部课次 | `35472=周一第1-2节|周三第6-8节` |
+| `COURSE_SESSION_OVERRIDE_DATES` | ⬜ | 调课/补课日期例外；这些日期临时绕过课次白名单 | `2026-09-20` |
 | `DB_ENCRYPTION_KEY` | ✅ | 独立数据库密钥；用 `openssl rand -hex 32` 生成 | `64位随机十六进制字符串` |
 | `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |
 | `DEEPSEEK_API_KEY` | ⬜ | DeepSeek API Key（推荐） | `sk-xxxxxxxx` |
@@ -99,9 +100,9 @@ URL 的失败摘要。需要重试时运行 `Single Run`，勾选
 
 ![alt text](docs/frontend.png)
 
-本 Fork 保留上游前端代码和部署 workflow，但当前个人部署不启用它：前端会在浏览器
-中保存 UIS 凭证和高权限 GitHub PAT，而且不兼容独立 `DB_ENCRYPTION_KEY`。如需使用，
-应另行完成安全改造后再启用；当前通过邮件接收摘要。
+本 Fork 的 GitHub Pages 前端直接使用独立 `DB_ENCRYPTION_KEY` 解密数据库，不再索取
+或保存 UIS 凭证。PAT 和数据库密钥只保存在当前标签页的 `sessionStorage`，关闭标签页
+后失效。课程页支持按课次导出，以及清除摘要/转录/OCR 后永久忽略该课次。
 
 > [!TIP]
 >
@@ -225,7 +226,7 @@ GitHub Actions 每次在全新容器中运行，无法依赖本地文件系统�
 
 本 Fork 的持久化数据库使用独立 `DB_ENCRYPTION_KEY`，避免数据库加密强度与 UIS
 密码绑定。未配置该 Secret 时仅保留旧版 UIS 派生方式作为兼容回退；新的个人部署
-必须配置独立密钥。由于浏览器前端没有接收该独立密钥的安全方案，本 Fork 不部署它。
+必须配置独立密钥。前端由用户在当前会话中直接输入该密钥，明文不写入持久化存储。
 
 分片的动机是增量传输。数据库约 20MB，通过 GitHub API 完整拉取会显著增加前端加载时间。按课程分组切割为 ~10MB 的 shard，每个独立加密。前端使用 git blob SHA 作为缓存键存储于 IndexedDB，未变化的 shard 自动跳过网络下载、解密、解压。
 
@@ -240,9 +241,9 @@ Schema 迁移：新增列时，旧的 shard 与新的 schema 之间存在列数�
 
 前端是运行在 GitHub Pages 上的纯静态单页应用，无后端服务器。它通过 GitHub raw API 拉取位于 `data` 分支的加密 shard，在浏览器中使用 Web Crypto API 解密，并利用 sql.js（SQLite WebAssembly 编译）在内存中构建数据库。
 
-解密凭证（STUID + UISPSW）通过 PBKDF2 派生密钥，不经过网络传输，在浏览器本地内存中完成解密。
+解密凭证是独立的 `DB_ENCRYPTION_KEY`，不经过网络传输，在浏览器本地内存中完成解密。
 
-订阅编辑器解决了一个特殊的约束：GitHub Actions Secrets API 只支持写入，不支持读取——无法通过 API 获知当前 COURSE_IDS 的值。方案采用三层数据源：数据库 `courses` 表（实际运行过的课程）提供默认订阅状态；localStorage `lastSubscribed` 维护用户前次编辑后的状态；保存时通过 GitHub API 将选择列表写入 `COURSE_IDS` Secret。
+订阅编辑器解决了一个特殊的约束：GitHub Actions Secrets API 只支持写入，不支持读取——无法通过 API 获知当前 COURSE_IDS 的值。数据库 `meta` 中保存最近一次运行使用的订阅列表，前端据此显示当前状态；保存时通过 GitHub API 将完整选择列表写回 `COURSE_IDS` Secret。
 
 ### 技术方法总结
 

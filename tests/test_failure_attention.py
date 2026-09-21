@@ -76,6 +76,81 @@ class FailureAttentionTests(unittest.TestCase):
             conn.close()
             self.assertEqual(row, (1, None, 1))
 
+    def test_suppressed_lecture_is_scrubbed_and_never_requeued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._database(Path(tmp) / "icourse.db")
+            db.update_transcript("lecture-1", "private transcript")
+            db.update_summary("lecture-1", "private summary", "test-model")
+            db.conn.execute(
+                """INSERT INTO ppt_pages
+                   (sub_id, page_num, created_sec, text, ocr_status)
+                   VALUES ('lecture-1', 1, 0, 'private OCR', 'done')"""
+            )
+            db.conn.commit()
+
+            self.assertEqual(
+                db.suppress_lectures("course-1", ["lecture-1"]), 1
+            )
+            row = db.get_lecture("lecture-1")
+            self.assertIsNotNone(row["deleted_at"])
+            self.assertIsNone(row["summary"])
+            self.assertIsNone(row["transcript"])
+            self.assertEqual(db.count_total_ppt_pages("lecture-1"), 0)
+            self.assertEqual(db.get_unprocessed_lectures("course-1"), [])
+            self.assertIn("lecture-1", db.get_processed_sub_ids("course-1"))
+            db.conn.close()
+
+    def test_suppression_wins_over_stale_summary_during_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote_path = Path(tmp) / "remote.db"
+            local_path = Path(tmp) / "local.db"
+            remote = self._database(remote_path)
+            remote.update_transcript("lecture-1", "old transcript")
+            remote.update_summary("lecture-1", "old summary", "old-model")
+            remote.mark_processed("lecture-1")
+            remote.conn.close()
+            shutil.copyfile(remote_path, local_path)
+
+            local = Database(str(local_path))
+            local.suppress_lectures("course-1", ["lecture-1"])
+            local.conn.close()
+            merge(str(local_path), str(remote_path))
+
+            conn = sqlite3.connect(remote_path)
+            row = conn.execute(
+                """SELECT summary, transcript, summary_model, emailed_at,
+                          deleted_at
+                   FROM lectures WHERE sub_id = 'lecture-1'"""
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[:4], (None, None, None, None))
+            self.assertIsNotNone(row[4])
+
+    def test_remote_suppression_wins_over_stale_local_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote_path = Path(tmp) / "remote.db"
+            local_path = Path(tmp) / "local.db"
+            local = self._database(local_path)
+            local.update_transcript("lecture-1", "stale transcript")
+            local.update_summary("lecture-1", "stale summary", "old-model")
+            local.mark_processed("lecture-1")
+            local.conn.close()
+            shutil.copyfile(local_path, remote_path)
+
+            remote = Database(str(remote_path))
+            remote.suppress_lectures("course-1", ["lecture-1"])
+            remote.conn.close()
+            merge(str(local_path), str(remote_path))
+
+            conn = sqlite3.connect(remote_path)
+            row = conn.execute(
+                """SELECT summary, transcript, summary_model, deleted_at
+                   FROM lectures WHERE sub_id = 'lecture-1'"""
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[:3], (None, None, None))
+            self.assertIsNotNone(row[3])
+
 
 if __name__ == "__main__":
     unittest.main()

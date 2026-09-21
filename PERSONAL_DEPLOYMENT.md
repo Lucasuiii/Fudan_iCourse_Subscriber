@@ -7,9 +7,9 @@
 ## 部署前边界
 
 - 仅处理本人有权访问的课程资料。
-- 当前部署不启用 GitHub Pages；上游前端会在浏览器 `localStorage` 中保存 UIS 密码
-  和 PAT，且尚不兼容独立 `DB_ENCRYPTION_KEY`。
-- 不创建或填写前端所需的高权限 GitHub PAT。
+- GitHub Pages 前端仅在当前标签页的 `sessionStorage` 中保存 PAT 和
+  `DB_ENCRYPTION_KEY`，关闭标签页后失效；不要在公共电脑上使用。
+- 前端 PAT 只授予当前仓库的 Actions/Secrets 读写和 Contents 只读权限。
 - 不公开或转发录播、转录、PPT OCR 与课程摘要。
 - 上游更新不会自动进入本 Fork；合并前应人工审查网络请求和 workflow 变更。
 
@@ -23,6 +23,7 @@
 | `UISPSW` | UIS 密码 |
 | `COURSE_IDS` | 每日订阅课程 ID，多个用英文逗号分隔 |
 | `COURSE_SESSION_RULES` | 可选；每行一门课程的课次白名单，例如 `35472=周一第1-2节|周三第6-8节` |
+| `COURSE_SESSION_OVERRIDE_DATES` | 可选；调课/补课日期例外，逗号分隔，例如 `2026-09-20,2026-10-01` |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key；首次只配置这一个模型服务即可 |
 | `SMTP_EMAIL` | QQ 发件邮箱 |
 | `SMTP_PASSWORD` | QQ 邮箱 SMTP 授权码，不是邮箱登录密码 |
@@ -46,6 +47,10 @@ workflows。先不要运行任何 workflow，等下面的 Secrets 全部配置�
 可播放课次；出现的课程只处理列出的星期和节次。多条规则使用 `|` 分隔，也可填写
 `课程ID=全部`。格式错误时任务会在登录和调用模型前停止，且公开日志不会打印规则
 内容。
+
+若临时调课落在白名单之外，可把实际上课日期加入
+`COURSE_SESSION_OVERRIDE_DATES`。该日期会对所有已配置课程放行；课程处理成功后保留
+这个日期也不会重复生成摘要。
 
 每日任务优先使用完整的 iCourse 官方字幕，并用实际媒体时长检查头尾覆盖。官方字幕
 只有少量超过 20 分钟的缺口时，仅对缺口运行本地 ASR 并按时间轴合并；字幕缺失、
@@ -84,12 +89,9 @@ HTML 预览，并将相同 HTML 渲染为 PDF 附件。PDF 生成失败时会自
 
 ## 可选：导出或删除数据
 
-公开仓库的手动 workflow 文本参数并不适合填写课程 ID。因此：
-
-- `Export Course Summaries` 默认导出 `COURSE_IDS` 中的课程。如需只导出指定课程或
-  课次，临时添加 `EXPORT_COURSE_IDS`、`EXPORT_SUB_IDS` Secrets。
-- `Delete Course Data` 运行前必须临时添加 `DELETE_COURSE_IDS` Secret；如只删指定
-  课次，再添加 `DELETE_SUB_IDS`。确认完成后删除这两个临时 Secrets。
+在前端课程页可按课次导出或删除。课次选择会先写入一次性 GitHub Secret，公开的
+workflow 参数只包含随机请求 ID。删除会清除摘要、转录和 PPT OCR，但保留一个不含
+课程内容的永久忽略标记，因此后续每日任务不会重新生成或补发该课次。
 
 ## 停用
 

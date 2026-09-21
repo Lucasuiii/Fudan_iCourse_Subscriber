@@ -267,6 +267,7 @@ jobs:
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ secrets.COURSE_IDS }}
           COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+          COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
           USE_OFFICIAL_TRANSCRIPT: "1"
           CRAWL_TERM: ${{ secrets.CRAWL_TERM }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}

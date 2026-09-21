@@ -187,7 +187,8 @@ class Database:
         """Return sub_ids that have been fully processed."""
         with self._lock:
             rows = self.conn.execute(
-                "SELECT sub_id FROM lectures WHERE course_id = ? AND processed_at IS NOT NULL",
+                "SELECT sub_id FROM lectures WHERE course_id = ? "
+                "AND (processed_at IS NOT NULL OR deleted_at IS NOT NULL)",
                 (course_id,),
             ).fetchall()
         return {row["sub_id"] for row in rows}
@@ -204,6 +205,7 @@ class Database:
         query = (
             "SELECT * FROM lectures"
             " WHERE processed_at IS NULL"
+            "   AND deleted_at IS NULL"
             "   AND (error_count IS NULL OR error_count < ?)"
         )
         params: tuple = (max_errors,)
@@ -285,6 +287,7 @@ class Database:
             "SELECT l.*, c.title AS course_title, c.teacher "
             "FROM lectures l JOIN courses c ON l.course_id = c.course_id "
             "WHERE l.processed_at IS NULL "
+            "AND l.deleted_at IS NULL "
             "AND COALESCE(l.error_count, 0) >= ?"
         )
         params: list[object] = [max_errors]
@@ -332,6 +335,41 @@ class Database:
                       AND COALESCE(error_count, 0) >= 3
                       AND sub_id IN ({placeholders})""",
                 [str(sub_id) for sub_id in sub_ids],
+            )
+        return cur.rowcount or 0
+
+    def suppress_lectures(self, course_id: str, sub_ids: list[str]) -> int:
+        """Erase selected lecture content and keep persistent tombstones.
+
+        Keeping the row (with ``deleted_at`` set) prevents the next catalog
+        sync from treating the same iCourse sub_id as a brand-new lecture.
+        """
+        ids = list(dict.fromkeys(str(sub_id) for sub_id in sub_ids if sub_id))
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now().isoformat()
+        with self._lock, self.conn:
+            found = self.conn.execute(
+                f"""SELECT COUNT(*) FROM lectures
+                    WHERE course_id = ? AND sub_id IN ({placeholders})""",
+                [str(course_id), *ids],
+            ).fetchone()[0]
+            if found != len(ids):
+                raise ValueError("one or more selected lectures do not exist")
+            self.conn.execute(
+                f"DELETE FROM ppt_pages WHERE sub_id IN ({placeholders})",
+                ids,
+            )
+            cur = self.conn.execute(
+                f"""UPDATE lectures SET
+                        transcript = NULL, summary = NULL,
+                        summary_model = NULL, emailed_at = NULL,
+                        error_msg = NULL, error_count = 0,
+                        error_stage = NULL, failure_notified_at = NULL,
+                        processed_at = ?, deleted_at = ?
+                    WHERE course_id = ? AND sub_id IN ({placeholders})""",
+                [now, now, str(course_id), *ids],
             )
         return cur.rowcount or 0
 
@@ -466,7 +504,7 @@ class Database:
             self.conn.execute(
                 """UPDATE lectures
                    SET summary = ?, summary_model = ?
-                   WHERE sub_id = ?""",
+                   WHERE sub_id = ? AND deleted_at IS NULL""",
                 (summary, model, sub_id),
             )
 
@@ -486,6 +524,7 @@ class Database:
                    FROM lectures l
                    JOIN courses c ON l.course_id = c.course_id
                    WHERE l.processed_at IS NOT NULL
+                     AND l.deleted_at IS NULL
                      AND l.emailed_at IS NULL
                      AND l.summary IS NOT NULL""",
             ).fetchall()
