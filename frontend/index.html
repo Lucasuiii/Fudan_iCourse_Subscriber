@@ -211,7 +211,7 @@
         </label>
         <input x-model="setup.token" type="password" placeholder="github_pat_..."
                class="w-full border rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-300 focus:outline-none">
-        <p class="text-xs text-gray-400 mt-1">Scope: this repo only, Contents: Read and Write</p>
+        <p class="text-xs text-gray-400 mt-1">Scope: this repo only; Contents, Actions, and Secrets: Read and Write</p>
       </div>
 
       <!-- 4 Secrets -->
@@ -722,7 +722,7 @@
           </button>
         </div>
         <p class="text-xs text-gray-400 mt-1">
-          单次运行会触发 workflow 处理选中课程，结果发送到 RECEIVER_EMAIL。
+          单次运行会触发 workflow 处理选中课程，结果发送到已配置的收件人。
           保存需要 GitHub PAT 具备 <strong>Secrets: Read and write</strong> 权限。
         </p>
       </div>
@@ -878,7 +878,7 @@
 
     <div class="px-4 py-2 bg-blue-50 border-t border-blue-100 text-xs text-blue-800 leading-relaxed space-y-1">
       <p>[MD] <strong>复制 Markdown</strong>：导出所选课次的摘要到剪贴板，纯浏览器端操作，无需网络。</p>
-      <p>[PDF] <strong>触发后台导出</strong>：通过 GitHub Actions 生成 PDF，发送到 RECEIVER_EMAIL。预计 1-3 分钟。</p>
+      <p>[PDF] <strong>触发后台导出</strong>：通过 GitHub Actions 生成 PDF，发送到已配置的收件人。预计 1-3 分钟。</p>
     </div>
 
     <div class="px-4 py-3 border-t border-gray-100 flex justify-end gap-2">

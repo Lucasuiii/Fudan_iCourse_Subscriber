@@ -492,7 +492,7 @@ document.addEventListener("alpine:init", () => {
     async exportSelectedToPdf() {
       // Triggers .github/workflows/export.yml via workflow_dispatch.  The
       // workflow runs scripts/export_course.py (WeasyPrint) and emails the
-      // PDF to RECEIVER_EMAIL — same output and same code path as a manual
+      // PDF to the configured receiver list — same output and same code path as a manual
       // run from the Actions UI.  We dropped the in-browser html2pdf.js
       // approach because the screenshot-based pipeline produced blank PDFs
       // unreliably; routing through Actions reuses the working tech stack.
@@ -518,7 +518,7 @@ document.addEventListener("alpine:init", () => {
         );
         this.exportDialogOpen = false;
         this._toast(
-          "已触发后台导出，PDF 将在 1-3 分钟内发送到 RECEIVER_EMAIL",
+          "已触发后台导出，PDF 将在 1-3 分钟内发送到已配置的收件人",
           "success"
         );
       } catch (e) {
@@ -983,10 +983,9 @@ document.addEventListener("alpine:init", () => {
       this.singleRunTriggering = true;
       this.subsError = "";
       try {
-        // Fire single_run.yml directly with course_ids as input. This
-        // keeps the persisted COURSE_IDS secret (used by daily check)
-        // untouched, and uses the dedicated single-run workflow rather
-        // than overloading the scheduled check workflow.
+        // Store the temporary selection in a dedicated encrypted secret, so
+        // the persisted COURSE_IDS subscription remains untouched and course
+        // IDs do not appear in public workflow_dispatch metadata.
         await ICS.github.triggerSingleRunWorkflow(
           this.repoOwner, this.repoName, "main", creds.token,
           this.singleRunIds, this.singleRunUseOfficial,
