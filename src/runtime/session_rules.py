@@ -8,6 +8,7 @@ from datetime import date
 
 SessionRule = tuple[int, int, int]
 SessionRules = dict[str, frozenset[SessionRule] | None]
+SessionOverrideDates = frozenset[date]
 
 _WEEKDAYS = {
     "一": 0,
@@ -82,8 +83,34 @@ def parse_course_session_rules(raw: str) -> SessionRules:
     return parsed
 
 
+def parse_session_override_dates(raw: str) -> SessionOverrideDates:
+    """Parse one-off dates that bypass recurring per-course allowlists.
+
+    This is intended for make-up classes and timetable changes.  Values may
+    be separated by commas, pipes, or newlines.  The value is kept in a
+    separate secret so adding an exception never requires reading or
+    replacing the existing write-only ``COURSE_SESSION_RULES`` secret.
+    """
+    parsed: set[date] = set()
+    tokens = re.split(r"[,|｜\s]+", raw.strip()) if raw.strip() else []
+    for index, token in enumerate(tokens, start=1):
+        match = _DATE_RE.fullmatch(token)
+        if not match:
+            raise SessionRulesError(
+                f"Invalid COURSE_SESSION_OVERRIDE_DATES item {index}"
+            )
+        try:
+            parsed.add(date(*(int(part) for part in match.groups())))
+        except ValueError as exc:
+            raise SessionRulesError(
+                f"Invalid COURSE_SESSION_OVERRIDE_DATES item {index}"
+            ) from exc
+    return frozenset(parsed)
+
+
 def lecture_is_selected(
-    course_id: str, lecture: dict, rules: SessionRules
+    course_id: str, lecture: dict, rules: SessionRules,
+    override_dates: SessionOverrideDates = frozenset(),
 ) -> bool:
     """Return whether a lecture matches its course's configured allowlist.
 
@@ -98,13 +125,18 @@ def lecture_is_selected(
     sub_title = str(lecture.get("sub_title") or "")
     date_text = str(lecture.get("date") or "")
     date_match = _DATE_RE.search(date_text) or _DATE_RE.search(sub_title)
-    period_match = _PERIOD_RE.search(sub_title)
-    if not date_match or not period_match:
+    if not date_match:
         return False
 
     try:
         lecture_date = date(*(int(part) for part in date_match.groups()))
     except ValueError:
+        return False
+    if lecture_date in override_dates:
+        return True
+
+    period_match = _PERIOD_RE.search(sub_title)
+    if not period_match:
         return False
     start = int(period_match.group(1))
     end = int(period_match.group(2) or start)

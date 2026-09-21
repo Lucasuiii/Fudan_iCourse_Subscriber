@@ -210,6 +210,7 @@ jobs:
           PRIVATE_ACTION_REQUEST: ${{ secrets.SINGLE_RUN_REQUEST }}
           REQUEST_ID: ${{ inputs.request_id }}
           COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+          COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
           USE_OFFICIAL_TRANSCRIPT: ${{ inputs.use_official_transcript && '1' || '' }}
           RETRY_ALL_FAILED: ${{ inputs.retry_all_failed && '1' || '' }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}

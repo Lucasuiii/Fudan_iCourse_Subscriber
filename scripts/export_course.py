@@ -215,7 +215,7 @@ def _query_course(db: Database, course_id: str,
     rows = db.conn.execute(
         """SELECT sub_id, sub_title, date, summary
            FROM lectures
-           WHERE course_id = ? AND summary IS NOT NULL
+           WHERE course_id = ? AND summary IS NOT NULL AND deleted_at IS NULL
            ORDER BY CAST(sub_id AS INTEGER) ASC""",
         (course_id,),
     ).fetchall()

@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS lectures (
     error_msg TEXT, error_count INTEGER DEFAULT 0,
     error_stage TEXT, summary_model TEXT,
     failure_notified_at TEXT,
-    retry_generation INTEGER DEFAULT 0
+    retry_generation INTEGER DEFAULT 0,
+    deleted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS ppt_pages (
     sub_id TEXT NOT NULL,

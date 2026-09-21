@@ -1,7 +1,10 @@
 import os
 import re
 
-from src.runtime.session_rules import parse_course_session_rules
+from src.runtime.session_rules import (
+    parse_course_session_rules,
+    parse_session_override_dates,
+)
 
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
@@ -218,6 +221,9 @@ COURSE_IDS = [
 # Courses omitted from the rules keep all playable lectures.
 COURSE_SESSION_RULES = parse_course_session_rules(
     os.environ.get("COURSE_SESSION_RULES", "")
+)
+COURSE_SESSION_OVERRIDE_DATES = parse_session_override_dates(
+    os.environ.get("COURSE_SESSION_OVERRIDE_DATES", "")
 )
 
 # 学期级课程目录爬取（已弃用 — main.py 现在自动发现所有学期）。

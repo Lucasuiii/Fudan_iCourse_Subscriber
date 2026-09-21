@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Merge local DB into remote DB (additive-only).
+"""Merge local DB into remote DB without resurrecting deleted content.
 
 Used at deploy time to safely combine results from concurrent workflow runs.
-For each lecture row, fields only progress forward (null -> non-null).
+For ordinary rows, fields progress forward (null -> non-null).  A persistent
+lecture tombstone wins over stale transcript, summary, and PPT data.
 """
 
 import os
@@ -57,7 +58,7 @@ def _migrate_attached(conn: sqlite3.Connection, schema: str):
 
 
 def merge(local_path: str, remote_path: str):
-    """Merge local changes into remote DB.  Only adds/progresses, never deletes."""
+    """Merge local changes into remote DB; tombstones win over stale data."""
     conn = sqlite3.connect(remote_path)
     _ensure_schema(conn)
     conn.execute("ATTACH DATABASE ? AS local", (local_path,))
@@ -76,10 +77,12 @@ def merge(local_path: str, remote_path: str):
                 INSERT OR IGNORE INTO main.lectures
                     (sub_id, course_id, sub_title, date, transcript, summary,
                      processed_at, emailed_at, error_msg, error_count, error_stage,
-                     summary_model, failure_notified_at, retry_generation)
+                     summary_model, failure_notified_at, retry_generation,
+                     deleted_at)
                 SELECT sub_id, course_id, sub_title, date, transcript, summary,
                        processed_at, emailed_at, error_msg, error_count, error_stage,
-                       summary_model, failure_notified_at, retry_generation
+                       summary_model, failure_notified_at, retry_generation,
+                       deleted_at
                 FROM local.lectures
             """)
 
@@ -88,12 +91,31 @@ def merge(local_path: str, remote_path: str):
             #    - Error fields: clear if processed, otherwise keep the most info
             conn.execute("""
                 UPDATE main.lectures SET
-                    transcript    = COALESCE(l.transcript,    main.lectures.transcript),
-                    summary       = COALESCE(l.summary,       main.lectures.summary),
-                    summary_model = COALESCE(l.summary_model, main.lectures.summary_model),
-                    processed_at  = COALESCE(l.processed_at,  main.lectures.processed_at),
-                    emailed_at    = COALESCE(l.emailed_at,    main.lectures.emailed_at),
+                    deleted_at = COALESCE(l.deleted_at, main.lectures.deleted_at),
+                    transcript = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL ELSE COALESCE(l.transcript, main.lectures.transcript)
+                    END,
+                    summary = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL ELSE COALESCE(l.summary, main.lectures.summary)
+                    END,
+                    summary_model = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL ELSE COALESCE(l.summary_model, main.lectures.summary_model)
+                    END,
+                    processed_at = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN COALESCE(l.deleted_at, main.lectures.deleted_at)
+                        ELSE COALESCE(l.processed_at, main.lectures.processed_at)
+                    END,
+                    emailed_at = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL ELSE COALESCE(l.emailed_at, main.lectures.emailed_at)
+                    END,
                     error_msg = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         WHEN COALESCE(l.retry_generation, 0) >
@@ -105,6 +127,8 @@ def merge(local_path: str, remote_path: str):
                         ELSE COALESCE(l.error_msg, main.lectures.error_msg)
                     END,
                     error_count = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN 0
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN 0
                         WHEN COALESCE(l.retry_generation, 0) >
@@ -116,6 +140,8 @@ def merge(local_path: str, remote_path: str):
                         ELSE MAX(COALESCE(l.error_count, 0), COALESCE(main.lectures.error_count, 0))
                     END,
                     error_stage = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         WHEN COALESCE(l.retry_generation, 0) >
@@ -127,6 +153,8 @@ def merge(local_path: str, remote_path: str):
                         ELSE COALESCE(l.error_stage, main.lectures.error_stage)
                     END,
                     failure_notified_at = CASE
+                        WHEN COALESCE(l.deleted_at, main.lectures.deleted_at) IS NOT NULL
+                        THEN NULL
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         WHEN COALESCE(l.retry_generation, 0) >
@@ -156,6 +184,11 @@ def merge(local_path: str, remote_path: str):
                     (sub_id, page_num, created_sec, pptimgurl, text, ocr_status, ocr_at, dhash)
                 SELECT sub_id, page_num, created_sec, pptimgurl, text, ocr_status, ocr_at, dhash
                 FROM local.ppt_pages
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM main.lectures l
+                    WHERE l.sub_id = local.ppt_pages.sub_id
+                      AND l.deleted_at IS NOT NULL
+                )
             """)
 
             # 6) all_courses (catalog): upsert local rows into remote.  We take

@@ -120,7 +120,8 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                 if not lecture.get("has_playback"):
                     continue
                 if lecture_is_selected(
-                    course_id, lecture, config.COURSE_SESSION_RULES
+                    course_id, lecture, config.COURSE_SESSION_RULES,
+                    config.COURSE_SESSION_OVERRIDE_DATES,
                 ):
                     selected_lectures.append(lecture)
                 else:
@@ -141,7 +142,8 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                 for u in unprocessed
                 if u["sub_id"] not in new_ids
                 and lecture_is_selected(
-                    course_id, u, config.COURSE_SESSION_RULES
+                    course_id, u, config.COURSE_SESSION_RULES,
+                    config.COURSE_SESSION_OVERRIDE_DATES,
                 )
             ]
             new_lectures.extend(retry_only)
@@ -228,7 +230,8 @@ def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
             if (
                 row["sub_id"] not in seen_sub_ids
                 and lecture_is_selected(
-                    row["course_id"], row, config.COURSE_SESSION_RULES
+                    row["course_id"], row, config.COURSE_SESSION_RULES,
+                    config.COURSE_SESSION_OVERRIDE_DATES,
                 )
             ):
                 email_items.append({

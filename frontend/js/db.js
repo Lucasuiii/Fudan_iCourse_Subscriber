@@ -170,7 +170,7 @@ function _getCourses() {
            COUNT(l.sub_id) AS total_count,
            MAX(l.processed_at) AS last_updated
     FROM courses c
-    LEFT JOIN lectures l ON c.course_id = l.course_id
+    LEFT JOIN lectures l ON c.course_id = l.course_id AND l.deleted_at IS NULL
     GROUP BY c.course_id
     ORDER BY last_updated DESC NULLS LAST
   `);
@@ -198,7 +198,7 @@ function _getLectures(courseId) {
   const rows = _queryAll(`
     SELECT sub_id, sub_title, date, summary, processed_at,
            error_stage, error_msg, summary_model, transcript
-    FROM lectures WHERE course_id = ?
+    FROM lectures WHERE course_id = ? AND deleted_at IS NULL
   `, [courseId]);
   // Chronological ascending (earliest first); 第N-M节 breaks intra-day ties so
   // a morning session sorts before an afternoon one. Lectures with no parseable
@@ -225,7 +225,7 @@ function _getLecture(subId) {
   const rows = _queryAll(`
     SELECT l.*, c.title AS course_title, c.teacher
     FROM lectures l JOIN courses c ON l.course_id = c.course_id
-    WHERE l.sub_id = ?
+    WHERE l.sub_id = ? AND l.deleted_at IS NULL
   `, [subId]);
   if (!rows.length) return null;
   rows[0].state = _deriveState(rows[0]);
@@ -285,7 +285,7 @@ function _searchSummaries(query, courseIds, page, pageSize, domains) {
   var params = pptParams.concat(caseParams, textParams);
 
   // WHERE clause with optional course filter
-  var whereClauses = ["(" + textParts.join("\n           OR ") + ")"];
+  var whereClauses = ["l.deleted_at IS NULL", "(" + textParts.join("\n           OR ") + ")"];
   if (courseIds && courseIds.length) {
     var placeholders = courseIds.map(function () { return "?"; }).join(",");
     whereClauses.push("l.course_id IN (" + placeholders + ")");

@@ -587,7 +587,7 @@ document.addEventListener("alpine:init", () => {
           [currentCid], selectedSubIds,
         );
         this.deleteDialogOpen = false;
-        this._toast("已触发删除 workflow，数据将在几分钟内从远端清除", "success");
+        this._toast("已触发删除，内容清除后该课次会被永久忽略", "success");
         setTimeout(() => { this._go("courses"); }, 1500);
       } catch (e) {
         this._toast(e?.message || "删除失败", "error");

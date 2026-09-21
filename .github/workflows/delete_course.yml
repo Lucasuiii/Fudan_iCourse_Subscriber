@@ -75,19 +75,10 @@ jobs:
           for cid in "${CIDS[@]}"; do
             cid=$(echo "$cid" | xargs)
             if [ -n "$SUB_IDS" ]; then
-              echo "Deleting selected lecture data..."
-              IFS=',' read -ra SIDS <<< "$SUB_IDS"
-              for sid in "${SIDS[@]}"; do
-                sid=$(echo "$sid" | xargs)
-                sqlite3 data/icourse.db "DELETE FROM ppt_pages WHERE sub_id='$sid'"
-                sqlite3 data/icourse.db "DELETE FROM lectures WHERE sub_id='$sid'"
-              done
-              remaining=$(sqlite3 data/icourse.db "SELECT COUNT(*) FROM lectures WHERE course_id='$cid'")
-              echo "  $remaining lecture(s) remaining for selected course"
-              if [ "$remaining" -eq 0 ]; then
-                sqlite3 data/icourse.db "DELETE FROM courses WHERE course_id='$cid'"
-                echo "  Empty course record removed"
-              fi
+              echo "Permanently suppressing selected lecture data..."
+              python scripts/suppress_lectures.py data/icourse.db "$cid" "$SUB_IDS"
+              remaining=$(sqlite3 data/icourse.db "SELECT COUNT(*) FROM lectures WHERE course_id='$cid' AND deleted_at IS NULL")
+              echo "  $remaining visible lecture(s) remaining for selected course"
             else
               echo "Deleting selected course data..."
               count=$(sqlite3 data/icourse.db "SELECT COUNT(*) FROM lectures WHERE course_id='$cid'")

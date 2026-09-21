@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS lectures (
     error_stage TEXT, summary_model TEXT,
     failure_notified_at TEXT,
     retry_generation INTEGER DEFAULT 0,
+    deleted_at TEXT,
     FOREIGN KEY (course_id) REFERENCES courses(course_id)
 );
 CREATE TABLE IF NOT EXISTS ppt_pages (
@@ -80,6 +81,7 @@ LECTURES_MIGRATION_COLUMNS: list[tuple[str, str]] = [
     ("summary_model", "TEXT"),
     ("failure_notified_at", "TEXT"),
     ("retry_generation", "INTEGER DEFAULT 0"),
+    ("deleted_at", "TEXT"),
 ]
 
 # Columns added to ``ppt_pages`` after its initial shape shipped.
