@@ -189,28 +189,58 @@ async function _putRepoSecret(owner, repo, token, secretName,
   throw new Error(`GitHub API error ${res.status}: ${body}`);
 }
 
+async function _setRepoSecrets(owner, repo, token, values) {
+  // Encrypt several values with one repository-public-key lookup.  The
+  // plaintext is sent only inside GitHub's sealed-box secret payload and is
+  // never included in workflow_dispatch inputs (which are public run
+  // metadata on a public repository).
+  const sodium = await _ensureSodium();
+  const pub = await _getRepoPublicKey(owner, repo, token);
+  const publicKey = sodium.from_base64(
+    pub.key, sodium.base64_variants.ORIGINAL,
+  );
+
+  for (const [secretName, rawValue] of Object.entries(values)) {
+    const cipher = sodium.crypto_box_seal(
+      sodium.from_string(String(rawValue ?? "")),
+      publicKey,
+    );
+    const cipherB64 = sodium.to_base64(
+      cipher, sodium.base64_variants.ORIGINAL,
+    );
+    await _putRepoSecret(
+      owner, repo, token, secretName, cipherB64, pub.key_id,
+    );
+  }
+}
+
+function _newRequestId() {
+  _checkWebCrypto();
+  if (typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"));
+  return [
+    hex.slice(0, 4).join(""), hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""), hex.slice(8, 10).join(""),
+    hex.slice(10).join(""),
+  ].join("-");
+}
+
 async function _setCourseIdsSecret(owner, repo, token, courseIds) {
   // Convenience: encrypts the comma-joined COURSE_IDS list against the
   // repo's public key and writes it as the ``COURSE_IDS`` secret in one
   // round-trip.  Returns the canonical list that was written so the UI
   // can confirm the saved state.
-  const sodium = await _ensureSodium();
-  const pub = await _getRepoPublicKey(owner, repo, token);
   const value = (Array.isArray(courseIds) ? courseIds : [])
     .map(String)
     .map((s) => s.trim())
     .filter(Boolean)
     .join(",");
-  // sealed box: anyone with the public key can encrypt; only the matching
-  // private key (held by GitHub Actions runner) can decrypt.
-  const cipher = sodium.crypto_box_seal(
-    sodium.from_string(value),
-    sodium.from_base64(pub.key, sodium.base64_variants.ORIGINAL),
-  );
-  const cipherB64 = sodium.to_base64(
-    cipher, sodium.base64_variants.ORIGINAL,
-  );
-  await _putRepoSecret(owner, repo, token, "COURSE_IDS", cipherB64, pub.key_id);
+  await _setRepoSecrets(owner, repo, token, { COURSE_IDS: value });
   return value;
 }
 
@@ -219,8 +249,17 @@ async function _triggerSingleRunWorkflow(owner, repo, ref, token, courseIds, use
   const ids = (Array.isArray(courseIds) ? courseIds : [])
     .map(String).map((s) => s.trim()).filter(Boolean).join(",");
   if (!ids) throw new Error("单次运行列表为空");
-  const inputs = { course_ids: ids };
-  if (useOfficial) inputs.use_official_transcript = "true";
+  const requestId = _newRequestId();
+  await _setRepoSecrets(owner, repo, token, {
+    SINGLE_RUN_REQUEST: JSON.stringify({
+      request_id: requestId,
+      course_ids: ids,
+    }),
+  });
+  const inputs = {
+    request_id: requestId,
+    use_official_transcript: useOfficial ? "true" : "false",
+  };
   const res = await fetch(url, {
     method: "POST",
     headers: { ..._ghHeaders(token), "Content-Type": "application/json" },
@@ -251,17 +290,22 @@ async function _triggerDeleteWorkflow(owner, repo, ref, token, courseIds, subIds
   const ids = (Array.isArray(courseIds) ? courseIds : [])
     .map(String).map((s) => s.trim()).filter(Boolean).join(",");
   if (!ids) throw new Error("删除列表为空");
-  var inputs = { course_ids: ids };
-  if (subIds && subIds.length) {
-    inputs.sub_ids = (Array.isArray(subIds) ? subIds : [])
-      .map(String).map((s) => s.trim()).filter(Boolean).join(",");
-  }
+  const lectureIds = (Array.isArray(subIds) ? subIds : [])
+    .map(String).map((s) => s.trim()).filter(Boolean).join(",");
+  const requestId = _newRequestId();
+  await _setRepoSecrets(owner, repo, token, {
+    DELETE_REQUEST: JSON.stringify({
+      request_id: requestId,
+      course_ids: ids,
+      sub_ids: lectureIds,
+    }),
+  });
   const res = await fetch(url, {
     method: "POST",
     headers: { ..._ghHeaders(token), "Content-Type": "application/json" },
     body: JSON.stringify({
       ref: ref || "main",
-      inputs: inputs,
+      inputs: { request_id: requestId },
     }),
   });
   if (res.status === 204) return;
@@ -281,17 +325,28 @@ async function _triggerExportWorkflow(
 ) {
   // Fires the existing .github/workflows/export.yml workflow_dispatch.
   // The workflow runs scripts/export_course.py (WeasyPrint) and emails
-  // the resulting PDF to RECEIVER_EMAIL — same output the user gets when
+  // the resulting PDF to the configured receiver list — same output the user gets when
   // triggering the workflow manually from the Actions UI.
   //
   // Requires the PAT to grant Actions: Write (in addition to Contents:RW).
   const url = `${_GH_API}/repos/${owner}/${repo}/actions/workflows/export.yml/dispatches`;
+  const courseIds = String(courseId ?? "").trim();
+  if (!courseIds) throw new Error("导出课程为空");
+  const lectureIds = (Array.isArray(subIds) ? subIds : String(subIds || "").split(","))
+    .map(String).map((s) => s.trim()).filter(Boolean).join(",");
+  const requestId = _newRequestId();
+  await _setRepoSecrets(owner, repo, token, {
+    EXPORT_REQUEST: JSON.stringify({
+      request_id: requestId,
+      course_ids: courseIds,
+      sub_ids: lectureIds,
+    }),
+  });
   const payload = {
     ref,
     inputs: {
-      course_id: String(courseId),
+      request_id: requestId,
       export_type: exportType || "PDF",
-      sub_ids: subIds || "",
     },
   };
   const res = await fetch(url, {
@@ -327,5 +382,6 @@ window.ICS.github = {
   triggerSingleRunWorkflow: _triggerSingleRunWorkflow,
   getRepoPublicKey: _getRepoPublicKey,
   putRepoSecret: _putRepoSecret,
+  setRepoSecrets: _setRepoSecrets,
   setCourseIdsSecret: _setCourseIdsSecret,
 };
