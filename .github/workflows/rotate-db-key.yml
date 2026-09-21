@@ -1,0 +1,139 @@
+name: Rotate Database Encryption Key
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: icourse-data-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate rotation secrets
+        env:
+          CURRENT_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+          NEXT_KEY: ${{ secrets.NEW_DB_ENCRYPTION_KEY }}
+        run: |
+          if [ "${#CURRENT_KEY}" -lt 32 ]; then
+            echo "::error::DB_ENCRYPTION_KEY must contain at least 32 characters"
+            exit 2
+          fi
+          if [ "${#NEXT_KEY}" -lt 32 ]; then
+            echo "::error::NEW_DB_ENCRYPTION_KEY must contain at least 32 characters"
+            exit 2
+          fi
+          if [ "$CURRENT_KEY" = "$NEXT_KEY" ]; then
+            echo "::error::The current and new database keys must be different"
+            exit 2
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch current encrypted database
+        id: source
+        run: |
+          remote_ref=$(git ls-remote --heads origin refs/heads/data) \
+            || { echo "::error::Could not inspect the data branch."; exit 1; }
+          if [ -z "$remote_ref" ]; then
+            echo "::error::The data branch does not exist."
+            exit 1
+          fi
+          git fetch --depth=1 origin \
+            "+refs/heads/data:refs/remotes/origin/data"
+          source_commit=$(git rev-parse origin/data)
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+          if ! git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            echo "::error::Key rotation requires the sharded database format."
+            exit 1
+          fi
+
+          mkdir -p data/current/shards
+          git show origin/data:data/icourse-index.enc \
+            > data/current/icourse-index.enc
+          shard_paths=$(git ls-tree -r --name-only origin/data \
+            | grep '^data/shards/' || true)
+          if [ -z "$shard_paths" ]; then
+            echo "::error::The encrypted database contains no shards."
+            exit 1
+          fi
+          for path in $shard_paths; do
+            base=$(basename "$path")
+            git show "origin/data:$path" > "data/current/shards/$base"
+          done
+          echo "Loaded the encrypted database."
+
+      - name: Decrypt and validate with current key
+        env:
+          DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+        run: |
+          python scripts/db_shard.py reassemble \
+            data/current data/icourse-current.db
+          python scripts/validate_db.py data/icourse-current.db
+
+      - name: Re-encrypt and verify with new key
+        env:
+          DB_ENCRYPTION_KEY: ${{ secrets.NEW_DB_ENCRYPTION_KEY }}
+        run: |
+          mkdir -p data/rotated
+          python scripts/db_shard.py shard \
+            data/icourse-current.db data/rotated
+          python scripts/db_shard.py reassemble \
+            data/rotated data/icourse-verified.db
+          python scripts/validate_db.py data/icourse-verified.db
+          python scripts/verify_db_equivalence.py \
+            data/icourse-current.db data/icourse-verified.db
+
+      - name: Publish rotated encrypted database
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          git fetch --depth=1 origin \
+            "+refs/heads/data:refs/remotes/origin/data"
+          latest_commit=$(git rev-parse origin/data)
+          if [ "$latest_commit" != "$SOURCE_COMMIT" ]; then
+            echo "::error::The data branch changed during rotation; refusing to overwrite it."
+            exit 1
+          fi
+
+          deploy_dir=$(mktemp -d)
+          trap 'rm -rf "$deploy_dir"' EXIT
+          git -C "$deploy_dir" init -q
+          git -C "$deploy_dir" remote add origin \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git -C "$deploy_dir" fetch -q --depth=1 origin data
+          git -C "$deploy_dir" checkout -q -b data FETCH_HEAD
+
+          rm -rf "$deploy_dir/data"
+          mkdir -p "$deploy_dir/data/shards"
+          cp data/rotated/icourse-index.enc "$deploy_dir/data/"
+          cp data/rotated/shards/*.db.gz.enc "$deploy_dir/data/shards/"
+
+          git -C "$deploy_dir" config user.name "github-actions[bot]"
+          git -C "$deploy_dir" config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$deploy_dir" add -A data/
+          if git -C "$deploy_dir" diff --cached --quiet; then
+            echo "::error::Rotation produced no encrypted changes."
+            exit 1
+          fi
+          git -C "$deploy_dir" commit -q \
+            -m "chore: rotate database encryption key"
+          git -C "$deploy_dir" push origin data
+          echo "Encrypted database rotation published successfully."
