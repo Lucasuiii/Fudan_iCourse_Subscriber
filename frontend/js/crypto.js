@@ -6,11 +6,8 @@
  *   Bytes  8-15: 8-byte random salt
  *   Bytes 16+:   AES-256-CBC ciphertext (PKCS7 padded)
  *
- * Two key flavors:
- *   v2:     password = sha256("ICSv2:" + stuid + ":" + uispsw)  (hex)
- *           PBKDF2 iterations: 100000
- *   legacy: password = stuid + uispsw + dashscope + smtp        (concat)
- *           PBKDF2 iterations: 10000
+ * Personal deployments use DB_ENCRYPTION_KEY directly as the OpenSSL
+ * password. The older UIS-derived helpers remain for data migration only.
  *
  * Derivation:
  *   PBKDF2-HMAC-SHA256(password, salt, iterations, dkLen=48)
@@ -98,6 +95,14 @@ function _icsBuildPasswordLegacy(secrets) {
          (secrets.dashscope || "") + (secrets.smtp || "");
 }
 
+function _icsBuildStoragePassword(secrets) {
+  var value = String((secrets && secrets.dbkey) || "").trim();
+  if (value.length < 32) {
+    throw new Error("DB_ENCRYPTION_KEY must contain at least 32 characters.");
+  }
+  return value;
+}
+
 /* Plaintext sanity validators — mirrors src/crypto_box.py. AES-CBC + PKCS7
    has a ~1/256 chance of accepting a wrong key (the last byte happens to be
    0x01).  Pass one of these to decryptWithFallback so the wrong-key case
@@ -152,6 +157,7 @@ window.ICS.crypto = {
   buildPassword: _icsBuildPasswordV2,
   buildPasswordV2: _icsBuildPasswordV2,
   buildPasswordLegacy: _icsBuildPasswordLegacy,
+  buildStoragePassword: _icsBuildStoragePassword,
   decryptWithFallback: _icsDecryptWithFallback,
   isSqlite: _icsIsSqlite,
   isGzip: _icsIsGzip,
