@@ -209,21 +209,18 @@
           <a href="https://github.com/settings/personal-access-tokens/new" target="_blank"
              class="text-blue-500 underline ml-1">Create</a>
         </label>
-        <input x-model="setup.token" type="password" placeholder="github_pat_..."
+        <input x-model="setup.token" type="password" autocomplete="off" placeholder="github_pat_..."
                class="w-full border rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-300 focus:outline-none">
         <p class="text-xs text-gray-400 mt-1">Scope: this repo only; Contents, Actions, and Secrets: Read and Write</p>
       </div>
 
-      <!-- 4 Secrets -->
+      <!-- Database key -->
       <div>
-        <label class="block text-xs text-gray-500 mb-1">STUID (Student ID)</label>
-        <input x-model="setup.stuid" type="text" placeholder="22307110xxx"
-               class="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-300 focus:outline-none">
-      </div>
-      <div>
-        <label class="block text-xs text-gray-500 mb-1">UISPSW (UIS Password)</label>
-        <input x-model="setup.uispsw" type="password"
-               class="w-full border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-300 focus:outline-none">
+        <label class="block text-xs text-gray-500 mb-1">DB_ENCRYPTION_KEY</label>
+        <input x-model="setup.dbkey" type="password" autocomplete="off"
+               placeholder="The same value configured in GitHub Actions"
+               class="w-full border rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-300 focus:outline-none">
+        <p class="text-xs text-gray-400 mt-1">PAT and database key are kept only for this browser-tab session.</p>
       </div>
 
       <!-- Advanced -->
@@ -735,13 +732,13 @@
     <div class="space-y-3">
       <template x-for="field in [
         {key: 'token', label: 'GitHub PAT'},
-        {key: 'stuid', label: 'STUID'},
-        {key: 'uispsw', label: 'UISPSW'},
+        {key: 'dbkey', label: 'DB_ENCRYPTION_KEY'},
       ]" :key="field.key">
         <div>
           <label class="block text-xs text-gray-500 mb-1" x-text="field.label"></label>
           <div class="flex gap-2">
             <input :type="showSecrets[field.key] ? 'text' : 'password'"
+                   autocomplete="off"
                    x-model="settingsForm[field.key]"
                    class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono focus:ring-2 focus:ring-blue-300 focus:outline-none">
             <button @click="showSecrets[field.key] = !showSecrets[field.key]"

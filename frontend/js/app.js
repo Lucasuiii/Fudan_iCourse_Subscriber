@@ -26,58 +26,36 @@ async function _gunzip(compressedBytes) {
   return result;
 }
 
-/* ── IndexedDB cache for decrypted shards (keyed by git blob sha) ────
-   Shard contents are content-addressed: a shard's git blob sha changes
-   only when its bytes change, so we can keep decrypted bytes around and
-   skip the network + decrypt + decompress chain on subsequent loads.
+/* ── Session-only cache for decrypted shards ──
+   Decrypted course data must not survive a browser session. Content-addressed
+   cache keys still avoid duplicate work within the current page lifetime.
 */
-var _idbName = "ics_cache_v2";
-// Cache the open Promise — every shard load fires _idbGet + _idbPut, and
-// without this each call opens its own connection.  Reopening costs ~10ms
-// on cold caches and accumulates fast over 100+ shard reads.
-var _idbPromise = null;
+var _sessionBlobCache = new Map();
+var _legacyIdbName = "ics_cache_v2";
 
-function _idbOpen() {
-  if (_idbPromise) return _idbPromise;
-  _idbPromise = new Promise(function(resolve, reject) {
-    var req = indexedDB.open(_idbName, 1);
-    req.onupgradeneeded = function() { req.result.createObjectStore("blobs"); };
-    req.onsuccess = function() { resolve(req.result); };
-    req.onerror = function() {
-      // Don't cache failed opens — next call retries cleanly.
-      _idbPromise = null;
-      reject(req.error);
-    };
-  });
-  return _idbPromise;
+async function _cacheGet(key) {
+  return _sessionBlobCache.get(key) || null;
 }
 
-async function _idbGet(key) {
-  var db = await _idbOpen();
-  return new Promise(function(resolve) {
-    var tx = db.transaction("blobs", "readonly");
-    var req = tx.objectStore("blobs").get(key);
-    req.onsuccess = function() { resolve(req.result || null); };
-    req.onerror = function() { resolve(null); };
-  });
+async function _cachePut(key, value) {
+  _sessionBlobCache.set(key, value);
 }
 
-async function _idbPut(key, value) {
-  var db = await _idbOpen();
-  return new Promise(function(resolve) {
-    var tx = db.transaction("blobs", "readwrite");
-    tx.objectStore("blobs").put(value, key);
-    tx.oncomplete = function() { resolve(); };
-    tx.onerror = function() { resolve(); };
-  });
-}
-
-/* ── Credential helpers (localStorage) ── */
+/* ── Credential helpers (sessionStorage only) ── */
 const _LS = "ics_";
-const _loadCreds = () => { try { return JSON.parse(localStorage.getItem(_LS + "creds")); } catch { return null; } };
-const _saveCreds = (c) => localStorage.setItem(_LS + "creds", JSON.stringify(c));
+const _loadCreds = () => { try { return JSON.parse(sessionStorage.getItem(_LS + "creds")); } catch { return null; } };
+const _saveCreds = (c) => sessionStorage.setItem(_LS + "creds", JSON.stringify(c));
 const _loadSettings = () => { try { return JSON.parse(localStorage.getItem(_LS + "settings")) || {}; } catch { return {}; } };
 const _saveSettings = (s) => localStorage.setItem(_LS + "settings", JSON.stringify(s));
+
+function _purgeLegacyPersistentSecrets() {
+  try {
+    localStorage.removeItem(_LS + "creds");
+    localStorage.removeItem(_LS + "indexSha");
+    localStorage.removeItem(_LS + "lastSubscribed");
+  } catch (e) {}
+  try { indexedDB.deleteDatabase(_legacyIdbName); } catch (e) {}
+}
 /* Starred-course IDs are per-browser (localStorage). The school side
    doesn't need to know; the user just wants their favorites pinned to
    the top of their own view. */
@@ -138,9 +116,9 @@ const _DETAIL_VIEW_LABEL = {
 /* ── Sharded loading helpers ── */
 async function _loadShard(owner, repo, entry, password, token) {
   // Returns { bytes, downloaded: bool } — downloaded=true means we hit
-  // the network; false means IndexedDB cache hit (instant).
+  // the network; false means an in-session cache hit.
   var cacheKey = "shard:" + entry.sha;
-  var cached = await _idbGet(cacheKey);
+  var cached = await _cacheGet(cacheKey);
   if (cached) return { bytes: cached, downloaded: false };
 
   var encBytes = await ICS.github.fetchBlobBytes(owner, repo, entry.sha, token);
@@ -153,7 +131,7 @@ async function _loadShard(owner, repo, entry, password, token) {
     );
   }
   var dbBytes = await _gunzip(gzipped);
-  await _idbPut(cacheKey, dbBytes);
+  await _cachePut(cacheKey, dbBytes);
   return { bytes: dbBytes, downloaded: true };
 }
 
@@ -169,34 +147,24 @@ async function _fetchAndDecryptIndex(owner, repo, indexSha, password, token) {
 }
 
 async function _loadFromShardManifest(manifest, owner, repo, password, token, progress) {
-  // 0) Check if the full merged DB is already cached for this commit SHA.
-  //    If the data branch hasn't moved, we can skip ALL shard loading.
+  // 0) Reuse the merged DB only inside this browser session.
   var mergedKey = "merged:" + manifest.commitSha;
-  var cachedMerged = await _idbGet(mergedKey);
+  var cachedMerged = await _cacheGet(mergedKey);
   if (cachedMerged) {
     await ICS.db.initDB(cachedMerged);
     return;
   }
 
-  // 1) Load index: check if index SHA matches cached → reuse decrypted JSON;
-  //    otherwise fetch + decrypt + cache for next time.
-  var cachedIndexSha = null;
-  try { cachedIndexSha = localStorage.getItem(_LS + "indexSha"); } catch (e) {}
-
-  var index = null;
-  if (manifest.index.sha === cachedIndexSha) {
-    index = await _idbGet("index:v2:" + manifest.index.sha);
-  }
-
+  // 1) Load the encrypted index and retain plaintext only for this session.
+  var index = await _cacheGet("index:v2:" + manifest.index.sha);
   if (!index) {
     index = await _fetchAndDecryptIndex(
       owner, repo, manifest.index.sha, password, token,
     );
-    await _idbPut("index:v2:" + manifest.index.sha, index);
-    try { localStorage.setItem(_LS + "indexSha", manifest.index.sha); } catch (e) {}
+    await _cachePut("index:v2:" + manifest.index.sha, index);
   }
 
-  // 2) Pull every shard — skip cache hits, download only changed ones.
+  // 2) Pull every shard — skip only in-session cache hits.
   await ICS.db.initEmpty();
   var total = (index.shards || []).length;
   var downloaded = 0;
@@ -216,11 +184,10 @@ async function _loadFromShardManifest(manifest, owner, repo, password, token, pr
   }
   if (progress && downloaded === 0) progress(0, total, "");
 
-  // 3) Cache the merged DB in IndexedDB so next load with the same commit
-  //    SHA skips EVERYTHING — no index fetch, no shard iteration, no merge.
+  // 3) Cache the merged DB in memory for refreshes within this page session.
   try {
     var merged = ICS.db.exportDB();
-    await _idbPut(mergedKey, merged);
+    await _cachePut(mergedKey, merged);
   } catch (e) { /* non-critical — silently skip */ }
 }
 
@@ -232,10 +199,14 @@ async function _loadFromLegacyBlob(manifest, owner, repo, secrets, token) {
   var validator = manifest.legacy.compressed
     ? ICS.crypto.isGzip
     : ICS.crypto.isSqlite;
-  var fallback = await ICS.crypto.decryptWithFallback(
-    encBytes, secrets, validator,
+  var decrypted = await ICS.crypto.decrypt(
+    encBytes, ICS.crypto.buildStoragePassword(secrets),
+    ICS.crypto.NEW_ITERATIONS,
   );
-  var bytes = fallback.data;
+  if (!validator(decrypted)) {
+    throw new Error("Database decryption failed validation — wrong DB_ENCRYPTION_KEY?");
+  }
+  var bytes = decrypted;
   if (manifest.legacy.compressed) {
     bytes = await _gunzip(bytes);
   }
@@ -257,7 +228,7 @@ document.addEventListener("alpine:init", () => {
     searchPage: 1, searchHasMore: false,
     searchDomains: { summary: true, transcript: true, ocr: true },
     commitSha: null,
-    setup: { token: "", stuid: "", uispsw: "" },
+    setup: { token: "", dbkey: "" },
     setupError: "", setupTesting: false,
     settingsForm: {}, showSecrets: {},
     exportDialogOpen: false, exportSelection: {}, exportingPdf: false,
@@ -287,6 +258,7 @@ document.addEventListener("alpine:init", () => {
     starred: _loadStarred(),
 
     async init() {
+      _purgeLegacyPersistentSecrets();
       const detected = ICS.github.detectRepo();
       const s = _loadSettings();
       this.repoOwner = s.owner || (detected?.owner ?? "");
@@ -307,8 +279,8 @@ document.addEventListener("alpine:init", () => {
         this.commitSha = manifest.commitSha;
 
         if (manifest.format === "sharded") {
-          this.loadingMsg = "Deriving decryption key...";
-          var pw = await ICS.crypto.buildPasswordV2(creds);
+          this.loadingMsg = "Preparing decryption key...";
+          var pw = ICS.crypto.buildStoragePassword(creds);
 
           this.loadingMsg = "Loading index...";
           var self = this;
@@ -694,7 +666,7 @@ document.addEventListener("alpine:init", () => {
         );
         if (manifest.format === "sharded") {
           // Probe the index decryption to validate creds before we save.
-          var pw = await ICS.crypto.buildPasswordV2(this.setup);
+          var pw = ICS.crypto.buildStoragePassword(this.setup);
           var indexEnc = await ICS.github.fetchBlobBytes(
             this.repoOwner, this.repoName, manifest.index.sha, this.setup.token,
           );
@@ -711,9 +683,13 @@ document.addEventListener("alpine:init", () => {
           var legacyValidator = manifest.legacy.compressed
             ? ICS.crypto.isGzip
             : ICS.crypto.isSqlite;
-          await ICS.crypto.decryptWithFallback(
-            encBytes, this.setup, legacyValidator,
+          var legacyPlaintext = await ICS.crypto.decrypt(
+            encBytes, ICS.crypto.buildStoragePassword(this.setup),
+            ICS.crypto.NEW_ITERATIONS,
           );
+          if (!legacyValidator(legacyPlaintext)) {
+            throw new Error("凭据验证失败：数据库解密结果无效。");
+          }
         }
         _saveCreds({ ...this.setup });
         _saveSettings({ owner: this.repoOwner, repo: this.repoName, branch: this.dataBranch });
@@ -737,17 +713,15 @@ document.addEventListener("alpine:init", () => {
     },
     clearAllData() {
       if (!confirm("Clear all saved credentials?")) return;
+      sessionStorage.removeItem(_LS + "creds");
       localStorage.removeItem(_LS + "creds");
       localStorage.removeItem(_LS + "settings");
-      // Close the cached connection before deleting — Chrome/Firefox block
-      // deleteDatabase indefinitely while any handle is still open.
-      if (_idbPromise) {
-        _idbPromise.then(function(db) { try { db.close(); } catch (e) {} });
-        _idbPromise = null;
-      }
-      indexedDB.deleteDatabase(_idbName);
+      localStorage.removeItem(_LS + "lastSubscribed");
+      sessionStorage.removeItem(_LS + "lastSubscribed");
+      _sessionBlobCache.clear();
+      try { indexedDB.deleteDatabase(_legacyIdbName); } catch (e) {}
       this.view = "setup";
-      this.setup = { token: "", stuid: "", uispsw: "" };
+      this.setup = { token: "", dbkey: "" };
     },
 
     // ── Subscriptions editor (three-column) ──────────────────────────
@@ -778,11 +752,11 @@ document.addEventListener("alpine:init", () => {
       this._subsDeptCache = [];
       this.subsError = "";
 
-      // Load subscription (localStorage → meta table fallback)
+      // Load subscription (sessionStorage → meta table fallback)
       this.subscribedIds = [];
       try {
         var cached = JSON.parse(
-          localStorage.getItem(_LS + "lastSubscribed") || "null"
+          sessionStorage.getItem(_LS + "lastSubscribed") || "null"
         );
         if (Array.isArray(cached)) this.subscribedIds = cached.map(String);
       } catch {}
@@ -793,7 +767,7 @@ document.addEventListener("alpine:init", () => {
             .map(function (s) { return s.trim(); })
             .filter(Boolean);
           try {
-            localStorage.setItem(
+            sessionStorage.setItem(
               _LS + "lastSubscribed",
               JSON.stringify(this.subscribedIds),
             );
@@ -957,7 +931,7 @@ document.addEventListener("alpine:init", () => {
           "success",
         );
         try {
-          localStorage.setItem(
+          sessionStorage.setItem(
             _LS + "lastSubscribed",
             JSON.stringify(this.subscribedIds),
           );
