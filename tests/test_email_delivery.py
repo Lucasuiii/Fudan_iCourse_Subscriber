@@ -82,6 +82,37 @@ class EmailDeliveryTests(unittest.TestCase):
         self.assertIn("<strong>关键结论</strong>", rendered)
         self.assertIn("strong { color: #c0392b; }", _EMAIL_CSS)
 
+    def test_formulas_render_locally_and_embed_as_cid(self):
+        cid_images = {}
+        rendered = _md_to_html(
+            r"矩阵 $$\begin{bmatrix}1&2\\3&4\end{bmatrix}$$ "
+            r"分段 $$f(x)=\begin{cases}x^2,&x>0\\0,&x\le0\end{cases}$$",
+            cid_images,
+        )
+        self.assertEqual(len(cid_images), 2)
+        self.assertEqual(rendered.count('src="cid:latex-'), 2)
+        self.assertNotIn("codecogs", rendered.lower())
+        self.assertTrue(all(data.startswith(b"\x89PNG") for data in cid_images.values()))
+
+    def test_formula_without_cid_uses_inline_data(self):
+        rendered = _md_to_html("答案是 $x^2$。")
+        self.assertIn("data:image/png;base64,", rendered)
+        self.assertNotIn("https://", rendered)
+
+    def test_remote_markdown_image_and_raw_html_are_removed(self):
+        rendered = _md_to_html(
+            '正文 ![remote](https://example.com/a.png) '
+            '<img src="https://example.com/b.png">'
+        )
+        self.assertNotIn("<img", rendered)
+        self.assertNotIn("https://example.com", rendered)
+
+    @patch("src.api.emailer._render_latex_images", return_value={("x^2", False): None})
+    def test_failed_local_formula_stays_readable(self, _render):
+        rendered = _md_to_html("答案是 $x^2$。")
+        self.assertIn("<code>x^2</code>", rendered)
+        self.assertNotIn("codecogs", rendered.lower())
+
     def _emailer(self):
         sender = Emailer()
         sender.sender = "sender@example.com"

@@ -1,12 +1,14 @@
 import base64
+import json
+import math
 import re
 import smtplib
+import subprocess
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from io import BytesIO
-from PIL import Image
+from pathlib import Path
+import cairosvg
+import bleach
 from collections import OrderedDict
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -14,7 +16,6 @@ from email.mime.image import MIMEImage
 from email.mime.application import MIMEApplication
 from html import escape
 from email.utils import formataddr
-from urllib.parse import quote
 
 import markdown
 from pygments.formatters import HtmlFormatter
@@ -138,48 +139,74 @@ pre, blockquote, table { break-inside: avoid; }
 
 _MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
 
-_IMAGE_CACHE: dict[str, tuple] = {}
+_IMAGE_CACHE: dict[tuple[str, bool], tuple[int, int, bytes] | None] = {}
+_MATH_RENDERER = Path(__file__).resolve().parents[2] / "scripts/render_math.js"
+_SVG_SIZE = re.compile(r'\b(width|height)="([0-9.]+)ex"')
+_MARKDOWN_TAGS = [
+    "a", "blockquote", "br", "code", "div", "em", "h1", "h2", "h3",
+    "h4", "h5", "h6", "hr", "li", "ol", "p", "pre", "span", "strong",
+    "table", "tbody", "td", "th", "thead", "tr", "ul",
+]
+_MARKDOWN_ATTRIBUTES = {"a": ["href", "title"], "code": ["class"],
+                        "div": ["class"], "span": ["class"]}
 
 
-def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
-    """Fetch rendered LaTeX image, return (width, height, png_bytes).
+def _render_latex_images(formulas: list[tuple[str, bool]]) -> dict:
+    """Render unique TeX formulas locally in one Node process, then to PNG.
 
-    Width/height are logical display pixels (DPI-adjusted).
-    Returns (None, None, None) on failure.
+    Return logical pixel dimensions and PNG bytes. A failed formula is kept as
+    escaped text by the caller; no external formula service is contacted.
     """
-    if url in _IMAGE_CACHE:
-        return _IMAGE_CACHE[url]
-
-    try:
-        scale_factor = dpi / 96.0
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-
-        img = Image.open(BytesIO(response.content))
-        logical_width = max(1, int(img.width / scale_factor))
-        logical_height = max(1, int(img.height / scale_factor))
-
-        result = (logical_width, logical_height, response.content)
-        _IMAGE_CACHE[url] = result
-        return result
-    except Exception as e:
-        print(f"[LaTeX Render] Image fetch failed: {type(e).__name__}")
-        return None, None, None
-
-
-def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
-    """Pre-fetch multiple LaTeX images concurrently.
-
-    Results are stored in ``_IMAGE_CACHE`` so that subsequent calls to
-    ``_fetch_latex_image`` become instant cache hits.
-    """
-    uncached = [u for u in urls if u not in _IMAGE_CACHE]
-    if not uncached:
-        return
-    with ThreadPoolExecutor(max_workers=min(len(uncached), 8)) as pool:
-        futures = {pool.submit(_fetch_latex_image, u, dpi): u for u in uncached}
-        for future in as_completed(futures):
-            future.result()  # trigger any exception logging inside _fetch_latex_image
+    unique = list(dict.fromkeys(formulas))
+    missing = [formula for formula in unique if formula not in _IMAGE_CACHE]
+    if missing:
+        try:
+            process = subprocess.run(
+                ["node", str(_MATH_RENDERER)],
+                input=json.dumps([
+                    {"tex": tex, "display": block} for tex, block in missing
+                ]),
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=45,
+            )
+            svgs = json.loads(process.stdout)
+            if not isinstance(svgs, list) or len(svgs) != len(missing):
+                raise ValueError("Unexpected formula renderer output")
+            for formula, svg in zip(missing, svgs):
+                try:
+                    if not isinstance(svg, str) or not svg.startswith("<svg"):
+                        raise ValueError("Formula did not render")
+                    # MathJax emits only internal SVG path references. Reject
+                    # any active/external resource before passing it to CairoSVG.
+                    if len(svg) > 5_000_000 or re.search(
+                        r"<(?:image|foreignObject)\b|"
+                        r"(?:xlink:)?href\s*=\s*['\"](?!#)|"
+                        r"url\s*\(\s*['\"]?(?!#)", svg, re.I
+                    ):
+                        raise ValueError("Formula contains an external resource")
+                    root_tag = svg.split(">", 1)[0]
+                    sizes = dict((axis, float(value)) for axis, value
+                                 in _SVG_SIZE.findall(root_tag))
+                    width = max(1, math.ceil(sizes["width"] * 8))
+                    height = max(1, math.ceil(sizes["height"] * 8))
+                    if width > 4096 or height > 2048:
+                        raise ValueError("Formula image is too large")
+                    png = cairosvg.svg2png(
+                        bytestring=svg.encode("utf-8"),
+                        output_width=width * 3,
+                        output_height=height * 3,
+                    )
+                    _IMAGE_CACHE[formula] = (width, height, png)
+                except Exception as exc:
+                    print(f"[LaTeX Render] Formula failed: {type(exc).__name__}")
+                    _IMAGE_CACHE[formula] = None
+        except Exception as exc:
+            print(f"[LaTeX Render] Batch failed: {type(exc).__name__}")
+            for formula in missing:
+                _IMAGE_CACHE[formula] = None
+    return {formula: _IMAGE_CACHE[formula] for formula in unique}
 
 
 def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
@@ -190,17 +217,18 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
 
     Args:
         md_text: Markdown source text.
-        cid_images: When provided (dict), download images and embed via CID
-                    references instead of external URLs.  The dict is populated
+        cid_images: When provided (dict), embed PNGs via CID references.
+                    Otherwise use inline data URIs. The dict is populated
                     with {cid_name: png_bytes} entries for the caller to attach
                     to the MIME message.
     """
     latex_map: dict[str, str] = {}
     counter = 0
+    marker = uuid.uuid4().hex.upper()
 
     def _stash(match):
         nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
+        key = f"ICOURSEMATH{marker}{counter}END"
         counter += 1
         latex_map[key] = match.group(0)
         return key
@@ -208,7 +236,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     def _stash_block(match):
         """Stash \\[...\\] as $$...$$ for uniform downstream handling."""
         nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
+        key = f"ICOURSEMATH{marker}{counter}END"
         counter += 1
         latex_map[key] = "$$" + match.group(1) + "$$"
         return key
@@ -216,7 +244,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     def _stash_inline(match):
         """Stash \\(...\\) as $...$ for uniform downstream handling."""
         nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
+        key = f"ICOURSEMATH{marker}{counter}END"
         counter += 1
         latex_map[key] = "$" + match.group(1) + "$"
         return key
@@ -236,25 +264,28 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
         extensions=_MD_EXTENSIONS,
         extension_configs=_MD_EXTENSION_CONFIGS,
     )
+    # Course material can contain raw HTML or Markdown images. Remove active
+    # markup and remote images before restoring our own local formula PNGs.
+    html = bleach.clean(
+        html, tags=_MARKDOWN_TAGS, attributes=_MARKDOWN_ATTRIBUTES,
+        protocols=["http", "https", "mailto"], strip=True,
+    )
 
-    # Build URL list and pre-fetch all LaTeX images concurrently
-    # Each entry: (url, latex_content, is_block)
-    latex_info: dict[str, tuple[str, str, bool]] = {}
+    latex_info: dict[str, tuple[str, bool]] = {}
     for key, original in latex_map.items():
         is_block = original.startswith("$$")
         latex_content = original[2:-2] if is_block else original[1:-1]
-        prefix = r"\dpi{300}\bg{white}" if is_block else r"\dpi{300}\bg{white}\inline"
-        url = f"https://latex.codecogs.com/png.latex?{prefix}%20{quote(latex_content)}"
-        latex_info[key] = (url, latex_content, is_block)
+        latex_info[key] = (latex_content, is_block)
 
-    _prefetch_latex_images([info[0] for info in latex_info.values()])
+    images = _render_latex_images(list(latex_info.values())) if latex_info else {}
 
-    for key, (url, latex_content, is_block) in latex_info.items():
-        w, h, img_data = _fetch_latex_image(url)
+    for key, (latex_content, is_block) in latex_info.items():
+        rendered = images[(latex_content, is_block)]
+        w, h, img_data = rendered if rendered else (None, None, None)
 
         if is_block:
             if w and h:
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(img_data, cid_images)
                 img_tag = (
                     f'<div style="text-align:center;margin:16px 0">'
                     f'<img src="{src}" alt="{escape(latex_content)}" '
@@ -276,7 +307,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
                     w = max(1, int(w * scale))
                     h = _MIN_INLINE_HEIGHT
 
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(img_data, cid_images)
                 img_tag = (
                     f'<img src="{src}" alt="{escape(latex_content)}" '
                     f'width="{w}" height="{h}" '
@@ -291,14 +322,13 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     return html
 
 
-def _resolve_src(url: str, img_data: bytes | None,
-                 cid_images: dict | None) -> str:
-    """Return a CID reference if embedding, otherwise the original URL."""
-    if cid_images is not None and img_data:
+def _resolve_src(img_data: bytes, cid_images: dict | None) -> str:
+    """Keep formula images inside the email/PDF, never on a remote URL."""
+    if cid_images is not None:
         cid = f"latex-{uuid.uuid4().hex[:12]}"
         cid_images[cid] = img_data
         return f"cid:{cid}"
-    return url
+    return "data:image/png;base64," + base64.b64encode(img_data).decode("ascii")
 
 
 def _prepare_pdf_html(html: str, cid_images: dict[str, bytes]) -> str:
@@ -326,7 +356,15 @@ def render_html_pdf(html: str, cid_images: dict[str, bytes],
     """
     if renderer is None:
         from weasyprint import HTML  # noqa: PLC0415
+        from weasyprint.urls import URLFetcher  # noqa: PLC0415
+
         renderer = HTML
+        return renderer(
+            string=_prepare_pdf_html(html, cid_images),
+            url_fetcher=URLFetcher(
+                allowed_protocols=["data"], fail_on_errors=True
+            ),
+        ).write_pdf()
     return renderer(string=_prepare_pdf_html(html, cid_images)).write_pdf()
 
 
