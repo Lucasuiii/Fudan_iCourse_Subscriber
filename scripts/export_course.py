@@ -38,7 +38,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.runtime import config
 from src.data.database import Database  # noqa: E402
-from src.api.emailer import _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html  # noqa: E402
+from src.api.emailer import (  # noqa: E402
+    _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html, render_html_pdf,
+)
 
 # Override hardcoded pixel dimensions for PDF rendering.
 # WeasyPrint maps CSS px to physical size at 96 DPI, which makes the
@@ -55,8 +57,8 @@ def _build_html(course_title: str, teacher: str, lectures: list[dict],
     """Build a complete styled HTML document from course summaries.
 
     Args:
-        cid_images: When provided (dict), LaTeX images are downloaded and
-                    embedded via CID references.  The dict is populated with
+        cid_images: When provided (dict), local LaTeX PNGs are embedded via
+                    CID references. The dict is populated with
                     ``{cid_name: png_bytes}`` entries for the caller to attach
                     to the MIME message.
     """
@@ -304,7 +306,7 @@ def main():
 
             html = _build_html(course_title, teacher, lectures, pdf=True)
             print("Generating PDF for requested course...")
-            pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+            pdf_bytes = render_html_pdf(html, {})
             filename = f"{_safe_filename(course_title)}_summaries.pdf"
             attachments.append((pdf_bytes, filename))
             print(f"  PDF ready ({len(pdf_bytes)} bytes; filename redacted)")
