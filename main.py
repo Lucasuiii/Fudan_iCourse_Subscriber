@@ -69,6 +69,16 @@ def _check_session(client: ICourseClient) -> None:
     client._userinfo = None
 
 
+def _in_run_scope(course_id: str, lecture: dict) -> bool:
+    """Keep date reruns isolated from routine allowlists and unsent recovery."""
+    if config.RERUN_TARGET_IDS:
+        return str(lecture["sub_id"]) in config.RERUN_TARGET_IDS
+    return lecture_is_selected(
+        course_id, lecture, config.COURSE_SESSION_RULES,
+        config.COURSE_SESSION_OVERRIDE_DATES,
+    )
+
+
 def _enumerate_lectures(client: ICourseClient, db: Database,
                         reporter: Reporter) -> list[tuple[str, str, dict]]:
     """Sync, fast: list every (course_id, course_title, lecture) we'll
@@ -119,10 +129,7 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             for lecture in lectures:
                 if not lecture.get("has_playback"):
                     continue
-                if lecture_is_selected(
-                    course_id, lecture, config.COURSE_SESSION_RULES,
-                    config.COURSE_SESSION_OVERRIDE_DATES,
-                ):
+                if _in_run_scope(course_id, lecture):
                     selected_lectures.append(lecture)
                 else:
                     filtered_count += 1
@@ -141,10 +148,7 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                  "date": u["date"]}
                 for u in unprocessed
                 if u["sub_id"] not in new_ids
-                and lecture_is_selected(
-                    course_id, u, config.COURSE_SESSION_RULES,
-                    config.COURSE_SESSION_OVERRIDE_DATES,
-                )
+                and _in_run_scope(course_id, u)
             ]
             new_lectures.extend(retry_only)
             reporter.course_new_count(len(new_lectures))
@@ -229,10 +233,7 @@ def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
         for row in unsent:
             if (
                 row["sub_id"] not in seen_sub_ids
-                and lecture_is_selected(
-                    row["course_id"], row, config.COURSE_SESSION_RULES,
-                    config.COURSE_SESSION_OVERRIDE_DATES,
-                )
+                and _in_run_scope(row["course_id"], row)
             ):
                 email_items.append({
                     "sub_id": row["sub_id"],
@@ -384,6 +385,8 @@ def run():
         # Fall through — crawl-only mode is valid.
 
     db = Database()
+    if config.RERUN_TARGET_IDS and config.RETRY_ALL_FAILED:
+        raise ValueError("date rerun cannot also retry unrelated failures")
     if config.RETRY_ALL_FAILED:
         attention = _selected_attention_lectures(db, only_unnotified=False)
         retried = db.retry_attention_lectures(
@@ -406,7 +409,8 @@ def run():
     email_items: list = []
 
     # Discover new semesters every run; only fetch catalogs not yet stored.
-    _crawl_semester_catalog(client, db, reporter)
+    if not config.RERUN_TARGET_IDS:
+        _crawl_semester_catalog(client, db, reporter)
 
     if not config.COURSE_IDS:
         # Crawl-only mode: nothing to process, just persist + exit.
@@ -426,8 +430,13 @@ def run():
     finally:
         scheduler.shutdown()
 
+    if config.RERUN_TARGET_IDS:
+        completed = {item["sub_id"] for item in email_items}
+        if completed != config.RERUN_TARGET_IDS:
+            raise RuntimeError("date rerun incomplete; original data retained")
     _send_email(emailer, db, reporter, email_items)
-    _send_failure_notices(emailer, db, reporter)
+    if not config.RERUN_TARGET_IDS:
+        _send_failure_notices(emailer, db, reporter)
     reporter.run_footer()
 
 
