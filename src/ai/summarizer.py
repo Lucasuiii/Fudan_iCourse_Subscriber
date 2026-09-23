@@ -6,6 +6,7 @@ from pathlib import Path
 from openai import OpenAI
 
 from src.runtime import config
+from src.ai.tavily_enrichment import enrich_summary
 
 _DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "lecture_summary.md"
@@ -111,6 +112,12 @@ class Summarizer:
                 model_id = f"{provider['name']}/{model}"
                 try:
                     result = self._call_llm(client, model, title, content)
+                    result = enrich_summary(
+                        result,
+                        api_key=config.TAVILY_API_KEY,
+                        client=client,
+                        model=model,
+                    )
                     return (result, model_id)
                 except Exception as e:
                     print(f"[Summarizer] {model_id} failed: "

@@ -121,6 +121,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # QQ SMTP
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "").strip()
 
 
 def parse_receiver_emails(raw: str) -> list[str]:

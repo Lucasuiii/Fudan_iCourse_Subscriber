@@ -25,6 +25,7 @@
 | `COURSE_SESSION_RULES` | 可选；每行一门课程的课次白名单，例如 `35472=周一第1-2节|周三第6-8节` |
 | `COURSE_SESSION_OVERRIDE_DATES` | 可选；调课/补课日期例外，逗号分隔，例如 `2026-09-20,2026-10-01` |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key；首次只配置这一个模型服务即可 |
+| `TAVILY_API_KEY` | 可选。仅当笔记标出可公开核查的术语缺口时使用；每节课最多 2 次基础搜索，不上传整段课堂材料。未配置时不联网检索。 |
 | `SMTP_EMAIL` | QQ 发件邮箱 |
 | `SMTP_PASSWORD` | QQ 邮箱 SMTP 授权码，不是邮箱登录密码 |
 | `RECEIVER_EMAILS` | 接收摘要的邮箱；多个地址用英文逗号、分号或换行分隔 |

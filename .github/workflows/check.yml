@@ -274,6 +274,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           # All secrets, JSON-encoded. provider_env.py exports only the
           # vars named by config.MODEL_PROVIDERS (api_key_env /
           # base_url_env), so user-defined providers with custom env-var
