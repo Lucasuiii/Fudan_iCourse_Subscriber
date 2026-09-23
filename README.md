@@ -48,6 +48,7 @@
 | `DB_ENCRYPTION_KEY` | ✅ | 独立数据库密钥；用 `openssl rand -hex 32` 生成 | `64位随机十六进制字符串` |
 | `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |
 | `DEEPSEEK_API_KEY` | ⬜ | DeepSeek API Key（推荐） | `sk-xxxxxxxx` |
+| `TAVILY_API_KEY` | ⬜ | 可选，疑点处最多两次基础网页检索；不传完整课程材料 | `tvly-xxxxxxxx` |
 | `GEMINI_API_KEY` | ⬜ | Gemini API Key | `AIza...` |
 | `SMTP_EMAIL` | ✅ | 用于发送邮件的 QQ 邮箱 | `123456@qq.com` |
 | `SMTP_PASSWORD` | ✅ | QQ 邮箱 SMTP **授权码**（不是登录密码） | `abcdefghijklmnop` |
