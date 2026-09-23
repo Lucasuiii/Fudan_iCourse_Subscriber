@@ -18,6 +18,16 @@ on:
         required: false
         default: false
         type: boolean
+      rerun_date:
+        description: "Exact lecture date to regenerate and replace (YYYY-MM-DD)"
+        required: false
+        default: ''
+        type: string
+      rerun_expected_count:
+        description: "Safety check: exact number of previously emailed lectures"
+        required: false
+        default: 0
+        type: number
 permissions:
   contents: write
 
@@ -199,6 +209,22 @@ jobs:
             echo "hash=none" >> $GITHUB_OUTPUT
           fi
 
+      - name: Prepare exact-date rerun
+        if: inputs.rerun_date != ''
+        env:
+          COURSE_IDS: ${{ secrets.COURSE_IDS }}
+          RERUN_DATE: ${{ inputs.rerun_date }}
+          RERUN_EXPECTED_COUNT: ${{ inputs.rerun_expected_count }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          RETRY_ALL_FAILED: ${{ inputs.retry_all_failed }}
+        run: |
+          if [ -n "$REQUEST_ID" ] || [ "$RETRY_ALL_FAILED" = "true" ]; then
+            echo "::error::Date rerun cannot be combined with a frontend request or failure retry."
+            exit 2
+          fi
+          python scripts/rerun_date.py prepare --date "$RERUN_DATE" \
+            --expected-count "$RERUN_EXPECTED_COUNT"
+
       - name: Run
         timeout-minutes: 350
         env:
@@ -237,8 +263,16 @@ jobs:
           unset SECRETS_CONTEXT
           python -u main.py
 
+      - name: Verify exact-date rerun before publishing
+        if: inputs.rerun_date != ''
+        run: python scripts/rerun_date.py verify
+
       - name: Deploy database to data branch
-        if: always()
+        # Ordinary Single Runs keep their existing best-effort persistence.
+        # A date rerun publishes only after every target was regenerated and
+        # the email step confirmed delivery; the old data branch stays intact
+        # if preparation, processing, or verification fails.
+        if: always() && (inputs.rerun_date == '' || success())
         env:
           STUID: ${{ secrets.STUID }}
           UISPSW: ${{ secrets.UISPSW }}

@@ -153,6 +153,11 @@ RECEIVER_EMAILS = parse_receiver_emails(_RECEIVER_EMAILS_RAW)
 RETRY_ALL_FAILED = os.environ.get("RETRY_ALL_FAILED", "").strip().lower() in {
     "1", "true", "yes", "on",
 }
+# Populated only by the guarded date-rerun workflow.  Ordinary scheduled and
+# frontend runs leave this empty and retain their existing selection behavior.
+RERUN_TARGET_IDS = frozenset(
+    part for part in os.environ.get("RERUN_TARGET_IDS", "").split(",") if part
+)
 # Backward-compatible first recipient for older integrations.
 RECEIVER_EMAIL = RECEIVER_EMAILS[0] if RECEIVER_EMAILS else ""
 SMTP_HOST = "smtp.qq.com"
