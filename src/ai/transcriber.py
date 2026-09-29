@@ -554,27 +554,6 @@ class Transcriber:
         self._last_segments = segments
         return transcript, segments
 
-    def _check_completeness(self, transcript: str,
-                            segments: list[dict]) -> None:
-        """Raise IncompleteAudioError when we received <50% of the media.
-
-        ``_media_duration`` is parsed from ffmpeg's stderr by
-        ``_consume_pcm_stream``; when it's unknown the check is skipped.
-        The partial result rides on the exception so the caller can still
-        inspect it."""
-        if self._media_duration and self._media_duration > 0:
-            ratio = self._last_duration / self._media_duration
-            if ratio < 0.5:
-                raise IncompleteAudioError(
-                    f"Only received {self._last_duration:.0f}s of "
-                    f"{self._media_duration:.0f}s audio ({ratio:.0%}). "
-                    f"Connection may have dropped.",
-                    actual_duration=self._last_duration,
-                    expected_duration=self._media_duration,
-                    transcript=transcript,
-                    segments=segments,
-                )
-
     # ── Public mode 1 — disk tail-f (preferred) ─────────────────────────
 
     def transcribe_tail(self, audio_path: str,
@@ -597,8 +576,6 @@ class Transcriber:
         Raises:
             RuntimeError if ffmpeg never wrote any audio.
             NoAudioStreamError if ffmpeg reported "does not contain any stream".
-            IncompleteAudioError if <90 % of the media duration arrived
-                (e.g. ffmpeg exited cleanly on a truncated stream).
             TimeoutError on overall ``timeout``.
         """
         # Wait for file to exist (ffmpeg may not have flushed the first byte yet)
@@ -636,10 +613,8 @@ class Transcriber:
                 wait_on_empty_sec=0.1,
                 label="tail",
             )
-            # ffmpeg can exit 0 on a server-side truncated stream; without
-            # this check the partial transcript would silently pass as a
-            # complete lecture.
-            self._check_completeness(transcript, segments)
+            # The caller assesses transcript quality. A mismatched iCourse
+            # media duration alone cannot tell whether the audio is partial.
             return transcript, segments
         finally:
             f.close()
@@ -806,9 +781,6 @@ class Transcriber:
                 proc.kill()
             proc.wait()
             stderr_thread.join(timeout=5)
-
-        # Both URL/pipe modes enforce the 90 % completeness check
-        self._check_completeness(transcript, segments)
 
         return transcript, segments
 

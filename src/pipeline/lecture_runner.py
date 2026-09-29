@@ -356,15 +356,6 @@ class LectureRunner:
                     self._reporter.info(
                         f"    [ASR] Seed-ASR 2.0: {len(transcript)} chars"
                     )
-                except doubao_asr.CloudAudioIncompleteError as e:
-                    # A severe shortfall is not an ASR failure. Never upload
-                    # or summarize it; retry on the next run.
-                    raise IncompleteAudioError(
-                        f"audio download incomplete "
-                        f"({e.actual:.0f}s/{e.expected:.0f}s)",
-                        actual_duration=e.actual,
-                        expected_duration=e.expected,
-                    ) from e
                 except (doubao_asr.CloudAudioError,
                         doubao_asr.CloudASRError) as e:
                     self._reporter.info(
@@ -392,10 +383,8 @@ class LectureRunner:
             self._release_audio(sub_id)
             return None, None
         except IncompleteAudioError as e:
-            # Severe truncation (ffmpeg may even exit 0 on a server-side
-            # cut). Don't persist the partial transcript — it would
-            # short-circuit the retry — just record the error so the
-            # lecture is retried up to max_errors times.
+            # Other audio paths may still detect a genuine truncated stream.
+            # Do not persist the partial transcript; retry on the next run.
             self._reporter.info(
                 "    [SKIP] Incomplete audio "
                 f"({e.actual_duration:.0f}s/{e.expected_duration:.0f}s); "
@@ -414,16 +403,14 @@ class LectureRunner:
 
         if official:
             mode, _ = assess_official_transcript(
-                official, self._asr_expected_duration
-                or self._asr_actual_duration,
+                official, self._asr_actual_duration,
             )
             self._reporter.info(
                 f"    [Official transcript] completeness={mode}; "
                 "ASR remains primary."
             )
             segments = supplement_asr_gaps(
-                segments, official,
-                self._asr_expected_duration or self._asr_actual_duration,
+                segments, official, self._asr_actual_duration,
             )
             transcript = " ".join(s["text"] for s in segments)
         return transcript, segments

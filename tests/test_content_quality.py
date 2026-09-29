@@ -45,6 +45,28 @@ class ContentQualityTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "summarize")
 
+    def test_substantial_audio_with_bad_media_duration_is_summarized(self):
+        decision = assess_content_quality(
+            transcript="有效课程内容" * 80,
+            segments=_segments(30, "有效课程内容"),
+            ppt_pages=[],
+            transcript_source="cloud_asr",
+            actual_audio_seconds=4061,
+            expected_audio_seconds=10087,
+        )
+        self.assertEqual(decision.action, "summarize")
+
+    def test_tiny_fragment_with_bad_media_duration_retries(self):
+        decision = assess_content_quality(
+            transcript="有效课程内容" * 80,
+            segments=_segments(30, "有效课程内容"),
+            ppt_pages=[],
+            transcript_source="cloud_asr",
+            actual_audio_seconds=600,
+            expected_audio_seconds=5400,
+        )
+        self.assertEqual(decision.action, "retry")
+
     def test_useful_ppt_can_rescue_sparse_audio(self):
         decision = assess_content_quality(
             transcript="声音很少",

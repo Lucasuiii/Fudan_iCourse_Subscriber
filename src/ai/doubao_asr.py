@@ -30,16 +30,7 @@ class CloudASRError(RuntimeError):
 
 
 class CloudAudioError(RuntimeError):
-    """The downloaded audio is missing or incomplete; do not transcribe it."""
-
-
-class CloudAudioIncompleteError(CloudAudioError):
-    """ffmpeg exited successfully but captured less than half the media."""
-
-    def __init__(self, actual: float, expected: float):
-        super().__init__("audio download is incomplete")
-        self.actual = actual
-        self.expected = expected
+    """The download failed or produced no usable audio."""
 
 
 def wait_for_complete_audio(path, process, stderr_chunks, timeout=7200,
@@ -66,11 +57,9 @@ def wait_for_complete_audio(path, process, stderr_chunks, timeout=7200,
     if not expected and match:
         h, m, s = match.groups()
         expected = int(h) * 3600 + int(m) * 60 + float(s)
-    # Media and decoded audio timelines can disagree on iCourse recordings.
-    # Only a severe shortfall blocks transcription; lesser discrepancies are
-    # reported by the runner without discarding otherwise usable audio.
-    if expected and actual / expected < 0.50:
-        raise CloudAudioIncompleteError(actual, expected)
+    # iCourse's media timeline can be much longer than the available audio.
+    # Return both durations; the runner warns about the mismatch and decides
+    # whether the actual transcript contains enough material to summarize.
     return actual, expected
 
 

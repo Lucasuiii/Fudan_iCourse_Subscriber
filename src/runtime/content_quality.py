@@ -15,6 +15,7 @@ import re
 
 
 MIN_LONG_RECORDING_SECONDS = 20 * 60
+MIN_SHORTFALL_AUDIO_SECONDS = 20 * 60
 MIN_TRANSCRIPT_CHARS = 120
 MIN_TRANSCRIPT_CHARS_PER_MINUTE = 2.0
 MAX_SPARSE_SEGMENTS_PER_MINUTE = 0.10
@@ -91,8 +92,8 @@ def assess_content_quality(
         ppt_page_count=ppt_page_count,
     )
 
-    # Cached transcripts lack trustworthy per-run audio duration. Both cloud
-    # and local ASR have a complete downloaded recording to assess.
+    # Cached transcripts lack trustworthy per-run audio duration. Cloud and
+    # local ASR both supply the duration of the audio actually obtained.
     if transcript_source not in ("local_asr", "cloud_asr"):
         return ContentQualityDecision("summarize", **decision_args)
 
@@ -101,6 +102,13 @@ def assess_content_quality(
         or chars_per_minute < MIN_TRANSCRIPT_CHARS_PER_MINUTE
     )
     ppt_sparse = ppt_chars < MIN_PPT_TEXT_CHARS
+    expected = max(float(expected_audio_seconds or 0), 0.0)
+    # A very short fragment of a much longer recording is not a reliable
+    # lecture even if a few sentences are recognizable. A substantial
+    # recording is judged by its actual content instead of the media ratio.
+    if (expected and duration / expected < 0.5
+            and duration < MIN_SHORTFALL_AUDIO_SECONDS):
+        return ContentQualityDecision("retry", **decision_args)
     if not transcript_sparse or not ppt_sparse:
         return ContentQualityDecision("summarize", **decision_args)
 
@@ -108,7 +116,6 @@ def assess_content_quality(
     if duration < MIN_LONG_RECORDING_SECONDS:
         return ContentQualityDecision("summarize", **decision_args)
 
-    expected = max(float(expected_audio_seconds or 0), 0.0)
     audio_complete = expected > 0 and duration / expected >= 0.90
     sparse_segment_limit = max(
         3,

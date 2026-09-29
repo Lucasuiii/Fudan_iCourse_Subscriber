@@ -6,16 +6,25 @@ from src.ai import doubao_asr
 
 
 class DoubaoASRTests(unittest.TestCase):
-    def test_wait_rejects_truncated_audio_before_upload(self):
+    def test_wait_accepts_large_media_timeline_mismatch(self):
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 8)
+            audio.flush()
+            process = MagicMock(returncode=0)
+            self.assertEqual(
+                doubao_asr.wait_for_complete_audio(
+                    audio.name, process, [b"Duration: 00:00:20.00"],
+                ),
+                (8, 20),
+            )
+
+    def test_wait_rejects_failed_download(self):
         with tempfile.NamedTemporaryFile() as audio:
             audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 9)
             audio.flush()
-            process = MagicMock(returncode=0)
-            with self.assertRaises(doubao_asr.CloudAudioIncompleteError):
-                doubao_asr.wait_for_complete_audio(
-                    audio.name, process,
-                    [b"Duration: 00:00:20.00"],
-                )
+            process = MagicMock(returncode=1)
+            with self.assertRaises(doubao_asr.CloudAudioError):
+                doubao_asr.wait_for_complete_audio(audio.name, process, [])
 
     def test_wait_accepts_moderate_timeline_shortfall(self):
         with tempfile.NamedTemporaryFile() as audio:
