@@ -1,0 +1,28 @@
+name: Doubao ASR Smoke Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install requests
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+      - name: Verify Seed-ASR 2.0 with synthetic audio
+        env:
+          DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+        run: python -m scripts.smoke_doubao_asr
