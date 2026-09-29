@@ -32,6 +32,83 @@ def _load_runner_class():
 
 
 class LectureQualityGateIntegrationTests(unittest.TestCase):
+    def test_official_tail_detects_clearly_truncated_audio(self):
+        LectureRunner = _load_runner_class()
+        with self.assertRaisesRegex(
+            RuntimeError, "audio ends well before official subtitle timeline"
+        ):
+            LectureRunner._assert_official_tail(4_000, [
+                {"start_ms": 4_850_000, "end_ms": 4_900_000,
+                 "text": "课尾内容"},
+            ])
+
+    def test_cloud_first_even_when_official_subtitles_are_complete(self):
+        LectureRunner = _load_runner_class()
+        db = MagicMock()
+        db.get_lecture.return_value = None
+        client = MagicMock()
+        client.get_transcript_segments.return_value = [
+            {"start_ms": 0, "end_ms": 60_000,
+             "text": "官方错字" * 100},
+        ]
+        scheduler = MagicMock()
+        transcriber = MagicMock()
+        reporter = MagicMock()
+        runner = LectureRunner(
+            client, db, scheduler, transcriber, MagicMock(), reporter,
+        )
+        handle = SimpleNamespace(path="audio.raw", process=MagicMock(),
+                                 stderr_chunks=[])
+        scheduler.audio_downloader.get.return_value = handle
+        from src.runtime import config
+        from src.ai import doubao_asr
+        with patch.object(config, "DOUBAO_ASR_API_KEY", "test-key"), \
+             patch.object(config, "USE_OFFICIAL_TRANSCRIPT", True), \
+             patch.object(doubao_asr, "wait_for_complete_audio",
+                          return_value=(60, 60)), \
+             patch.object(doubao_asr, "transcribe_pcm",
+                          return_value=("云端正确", [
+                       {"start_ms": 0, "end_ms": 60_000,
+                        "text": "云端正确"},
+                   ])):
+            self.assertTrue(runner._needs_audio("course", "lecture"))
+            text, _ = runner._get_transcript(None, "course", "lecture")
+        self.assertEqual(text, "云端正确")
+        self.assertEqual(runner._transcript_source, "cloud_asr")
+        transcriber.transcribe_tail.assert_not_called()
+        db.update_transcript.assert_not_called()
+
+    def test_cloud_failure_uses_local_asr_not_official_subtitles(self):
+        LectureRunner = _load_runner_class()
+        db = MagicMock()
+        client = MagicMock()
+        client.get_transcript_segments.return_value = None
+        scheduler = MagicMock()
+        scheduler.audio_downloader.get.return_value = SimpleNamespace(
+            path="audio.raw", process=MagicMock(), stderr_chunks=[],
+        )
+        transcriber = MagicMock()
+        transcriber.transcribe_tail.return_value = (
+            "本地结果", [{"start_ms": 0, "end_ms": 60_000,
+                        "text": "本地结果"}],
+        )
+        transcriber.last_audio_duration = 60
+        transcriber.last_media_duration = 60
+        runner = LectureRunner(
+            client, db, scheduler, transcriber, MagicMock(), MagicMock(),
+        )
+        from src.runtime import config
+        from src.ai import doubao_asr
+        with patch.object(config, "DOUBAO_ASR_API_KEY", "test-key"), \
+             patch.object(doubao_asr, "wait_for_complete_audio",
+                          return_value=(60, 60)), \
+             patch.object(doubao_asr, "transcribe_pcm",
+                          side_effect=doubao_asr.CloudASRError("failed")):
+            text, _ = runner._get_transcript(None, "course", "lecture")
+        self.assertEqual(text, "本地结果")
+        self.assertEqual(runner._transcript_source, "local_asr")
+        transcriber.transcribe_tail.assert_called_once()
+
     def test_no_content_bypasses_llm_and_email_batch(self):
         LectureRunner = _load_runner_class()
         db = MagicMock()

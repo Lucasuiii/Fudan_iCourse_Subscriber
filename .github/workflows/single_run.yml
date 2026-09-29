@@ -9,7 +9,7 @@ on:
         default: ''
         type: string
       use_official_transcript:
-        description: "Prefer official iCourse transcripts; fall back to local ASR"
+        description: "Use official subtitles only for completeness and gap hints"
         required: false
         default: true
         type: boolean
@@ -252,6 +252,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+          DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           # All secrets, JSON-encoded. provider_env.py exports only the
           # vars named by config.MODEL_PROVIDERS (api_key_env /

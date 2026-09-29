@@ -7,7 +7,7 @@
 
 自动监控复旦大学 iCourse 智慧教学平台的课程更新，对新课次的录播视频进行**语音转文字 + PPT OCR + AI 摘要**，并通过邮件推送到你的邮箱。
 
-部署在 GitHub Actions 上，每天定时运行，**零成本、免服务器、全自动**。
+部署在 GitHub Actions 上，每天定时运行，免服务器；云端 ASR 与大模型可能产生费用。
 
 > [!NOTE]
 > 本项目严禁大规模传播（例如，不准分享到树洞、班级群、大群等地），否则信息办可能随时ban掉该项目。
@@ -20,7 +20,7 @@
 
 1. 登录你的复旦 iCourse 账号（通过 WebVPN）
 2. 检查这两门课是否有新的录播视频
-3. 如果有：优先使用完整的官方字幕；大段缺失时仅对缺口运行本地 ASR，字幕不可用时再完整 ASR → 提取 PPT 图片 → OCR 转写 → AI 生成课程笔记
+3. 如果有：优先用豆包 Seed-ASR 2.0 云端识别；未配置或调用失败时用本地 ASR。官方字幕仅作完整度参考，并在 ASR 明显缺段且字幕完整时标记补充 → 提取 PPT 图片 → OCR 转写 → AI 生成课程笔记
 4. 每门课程单独发送一封邮件，并附带该课程的 Markdown 笔记
 
 邮件正文包含专业排版的 Markdown 渲染内容（含 LaTeX 公式渲染），并附带可归档的
@@ -48,6 +48,7 @@
 | `DB_ENCRYPTION_KEY` | ✅ | 独立数据库密钥；用 `openssl rand -hex 32` 生成 | `64位随机十六进制字符串` |
 | `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |
 | `DEEPSEEK_API_KEY` | ⬜ | DeepSeek API Key（推荐） | `sk-xxxxxxxx` |
+| `DOUBAO_ASR_API_KEY` | ⬜ | 豆包语音新版控制台的 API Key；配置后优先使用 Seed-ASR 2.0，未配置时继续使用本地 ASR | 请勿写入仓库 |
 | `TAVILY_API_KEY` | ⬜ | 可选，疑点处最多两次基础网页检索；不传完整课程材料 | `tvly-xxxxxxxx` |
 | `GEMINI_API_KEY` | ⬜ | Gemini API Key | `AIza...` |
 | `SMTP_EMAIL` | ✅ | 用于发送邮件的 QQ 邮箱 | `123456@qq.com` |
@@ -56,6 +57,10 @@
 | `RECEIVER_EMAIL` | ⬜ | 兼容旧部署的单个收件邮箱 | `you@m.fudan.edu.com` |
 
 > 至少配置一个 LLM API Key（DASHSCOPE、DEEPSEEK 或 GEMINI）。程序按配置顺序自动回退尝试。如果需要选择其他的LLM供应商，可以在`src\runtime\config.py`路径下自定义供应商。
+
+云端 ASR 另需在豆包语音控制台开通录音文件识别模型 2.0 标准版
+（`volc.seedasr.auc`）。体验中心试用与 API 开通、计费应分别核对；不配置
+`DOUBAO_ASR_API_KEY` 时仍可完全使用本地 ASR。
 
 ### 第 3 步：获取课程 ID
 
@@ -87,7 +92,7 @@
 - **自动运行**：每天 17:07（北京时间）主运行；若当天主任务仍未开始或已经失败，
   20:07 执行保底任务
 - **手动触发**：进入仓库 → Actions → **iCourse Check** → Run workflow。`Single Run`
-  也默认优先使用官方字幕。
+  也默认读取官方字幕，但只用于完整度参考和谨慎补缺。
 
 同一课次连续失败三次后会暂停自动重试，并向收件邮箱发送一次不含异常原文和签名
 URL 的失败摘要。需要重试时运行 `Single Run`，勾选

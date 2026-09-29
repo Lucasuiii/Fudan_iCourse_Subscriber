@@ -3,6 +3,7 @@ import unittest
 from src.runtime.transcript_policy import (
     assess_official_transcript,
     merge_timed_segments,
+    supplement_asr_gaps,
 )
 
 
@@ -55,3 +56,20 @@ class OfficialTranscriptAssessmentTests(unittest.TestCase):
         self.assertEqual([s["text"] for s in merged], [
             "official-a", "asr", "official-b",
         ])
+
+    def test_official_is_only_marked_supplement_in_long_asr_gap(self):
+        asr = [_segment(0, 20, "cloud-a"),
+               _segment(220, 240, "cloud-b")]
+        official = [_segment(0, 20),
+                    _segment(60, 100, "字幕补充" * 30),
+                    _segment(220, 240)]
+        merged = supplement_asr_gaps(asr, official, 240)
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(merged[0]["text"], "cloud-a")
+        self.assertIn("官方字幕补充", merged[1]["text"])
+        self.assertEqual(merged[2]["text"], "cloud-b")
+
+    def test_official_never_replaces_a_full_asr_transcript(self):
+        asr = [_segment(0, 120, "云端主文本")]
+        official = [_segment(0, 120, "官方字幕" * 30)]
+        self.assertEqual(supplement_asr_gaps(asr, official, 120), asr)
