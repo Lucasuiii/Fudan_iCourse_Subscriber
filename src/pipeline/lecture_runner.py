@@ -16,7 +16,8 @@ log greps):
      the next lecture will actually be ASR-transcribed) so its download
      overlaps with the current lecture's ASR.
   D  transcript: cached → Seed-ASR 2.0 → local ASR. Official iCourse
-     subtitles only check completeness and supplement substantial ASR gaps.
+     subtitles only warn about timeline differences and supplement substantial
+     ASR gaps.
      For ASR, ``Scheduler.audio_downloader
      .get`` blocks for the ffmpeg spawn scheduled earlier, then
      ``Transcriber.transcribe_tail`` reads PCM from the disk file with
@@ -266,18 +267,24 @@ class LectureRunner:
         existing = self._db.get_lecture(sub_id)
         return not (existing and existing.get("transcript"))
 
-    @staticmethod
-    def _assert_official_tail(actual_seconds: float,
-                              official: list[dict] | None) -> None:
-        """Treat a clearly later subtitle tail as evidence of a cut download."""
+    def _warn_official_tail(self, actual_seconds: float,
+                            official: list[dict] | None) -> None:
+        """Do not reject audio based solely on unreliable subtitle timing."""
         if not official or not actual_seconds:
             return
         official_tail = max(int(item.get("end_ms", 0)) for item in official) / 1000
         if official_tail - actual_seconds > max(120, actual_seconds * 0.05):
-            raise IncompleteAudioError(
-                "audio ends well before official subtitle timeline",
-                actual_duration=actual_seconds,
-                expected_duration=official_tail,
+            self._reporter.info(
+                "    [WARN] Official subtitle timeline exceeds audio; "
+                "continuing with ASR."
+            )
+
+    def _warn_short_audio(self, actual: float, expected: float) -> None:
+        """Keep a private-content-free warning for a moderate shortfall."""
+        if expected > 0 and actual / expected < 0.90:
+            self._reporter.info(
+                "    [WARN] Audio shorter than media timeline "
+                f"({actual / expected:.0%}); continuing with ASR."
             )
 
     def _get_transcript(self, existing: dict | None, course_id: str,
@@ -337,7 +344,8 @@ class LectureRunner:
                     actual, expected = doubao_asr.wait_for_complete_audio(
                         handle.path, handle.process, handle.stderr_chunks,
                     )
-                    self._assert_official_tail(actual, official)
+                    self._warn_short_audio(actual, expected)
+                    self._warn_official_tail(actual, official)
                     transcript, segments = doubao_asr.transcribe_pcm(
                         handle.path, config.DOUBAO_ASR_API_KEY, actual,
                     )
@@ -349,10 +357,11 @@ class LectureRunner:
                         f"    [ASR] Seed-ASR 2.0: {len(transcript)} chars"
                     )
                 except doubao_asr.CloudAudioIncompleteError as e:
-                    # Incomplete audio is not an ASR failure. Never upload or
-                    # summarize a partial recording; retry on the next run.
+                    # A severe shortfall is not an ASR failure. Never upload
+                    # or summarize it; retry on the next run.
                     raise IncompleteAudioError(
-                        "audio download incomplete",
+                        f"audio download incomplete "
+                        f"({e.actual:.0f}s/{e.expected:.0f}s)",
                         actual_duration=e.actual,
                         expected_duration=e.expected,
                     ) from e
@@ -371,7 +380,10 @@ class LectureRunner:
                 self._asr_expected_duration = (
                     self._transcriber.last_media_duration or 0.0
                 )
-                self._assert_official_tail(self._asr_actual_duration, official)
+                self._warn_short_audio(
+                    self._asr_actual_duration, self._asr_expected_duration,
+                )
+                self._warn_official_tail(self._asr_actual_duration, official)
         except NoAudioStreamError as e:
             self._reporter.info("    [SKIP] Video-only (no audio stream).")
             # Do not mark this as processed: retry it like other media
@@ -380,12 +392,14 @@ class LectureRunner:
             self._release_audio(sub_id)
             return None, None
         except IncompleteAudioError as e:
-            # Truncated download (ffmpeg may even exit 0 on a server-side
-            # cut).  Don't persist the partial transcript — it would
+            # Severe truncation (ffmpeg may even exit 0 on a server-side
+            # cut). Don't persist the partial transcript — it would
             # short-circuit the retry — just record the error so the
             # lecture is retried up to max_errors times.
             self._reporter.info(
-                "    [SKIP] Incomplete audio, will retry next run."
+                "    [SKIP] Incomplete audio "
+                f"({e.actual_duration:.0f}s/{e.expected_duration:.0f}s); "
+                "will retry next run."
             )
             self._db.update_error(sub_id, "transcribe", str(e))
             self._release_audio(sub_id)

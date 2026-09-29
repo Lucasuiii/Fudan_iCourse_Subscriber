@@ -34,7 +34,7 @@ class CloudAudioError(RuntimeError):
 
 
 class CloudAudioIncompleteError(CloudAudioError):
-    """ffmpeg exited successfully but captured less than 90% of the media."""
+    """ffmpeg exited successfully but captured less than half the media."""
 
     def __init__(self, actual: float, expected: float):
         super().__init__("audio download is incomplete")
@@ -66,7 +66,10 @@ def wait_for_complete_audio(path, process, stderr_chunks, timeout=7200,
     if not expected and match:
         h, m, s = match.groups()
         expected = int(h) * 3600 + int(m) * 60 + float(s)
-    if expected and actual / expected < 0.90:
+    # Media and decoded audio timelines can disagree on iCourse recordings.
+    # Only a severe shortfall blocks transcription; lesser discrepancies are
+    # reported by the runner without discarding otherwise usable audio.
+    if expected and actual / expected < 0.50:
         raise CloudAudioIncompleteError(actual, expected)
     return actual, expected
 

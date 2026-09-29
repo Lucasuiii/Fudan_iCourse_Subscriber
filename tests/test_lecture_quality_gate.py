@@ -32,15 +32,33 @@ def _load_runner_class():
 
 
 class LectureQualityGateIntegrationTests(unittest.TestCase):
-    def test_official_tail_detects_clearly_truncated_audio(self):
+    def test_local_asr_allows_moderate_shortfall_but_rejects_severe_one(self):
+        with patch.dict(sys.modules, {
+            "sherpa_onnx": types.ModuleType("sherpa_onnx"),
+        }):
+            module = importlib.import_module("src.ai.transcriber")
+        IncompleteAudioError = module.IncompleteAudioError
+        Transcriber = module.Transcriber
+
+        state = SimpleNamespace(_media_duration=100, _last_duration=50)
+        Transcriber._check_completeness(state, "课堂内容", [])
+        state._last_duration = 49
+        with self.assertRaises(IncompleteAudioError):
+            Transcriber._check_completeness(state, "课堂内容", [])
+
+    def test_official_tail_warns_without_blocking_asr(self):
         LectureRunner = _load_runner_class()
-        with self.assertRaisesRegex(
-            RuntimeError, "audio ends well before official subtitle timeline"
-        ):
-            LectureRunner._assert_official_tail(4_000, [
-                {"start_ms": 4_850_000, "end_ms": 4_900_000,
-                 "text": "课尾内容"},
-            ])
+        reporter = MagicMock()
+        runner = LectureRunner(
+            MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+            MagicMock(), reporter,
+        )
+        runner._warn_official_tail(4_000, [
+            {"start_ms": 4_850_000, "end_ms": 4_900_000,
+             "text": "课尾内容"},
+        ])
+        reporter.info.assert_called_once()
+        self.assertIn("continuing with ASR", reporter.info.call_args.args[0])
 
     def test_cloud_first_even_when_official_subtitles_are_complete(self):
         LectureRunner = _load_runner_class()
@@ -48,7 +66,7 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         db.get_lecture.return_value = None
         client = MagicMock()
         client.get_transcript_segments.return_value = [
-            {"start_ms": 0, "end_ms": 60_000,
+            {"start_ms": 0, "end_ms": 900_000,
              "text": "官方错字" * 100},
         ]
         scheduler = MagicMock()
@@ -70,11 +88,16 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
                           return_value=("云端正确", [
                        {"start_ms": 0, "end_ms": 60_000,
                         "text": "云端正确"},
-                   ])):
+                   ])) as cloud_transcribe:
             self.assertTrue(runner._needs_audio("course", "lecture"))
             text, _ = runner._get_transcript(None, "course", "lecture")
         self.assertEqual(text, "云端正确")
         self.assertEqual(runner._transcript_source, "cloud_asr")
+        cloud_transcribe.assert_called_once()
+        self.assertTrue(any(
+            "Official subtitle timeline exceeds audio" in call.args[0]
+            for call in reporter.info.call_args_list
+        ))
         transcriber.transcribe_tail.assert_not_called()
         db.update_transcript.assert_not_called()
 

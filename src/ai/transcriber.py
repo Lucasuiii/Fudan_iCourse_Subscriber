@@ -556,7 +556,7 @@ class Transcriber:
 
     def _check_completeness(self, transcript: str,
                             segments: list[dict]) -> None:
-        """Raise IncompleteAudioError when we received <90 % of the media.
+        """Raise IncompleteAudioError when we received <50% of the media.
 
         ``_media_duration`` is parsed from ffmpeg's stderr by
         ``_consume_pcm_stream``; when it's unknown the check is skipped.
@@ -564,7 +564,7 @@ class Transcriber:
         inspect it."""
         if self._media_duration and self._media_duration > 0:
             ratio = self._last_duration / self._media_duration
-            if ratio < 0.9:
+            if ratio < 0.5:
                 raise IncompleteAudioError(
                     f"Only received {self._last_duration:.0f}s of "
                     f"{self._media_duration:.0f}s audio ({ratio:.0%}). "

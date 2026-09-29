@@ -14,8 +14,32 @@ class DoubaoASRTests(unittest.TestCase):
             with self.assertRaises(doubao_asr.CloudAudioIncompleteError):
                 doubao_asr.wait_for_complete_audio(
                     audio.name, process,
-                    [b"Duration: 00:00:11.00"],
+                    [b"Duration: 00:00:20.00"],
                 )
+
+    def test_wait_accepts_moderate_timeline_shortfall(self):
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 9)
+            audio.flush()
+            process = MagicMock(returncode=0)
+            self.assertEqual(
+                doubao_asr.wait_for_complete_audio(
+                    audio.name, process, [b"Duration: 00:00:11.00"],
+                ),
+                (9, 11),
+            )
+
+    def test_wait_accepts_exactly_half_the_media(self):
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 10)
+            audio.flush()
+            process = MagicMock(returncode=0)
+            self.assertEqual(
+                doubao_asr.wait_for_complete_audio(
+                    audio.name, process, [b"Duration: 00:00:20.00"],
+                ),
+                (10, 20),
+            )
 
     def test_submit_query_uses_seed_2_resource_and_relative_timestamps(self):
         submitted = MagicMock()
