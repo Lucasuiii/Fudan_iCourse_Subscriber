@@ -91,9 +91,9 @@ def assess_content_quality(
         ppt_page_count=ppt_page_count,
     )
 
-    # Cached, official and hybrid transcripts do not carry a trustworthy full
-    # local-ASR duration here. Their own completeness policy remains in charge.
-    if transcript_source != "local_asr":
+    # Cached transcripts lack trustworthy per-run audio duration. Both cloud
+    # and local ASR have a complete downloaded recording to assess.
+    if transcript_source not in ("local_asr", "cloud_asr"):
         return ContentQualityDecision("summarize", **decision_args)
 
     transcript_sparse = (

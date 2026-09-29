@@ -25,6 +25,7 @@
 | `COURSE_SESSION_RULES` | 可选；每行一门课程的课次白名单，例如 `35472=周一第1-2节|周三第6-8节` |
 | `COURSE_SESSION_OVERRIDE_DATES` | 可选；调课/补课日期例外，逗号分隔，例如 `2026-09-20,2026-10-01` |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key；首次只配置这一个模型服务即可 |
+| `DOUBAO_ASR_API_KEY` | 可选；豆包语音新版控制台的 API Key。配置后云端 Seed-ASR 2.0 优先，失败自动回退本地 ASR；音频片段会上传火山引擎，按服务规则消耗额度或计费。 |
 | `TAVILY_API_KEY` | 可选。仅当笔记标出可公开核查的术语缺口时使用；每节课最多 2 次基础搜索，不上传整段课堂材料。未配置时不联网检索。 |
 | `SMTP_EMAIL` | QQ 发件邮箱 |
 | `SMTP_PASSWORD` | QQ 邮箱 SMTP 授权码，不是邮箱登录密码 |
@@ -41,6 +42,11 @@ openssl rand -hex 32
 只把输出粘贴到 `DB_ENCRYPTION_KEY` Secret。不要把输出发给别人，也不要写入
 `.env` 后提交。丢失该密钥将无法解密已有数据库；更换它之前应先做好迁移。
 
+启用云端识别还需在[豆包语音控制台](https://console.volcengine.com/speech/new/)
+开通“录音文件识别模型 2.0 标准版”（资源 ID `volc.seedasr.auc`），创建新版
+API Key，并将它仅填入 `DOUBAO_ASR_API_KEY` Secret。体验中心的试用额度不等于
+API 已开通或 API 账单一定免费；首次运行后请在控制台核对用量与费用。
+
 Fork 的 Actions 如处于禁用状态，进入 `Actions` 页面，阅读提示后为该 Fork 启用
 workflows。先不要运行任何 workflow，等下面的 Secrets 全部配置完成。
 
@@ -53,9 +59,10 @@ workflows。先不要运行任何 workflow，等下面的 Secrets 全部配置�
 `COURSE_SESSION_OVERRIDE_DATES`。该日期会对所有已配置课程放行；课程处理成功后保留
 这个日期也不会重复生成摘要。
 
-每日任务优先使用完整的 iCourse 官方字幕，并用实际媒体时长检查头尾覆盖。官方字幕
-只有少量超过 20 分钟的缺口时，仅对缺口运行本地 ASR 并按时间轴合并；字幕缺失、
-过于稀疏或大部分内容缺失时才进行完整 ASR。每门课程会单独发送一封邮件，正文保留
+每日任务优先使用豆包 Seed-ASR 2.0；未配置 Key 或云端失败时使用本地 ASR。
+下载完成的录音会分成不超过 30 分钟的 MP3 片段，直接以 Base64 发送给火山引擎，
+不会向第三方提供带登录签名的 iCourse/WebVPN 视频 URL。官方字幕只作为完整度参考，
+以及 ASR 存在较长空缺时带标记的补充来源，不再替代整段 ASR。每门课程会单独发送一封邮件，正文保留
 HTML 预览，并将相同 HTML 渲染为 PDF 附件。PDF 生成失败时会自动改附 `.md`
 文件，邮件本身不会因此丢失。
 
@@ -75,7 +82,7 @@ HTML 预览，并将相同 HTML 渲染为 PDF 附件。PDF 生成失败时会自
 
 1. 在 `COURSE_IDS` 中暂时只填一门课程。
 2. 打开 `Actions -> Single Run -> Run workflow`。
-3. “优先使用官方字幕”现在默认开启；课程 ID 会直接从 `COURSE_IDS` Secret 读取，
+3. “使用官方字幕作补充”默认开启；课程 ID 会直接从 `COURSE_IDS` Secret 读取，
    不在公开参数中填写。
 4. 运行后检查 Actions 日志中没有课程名、教师名、课次 ID、完整 URL 或邮箱地址。
 5. 检查邮件和模型平台账单；确认无异常后，再把其他课程加入 `COURSE_IDS`。
@@ -84,8 +91,9 @@ HTML 预览，并将相同 HTML 渲染为 PDF 附件。PDF 生成失败时会自
 符合白名单的课次。视频地址获取和开放时间处理保持不变；失败课次按上述规则最多
 自动尝试三次。GitHub 的 cron 不保证准点执行。
 
-官方字幕缺失或不完整时，SenseVoice ASR 在 GitHub Actions runner 本地运行，不需要
-额外的语音识别 API。课程标题、转录/OCR 文本和摘要提示会发送给你配置的模型服务商；生成的摘要会发送
+未配置 `DOUBAO_ASR_API_KEY` 时，SenseVoice ASR 在 GitHub Actions runner 本地运行，不需要
+额外的语音识别 API。配置后，录音片段会送往火山引擎豆包语音；云端失败才用本地 ASR。
+课程标题、转录/OCR 文本和摘要提示会发送给你配置的模型服务商；生成的摘要会发送
 给邮箱服务商。请按课程资料的使用规则和对应服务商的隐私条款决定是否使用。
 
 ## 可选：导出或删除数据

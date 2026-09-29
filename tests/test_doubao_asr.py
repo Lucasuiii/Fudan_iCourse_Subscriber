@@ -1,0 +1,77 @@
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from src.ai import doubao_asr
+
+
+class DoubaoASRTests(unittest.TestCase):
+    def test_wait_rejects_truncated_audio_before_upload(self):
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 9)
+            audio.flush()
+            process = MagicMock(returncode=0)
+            with self.assertRaises(doubao_asr.CloudAudioIncompleteError):
+                doubao_asr.wait_for_complete_audio(
+                    audio.name, process,
+                    [b"Duration: 00:00:11.00"],
+                )
+
+    def test_submit_query_uses_seed_2_resource_and_relative_timestamps(self):
+        submitted = MagicMock()
+        submitted.headers = {"X-Api-Status-Code": "20000000"}
+        queried = MagicMock()
+        queried.headers = {"X-Api-Status-Code": "20000000"}
+        queried.json.return_value = {
+            "result": {"text": "良态和病态", "utterances": [
+                {"start_time": 100, "end_time": 900,
+                 "text": "良态和病态"},
+            ]}
+        }
+        session = MagicMock()
+        session.post.side_effect = [submitted, queried]
+        result = doubao_asr._recognize_chunk(
+            b"mp3", "test-key", 1_800_000, 1000, session,
+        )
+        self.assertEqual(result, [{
+            "start_ms": 1_800_100, "end_ms": 1_800_900,
+            "text": "良态和病态",
+        }])
+        args, kwargs = session.post.call_args_list[0]
+        self.assertEqual(kwargs["headers"]["X-Api-Resource-Id"],
+                         "volc.seedasr.auc")
+        self.assertEqual(kwargs["headers"]["X-Api-Key"], "test-key")
+        self.assertIn("data", kwargs["json"]["audio"])
+        self.assertNotIn("url", kwargs["json"]["audio"])
+        self.assertEqual(
+            session.post.call_args_list[1].kwargs["headers"]
+            ["X-Api-Request-Id"],
+            kwargs["headers"]["X-Api-Request-Id"],
+        )
+
+    def test_empty_cloud_result_fails_over_instead_of_using_subtitles(self):
+        with patch.object(doubao_asr, "_encode_chunk", return_value=b"mp3"), \
+             patch.object(doubao_asr, "_recognize_chunk", return_value=[]):
+            with self.assertRaises(doubao_asr.CloudASRError):
+                doubao_asr.transcribe_pcm("unused", "key", 60,
+                                          session=MagicMock())
+
+    def test_chunking_covers_long_lecture_without_public_url(self):
+        seen = []
+        def recognize(_audio, _key, offset, duration, _session):
+            seen.append((offset, duration))
+            return [{"start_ms": offset, "end_ms": offset + duration,
+                     "text": "课堂内容"}]
+        with patch.object(doubao_asr, "_encode_chunk", return_value=b"mp3"), \
+             patch.object(doubao_asr, "_recognize_chunk", side_effect=recognize):
+            text, segments = doubao_asr.transcribe_pcm(
+                "unused", "key", 3601, session=MagicMock(),
+            )
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(seen, [(0, 1_800_000), (1_800_000, 1_800_000),
+                                (3_600_000, 1000)])
+        self.assertEqual(text, "课堂内容 课堂内容 课堂内容")
+
+
+if __name__ == "__main__":
+    unittest.main()

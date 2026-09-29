@@ -66,3 +66,43 @@ def merge_timed_segments(
         [*official, *asr_segments],
         key=lambda s: (int(s.get("start_ms", 0)), int(s.get("end_ms", 0))),
     )
+
+
+def supplement_asr_gaps(
+    asr_segments: list[dict], official: list[dict] | None,
+    duration_s: float, min_gap_s: int = 120,
+) -> list[dict]:
+    """Use official text only inside long ASR holes, visibly marked as such.
+
+    A whole official transcript never replaces ASR. In particular, a short
+    announcement or a genuinely silent interval must not be overwritten by
+    miscellaneous subtitles outside a substantial ASR gap.
+    """
+    if not asr_segments or not official or duration_s <= 0:
+        return asr_segments
+    if assess_official_transcript(official, duration_s)[0] != "complete":
+        return asr_segments
+    ordered = sorted(asr_segments, key=lambda s: int(s["start_ms"]))
+    end_ms = int(duration_s * 1000)
+    holes = []
+    cursor = 0
+    for segment in ordered:
+        start = int(segment["start_ms"])
+        if start - cursor >= min_gap_s * 1000:
+            holes.append((cursor, start))
+        cursor = max(cursor, int(segment["end_ms"]))
+    if end_ms - cursor >= min_gap_s * 1000:
+        holes.append((cursor, end_ms))
+    supplements = []
+    for start, end in holes:
+        candidates = [s for s in official
+                      if int(s["start_ms"]) >= start
+                      and int(s["end_ms"]) <= end
+                      and str(s.get("text", "")).strip()]
+        if candidates:
+            supplements.append({
+                "start_ms": start, "end_ms": end,
+                "text": "[官方字幕补充，可能有识别错误] "
+                        + " ".join(str(s["text"]) for s in candidates),
+            })
+    return sorted([*ordered, *supplements], key=lambda s: int(s["start_ms"]))

@@ -15,8 +15,9 @@ log greps):
   C  schedule **next** lecture's prefetch (images always; audio only when
      the next lecture will actually be ASR-transcribed) so its download
      overlaps with the current lecture's ASR.
-  D  transcript: cached → official iCourse transcript (config-gated,
-     completeness-checked) → ASR.  For ASR, ``Scheduler.audio_downloader
+  D  transcript: cached → Seed-ASR 2.0 → local ASR. Official iCourse
+     subtitles only check completeness and supplement substantial ASR gaps.
+     For ASR, ``Scheduler.audio_downloader
      .get`` blocks for the ffmpeg spawn scheduled earlier, then
      ``Transcriber.transcribe_tail`` reads PCM from the disk file with
      tail-f semantics while ffmpeg keeps writing.
@@ -42,13 +43,14 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
+from src.ai import doubao_asr
 from src.pipeline.ppt_pipeline import PPTPipeline
 from src.ai.transcriber import IncompleteAudioError, NoAudioStreamError
 from src.runtime import config
 from src.runtime.content_quality import assess_content_quality
 from src.runtime.transcript_policy import (
     assess_official_transcript,
-    merge_timed_segments,
+    supplement_asr_gaps,
 )
 
 if TYPE_CHECKING:
@@ -74,10 +76,6 @@ class LectureRunner:
         self._summarizer = summarizer
         self._reporter = reporter
         self._ppt = PPTPipeline(db, scheduler, reporter)
-        # Official-transcript segments fetched during the prefetch decision
-        # (``_needs_audio``), keyed by sub_id, so ``_get_transcript`` doesn't
-        # re-fetch them one lecture later.
-        self._official_cache: dict[str, list[dict]] = {}
         self._transcript_source = "unknown"
         self._asr_actual_duration = 0.0
         self._asr_expected_duration = 0.0
@@ -264,83 +262,30 @@ class LectureRunner:
         )
 
     def _needs_audio(self, course_id: str, sub_id: str) -> bool:
-        """False when transcription won't need the audio stream: a cached
-        transcript exists, or the official transcript looks usable.  Keeps
-        prefetching from spending a download slot (and a full lecture of
-        bandwidth) on audio that would just be killed in Phase H."""
+        """Every uncached lecture needs audio, regardless of subtitle quality."""
         existing = self._db.get_lecture(sub_id)
-        if existing and existing.get("transcript"):
-            return False
-        if config.USE_OFFICIAL_TRANSCRIPT:
-            try:
-                segments = self._client.get_transcript_segments(sub_id)
-                if segments:
-                    self._official_cache[sub_id] = segments
-                # No tail hint at prefetch time — the lecture's PPT rows
-                # aren't registered yet.  _get_transcript re-checks with
-                # the hint and schedules the download then if needed.
-                if self._official_transcript_usable(segments):
-                    return False
-            except Exception as e:
-                self._reporter.info(
-                    f"    [Official transcript] probe failed: {type(e).__name__}"
-                )
-        return True
+        return not (existing and existing.get("transcript"))
 
     @staticmethod
-    def _official_transcript_usable(segments: list[dict] | None,
-                                    max_gap_minutes: int = 20,
-                                    duration_hint_s: int = 0) -> bool:
-        """True if the official transcript is complete enough to use.
-
-        Looks for a >``max_gap_minutes`` hole in three places: before the
-        first segment (head truncation), between segments, and — when a
-        duration hint is known (the last PPT screenshot offset, a lower
-        bound on lecture length) — after the last segment (tail
-        truncation)."""
-        # Keep the legacy signature for callers/tests. The production threshold
-        # remains 20 minutes; non-default values use the original gap-only path.
-        if max_gap_minutes != 20:
-            if not segments:
-                return False
-            max_gap_ms = max_gap_minutes * 60_000
-            ordered = sorted(segments, key=lambda s: s["start_ms"])
-            if ordered[0]["start_ms"] > max_gap_ms:
-                return False
-            prev_end = ordered[0]["end_ms"]
-            for seg in ordered[1:]:
-                if seg["start_ms"] - prev_end > max_gap_ms:
-                    return False
-                prev_end = max(prev_end, seg["end_ms"])
-            return not (
-                duration_hint_s
-                and duration_hint_s * 1000 - prev_end > max_gap_ms
+    def _assert_official_tail(actual_seconds: float,
+                              official: list[dict] | None) -> None:
+        """Treat a clearly later subtitle tail as evidence of a cut download."""
+        if not official or not actual_seconds:
+            return
+        official_tail = max(int(item.get("end_ms", 0)) for item in official) / 1000
+        if official_tail - actual_seconds > max(120, actual_seconds * 0.05):
+            raise IncompleteAudioError(
+                "audio ends well before official subtitle timeline",
+                actual_duration=actual_seconds,
+                expected_duration=official_tail,
             )
-        mode, _ = assess_official_transcript(segments, duration_hint_s)
-        return mode == "complete"
-
-    def _probe_media_duration(self, course_id: str, sub_id: str) -> float | None:
-        """Probe the signed media URL locally; return None on any failure."""
-        try:
-            video_url = self._client.get_video_url(course_id, sub_id)
-            if not video_url:
-                return None
-            stream_url, headers = self._client.get_stream_params(video_url)
-            return self._transcriber.probe_duration(stream_url, headers)
-        except Exception as exc:
-            self._reporter.info(
-                f"    [Official transcript] duration probe failed: "
-                f"{type(exc).__name__}"
-            )
-            return None
 
     def _get_transcript(self, existing: dict | None, course_id: str,
                         sub_id: str) -> tuple[Optional[str], Optional[list]]:
         """Return (transcript, segments) or (None, None) on skip.
 
-        Tries the official iCourse transcript first — when available and
-        complete-enough (no >20 min silence gaps) it replaces the ASR
-        step entirely, saving ~5 min of CPU time per lecture.
+        Cloud ASR takes priority; a failure uses local ASR on the same audio.
+        Official subtitles are never used as the main transcript.
         """
         if existing and existing.get("transcript"):
             self._transcript_source = "cached"
@@ -351,52 +296,14 @@ class LectureRunner:
             )
             return existing["transcript"], None
 
-        # Try official transcript before firing up ASR (config-gated).
+        # Read official subtitles as lower-trust supporting evidence only.
         official: list[dict] | None = None
-        hybrid_intervals: list[tuple[float, float]] = []
-        official_duration: float | None = None
         if config.USE_OFFICIAL_TRANSCRIPT:
             try:
-                official = self._official_cache.pop(sub_id, None)
-                if official is None:
-                    official = self._client.get_transcript_segments(sub_id)
-                # Prefer the actual media duration. The final PPT timestamp is
-                # only a lower-bound fallback when ffprobe cannot inspect the
-                # signed stream.
-                media_duration = self._probe_media_duration(course_id, sub_id)
-                official_duration = media_duration
-                duration_hint = (
-                    media_duration or self._db.get_max_ppt_created_sec(sub_id)
-                )
-                mode, gaps = assess_official_transcript(official, duration_hint)
-                if mode == "complete":
-                    text = " ".join(s["text"] for s in official)
-                    self._reporter.info(
-                        f"    Using official transcript "
-                        f"({len(text)} chars, {len(official)} segments)"
-                    )
-                    self._db.update_transcript(sub_id, text)
-                    self._transcript_source = "official"
-                    # The audio may have been prefetched before we knew the
-                    # official transcript was usable — stop that download
-                    # now instead of letting it run until Phase H.
-                    self._release_audio(sub_id)
-                    return text, official
-                if mode == "hybrid" and media_duration:
-                    hybrid_intervals = gaps
-                    self._reporter.info(
-                        f"    Official transcript has {len(gaps)} long gap(s); "
-                        "running local ASR only for missing intervals."
-                    )
-                else:
-                    self._reporter.info(
-                        "    Official transcript is incomplete; falling back "
-                        "to full local ASR."
-                    )
+                official = self._client.get_transcript_segments(sub_id)
             except Exception as e:
                 self._reporter.info(
-                    f"    [Official transcript] unavailable, falling back "
-                    f"to ASR: {type(e).__name__}"
+                    f"    [Official transcript] unavailable: {type(e).__name__}"
                 )
 
         # Pull the audio handle.  ``schedule`` is idempotent — usually the
@@ -424,28 +331,47 @@ class LectureRunner:
             return None, None
 
         try:
-            used_full_local_asr = not (hybrid_intervals and official)
-            if hybrid_intervals and official:
-                gap_text, gap_segments = self._transcriber.transcribe_tail_intervals(
-                    handle.path, handle.process, handle.stderr_chunks,
-                    hybrid_intervals,
-                    expected_duration_s=official_duration,
-                )
-                if gap_text.strip():
-                    segments = merge_timed_segments(official, gap_segments)
-                    transcript = " ".join(s["text"] for s in segments)
-                else:
-                    self._reporter.info(
-                        "    Gap-only ASR returned no text; retrying full local ASR."
-                    )
-                    transcript, segments = self._transcriber.transcribe_tail(
+            cloud_ok = False
+            if config.DOUBAO_ASR_API_KEY:
+                try:
+                    actual, expected = doubao_asr.wait_for_complete_audio(
                         handle.path, handle.process, handle.stderr_chunks,
                     )
-                    used_full_local_asr = True
-            else:
+                    self._assert_official_tail(actual, official)
+                    transcript, segments = doubao_asr.transcribe_pcm(
+                        handle.path, config.DOUBAO_ASR_API_KEY, actual,
+                    )
+                    self._transcript_source = "cloud_asr"
+                    self._asr_actual_duration = actual
+                    self._asr_expected_duration = expected
+                    cloud_ok = True
+                    self._reporter.info(
+                        f"    [ASR] Seed-ASR 2.0: {len(transcript)} chars"
+                    )
+                except doubao_asr.CloudAudioIncompleteError as e:
+                    # Incomplete audio is not an ASR failure. Never upload or
+                    # summarize a partial recording; retry on the next run.
+                    raise IncompleteAudioError(
+                        "audio download incomplete",
+                        actual_duration=e.actual,
+                        expected_duration=e.expected,
+                    ) from e
+                except (doubao_asr.CloudAudioError,
+                        doubao_asr.CloudASRError) as e:
+                    self._reporter.info(
+                        f"    [ASR] Cloud unavailable ({type(e).__name__}); "
+                        "using local ASR."
+                    )
+            if not cloud_ok:
                 transcript, segments = self._transcriber.transcribe_tail(
                     handle.path, handle.process, handle.stderr_chunks,
                 )
+                self._transcript_source = "local_asr"
+                self._asr_actual_duration = self._transcriber.last_audio_duration
+                self._asr_expected_duration = (
+                    self._transcriber.last_media_duration or 0.0
+                )
+                self._assert_official_tail(self._asr_actual_duration, official)
         except NoAudioStreamError as e:
             self._reporter.info("    [SKIP] Video-only (no audio stream).")
             # Do not mark this as processed: retry it like other media
@@ -472,14 +398,20 @@ class LectureRunner:
             self._release_audio(sub_id)
             raise
 
-        if used_full_local_asr:
-            self._transcript_source = "local_asr"
-            self._asr_actual_duration = self._transcriber.last_audio_duration
-            self._asr_expected_duration = (
-                self._transcriber.last_media_duration or 0.0
+        if official:
+            mode, _ = assess_official_transcript(
+                official, self._asr_expected_duration
+                or self._asr_actual_duration,
             )
-        else:
-            self._transcript_source = "hybrid"
+            self._reporter.info(
+                f"    [Official transcript] completeness={mode}; "
+                "ASR remains primary."
+            )
+            segments = supplement_asr_gaps(
+                segments, official,
+                self._asr_expected_duration or self._asr_actual_duration,
+            )
+            transcript = " ".join(s["text"] for s in segments)
         return transcript, segments
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
