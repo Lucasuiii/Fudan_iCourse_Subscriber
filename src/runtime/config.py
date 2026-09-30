@@ -208,8 +208,8 @@ VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
 
-# Seed-ASR 2.0 is primary only when this key is set. An absent or failing
-# cloud service falls back to the existing local SenseVoice backend.
+# Local SenseVoice is primary.  When set, Seed-ASR 2.0 only rescues bounded
+# VAD-confirmed speech windows with empty or near-empty local recognition.
 DOUBAO_ASR_API_KEY = os.environ.get("DOUBAO_ASR_API_KEY", "").strip()
 
 # Official subtitles are secondary evidence, never the primary transcript.

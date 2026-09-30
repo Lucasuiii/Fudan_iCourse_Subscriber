@@ -94,7 +94,7 @@ def assess_content_quality(
 
     # Cached transcripts lack trustworthy per-run audio duration. Cloud and
     # local ASR both supply the duration of the audio actually obtained.
-    if transcript_source not in ("local_asr", "cloud_asr"):
+    if transcript_source not in ("local_asr", "cloud_asr", "hybrid_asr"):
         return ContentQualityDecision("summarize", **decision_args)
 
     transcript_sparse = (

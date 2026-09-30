@@ -34,6 +34,17 @@ class ContentQualityTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "skip_no_content")
 
+    def test_hybrid_asr_obeys_same_no_content_gate(self):
+        decision = assess_content_quality(
+            transcript="零星声音" * 6,
+            segments=_segments(9),
+            ppt_pages=[],
+            transcript_source="hybrid_asr",
+            actual_audio_seconds=10_054,
+            expected_audio_seconds=10_054,
+        )
+        self.assertEqual(decision.action, "skip_no_content")
+
     def test_useful_transcript_is_summarized_without_ppt(self):
         decision = assess_content_quality(
             transcript="有效课程内容" * 80,

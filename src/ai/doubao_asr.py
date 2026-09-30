@@ -16,6 +16,8 @@ import uuid
 
 import requests
 
+from src.ai.segment_rescue import MAX_CLOUD_CLIPS, MAX_CLOUD_SECONDS
+
 
 BASE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel"
 RESOURCE_ID = "volc.seedasr.auc"
@@ -179,3 +181,49 @@ def transcribe_pcm(path: str, api_key: str, actual_duration_s: float,
     if not text:
         raise CloudASRError("cloud ASR returned no speech")
     return text, segments
+
+
+def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
+                         *, session: requests.Session | None = None,
+                         max_seconds: float = MAX_CLOUD_SECONDS,
+                         max_clips: int = MAX_CLOUD_CLIPS,
+                         ) -> tuple[list[tuple[dict, list[dict]]], float, bool]:
+    """Recognize only selected short speech intervals.
+
+    Return (completed rescues, attempted audio seconds, cloud_failed).  On the
+    first cloud error, stop spending quota but retain earlier useful results.
+    This function also enforces the per-lecture duration and clip-count caps.
+    """
+    if not api_key or not intervals:
+        return [], 0.0, False
+    own_session = session is None
+    session = session or requests.Session()
+    rescues = []
+    attempted = 0.0
+    failed = False
+    max_seconds = min(MAX_CLOUD_SECONDS, max(0, max_seconds))
+    max_clips = min(MAX_CLOUD_CLIPS, max(0, max_clips))
+    try:
+        for interval in intervals:
+            if len(rescues) >= max_clips:
+                break
+            start = interval["start_ms"] / 1000
+            duration = (interval["end_ms"] - interval["start_ms"]) / 1000
+            if (duration <= 0 or duration > 60
+                    or attempted + duration > max_seconds):
+                continue
+            try:
+                audio = _encode_chunk(path, start, duration)
+                attempted += duration
+                segments = _recognize_chunk(
+                    audio, api_key, interval["start_ms"],
+                    int(duration * 1000), session,
+                )
+            except CloudASRError:
+                failed = True
+                break
+            rescues.append((interval, segments))
+    finally:
+        if own_session:
+            session.close()
+    return rescues, attempted, failed

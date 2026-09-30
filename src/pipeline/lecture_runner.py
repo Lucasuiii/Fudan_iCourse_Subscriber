@@ -15,7 +15,7 @@ log greps):
   C  schedule **next** lecture's prefetch (images always; audio only when
      the next lecture will actually be ASR-transcribed) so its download
      overlaps with the current lecture's ASR.
-  D  transcript: cached → Seed-ASR 2.0 → local ASR. Official iCourse
+  D  transcript: cached → local ASR → bounded Seed-ASR rescue. Official iCourse
      subtitles only warn about timeline differences and supplement substantial
      ASR gaps.
      For ASR, ``Scheduler.audio_downloader
@@ -45,6 +45,12 @@ from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
 from src.ai import doubao_asr
+from src.ai.segment_rescue import (
+    MAX_CLOUD_CLIPS,
+    MAX_CLOUD_SECONDS,
+    merge_rescued_segments,
+    select_weak_windows,
+)
 from src.pipeline.ppt_pipeline import PPTPipeline
 from src.ai.transcriber import IncompleteAudioError, NoAudioStreamError
 from src.runtime import config
@@ -80,6 +86,10 @@ class LectureRunner:
         self._transcript_source = "unknown"
         self._asr_actual_duration = 0.0
         self._asr_expected_duration = 0.0
+        self._cloud_seconds = 0.0
+        self._cloud_windows = set()
+        self._cloud_failed = False
+        self._asr_audio_path = None
 
     # ── Public entry point ──────────────────────────────────────────────
 
@@ -98,6 +108,10 @@ class LectureRunner:
         self._transcript_source = "unknown"
         self._asr_actual_duration = 0.0
         self._asr_expected_duration = 0.0
+        self._cloud_seconds = 0.0
+        self._cloud_windows = set()
+        self._cloud_failed = False
+        self._asr_audio_path = None
         self._reporter.lecture_start(course_title, sub_title, date)
 
         existing = self._db.get_lecture(sub_id)
@@ -149,6 +163,9 @@ class LectureRunner:
         # is terminal "No Content" (for example, the teacher never arrived).
         # Ambiguous technical cases are retried instead of being summarized.
         ppt_pages = self._db.get_done_ppt_pages(sub_id)
+        transcript, transcript_segments = self._refine_unclear_transcript(
+            transcript, transcript_segments, ppt_pages,
+        )
         ppt_status_counts = self._db.get_ppt_status_counts(sub_id)
         ppt_uncertain = (
             ppt_status_counts.get("failed", 0)
@@ -338,43 +355,54 @@ class LectureRunner:
             return None, None
 
         try:
-            cloud_ok = False
+            transcript, segments = self._transcriber.transcribe_tail(
+                handle.path, handle.process, handle.stderr_chunks,
+            )
+            self._transcript_source = "local_asr"
+            self._asr_audio_path = handle.path
+            self._asr_actual_duration = self._transcriber.last_audio_duration
+            self._asr_expected_duration = (
+                self._transcriber.last_media_duration or 0.0
+            )
+            self._warn_short_audio(
+                self._asr_actual_duration, self._asr_expected_duration,
+            )
+            self._warn_official_tail(self._asr_actual_duration, official)
             if config.DOUBAO_ASR_API_KEY:
-                try:
-                    actual, expected = doubao_asr.wait_for_complete_audio(
-                        handle.path, handle.process, handle.stderr_chunks,
+                weak = select_weak_windows(
+                    self._transcriber.last_speech_windows,
+                    self._asr_actual_duration,
+                    # Leave clip slots for the context/PPT review when there
+                    # is enough local text to make that review meaningful.
+                    max_clips=(MAX_CLOUD_CLIPS // 2 if len(transcript) >= 200
+                               else MAX_CLOUD_CLIPS),
+                )
+                if weak:
+                    rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
+                        handle.path, config.DOUBAO_ASR_API_KEY, weak,
                     )
-                    self._warn_short_audio(actual, expected)
-                    self._warn_official_tail(actual, official)
-                    transcript, segments = doubao_asr.transcribe_pcm(
-                        handle.path, config.DOUBAO_ASR_API_KEY, actual,
+                    self._cloud_seconds = attempted
+                    self._cloud_failed = failed
+                    self._cloud_windows.update(
+                        (w["start_ms"], w["end_ms"]) for w in weak
                     )
-                    self._transcript_source = "cloud_asr"
-                    self._asr_actual_duration = actual
-                    self._asr_expected_duration = expected
-                    cloud_ok = True
+                    segments = merge_rescued_segments(segments, rescues)
+                    transcript = " ".join(s["text"] for s in segments)
+                    if any(result for _, result in rescues):
+                        self._transcript_source = "hybrid_asr"
                     self._reporter.info(
-                        f"    [ASR] Seed-ASR 2.0: {len(transcript)} chars"
+                        f"    [ASR] Local-first; cloud rescue attempted "
+                        f"{attempted:.1f}s/{MAX_CLOUD_SECONDS}s, "
+                        f"recovered {sum(bool(result) for _, result in rescues)} "
+                        f"of {len(weak)} weak clips"
+                        + ("; stopped after cloud error" if failed else "")
+                        + "."
                     )
-                except (doubao_asr.CloudAudioError,
-                        doubao_asr.CloudASRError) as e:
+                else:
                     self._reporter.info(
-                        f"    [ASR] Cloud unavailable ({type(e).__name__}); "
-                        "using local ASR."
+                        "    [ASR] Local-first; no weak speech clips "
+                        "eligible for cloud rescue."
                     )
-            if not cloud_ok:
-                transcript, segments = self._transcriber.transcribe_tail(
-                    handle.path, handle.process, handle.stderr_chunks,
-                )
-                self._transcript_source = "local_asr"
-                self._asr_actual_duration = self._transcriber.last_audio_duration
-                self._asr_expected_duration = (
-                    self._transcriber.last_media_duration or 0.0
-                )
-                self._warn_short_audio(
-                    self._asr_actual_duration, self._asr_expected_duration,
-                )
-                self._warn_official_tail(self._asr_actual_duration, official)
         except NoAudioStreamError as e:
             self._reporter.info("    [SKIP] Video-only (no audio stream).")
             # Do not mark this as processed: retry it like other media
@@ -414,6 +442,37 @@ class LectureRunner:
             )
             transcript = " ".join(s["text"] for s in segments)
         return transcript, segments
+
+    def _refine_unclear_transcript(self, transcript, segments, ppt_pages):
+        """Let the LLM propose existing speech windows within remaining quota."""
+        remaining = MAX_CLOUD_SECONDS - self._cloud_seconds
+        clips_left = MAX_CLOUD_CLIPS - len(self._cloud_windows)
+        if (not config.DOUBAO_ASR_API_KEY or self._cloud_failed
+                or not self._asr_audio_path or remaining <= 0 or clips_left <= 0
+                or self._transcript_source not in ("local_asr", "hybrid_asr")
+                or len(transcript.strip()) < 200):
+            return transcript, segments
+        suspects = self._summarizer.find_unclear_windows(
+            self._transcriber.last_speech_windows, ppt_pages, self._cloud_windows,
+        )
+        if not suspects:
+            return transcript, segments
+        rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
+            self._asr_audio_path, config.DOUBAO_ASR_API_KEY, suspects,
+            max_seconds=remaining, max_clips=clips_left,
+        )
+        self._cloud_seconds += attempted
+        self._cloud_failed = failed
+        merged = merge_rescued_segments(segments or [], rescues)
+        if any(result for _, result in rescues):
+            self._transcript_source = "hybrid_asr"
+        self._reporter.info(
+            f"    [ASR] LLM review rescue: {attempted:.1f}s attempted; "
+            f"lecture total={self._cloud_seconds:.1f}s/{MAX_CLOUD_SECONDS}s; "
+            f"recovered {sum(bool(result) for _, result in rescues)} clips"
+            + ("; stopped after cloud error" if failed else "") + "."
+        )
+        return " ".join(segment["text"] for segment in merged), merged
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:

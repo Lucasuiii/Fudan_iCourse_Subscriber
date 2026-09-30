@@ -7,6 +7,7 @@ from openai import OpenAI
 
 from src.runtime import config
 from src.ai.tavily_enrichment import enrich_summary
+from src.ai.asr_review import review_windows
 
 _DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "lecture_summary.md"
@@ -127,3 +128,18 @@ class Summarizer:
         raise RuntimeError(
             "All LLM models failed:\n" + "\n".join(errors)
         )
+
+    def find_unclear_windows(self, windows: list[dict], ppt_pages: list[dict],
+                             excluded: set[tuple[int, int]]) -> list[dict]:
+        """One optional review call, using the existing first provider/model."""
+        provider = self.providers[0]
+        try:
+            return review_windows(
+                self._clients[provider["name"]], provider["models"][0],
+                windows, ppt_pages, excluded,
+                disable_thinking=provider["name"] == "deepseek",
+            )
+        except Exception as exc:
+            print(f"[ASR review] Unavailable ({type(exc).__name__}); "
+                  "keeping local transcription.")
+            return []

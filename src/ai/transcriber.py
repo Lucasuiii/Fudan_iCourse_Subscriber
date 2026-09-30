@@ -204,6 +204,7 @@ class Transcriber:
         self._last_duration = 0.0           # audio seconds from last transcription
         self._last_transcript = ""           # text from last transcription
         self._last_segments: list[dict] = []
+        self._last_speech_windows: list[dict] = []
         self._media_duration: Optional[float] = None
 
     @property
@@ -215,6 +216,11 @@ class Transcriber:
     def last_media_duration(self) -> Optional[float]:
         """Container duration parsed for the most recent ASR pass."""
         return self._media_duration
+
+    @property
+    def last_speech_windows(self) -> list[dict]:
+        """VAD speech windows, including those for which local ASR was empty."""
+        return self._last_speech_windows
 
     # ── Model lifecycle ─────────────────────────────────────────────────
 
@@ -345,11 +351,14 @@ class Transcriber:
             stream.accept_waveform(SAMPLE_RATE, samples)
             self._recognizer.decode_stream(stream)
             text = _postprocess_segment(stream.result.text)
+            start_ms = int(seg_start_samples / SAMPLE_RATE * 1000)
+            end_ms = int(
+                (seg_start_samples + len(samples)) / SAMPLE_RATE * 1000
+            )
+            self._last_speech_windows.append({
+                "start_ms": start_ms, "end_ms": end_ms, "text": text,
+            })
             if text:
-                start_ms = int(seg_start_samples / SAMPLE_RATE * 1000)
-                end_ms = int(
-                    (seg_start_samples + len(samples)) / SAMPLE_RATE * 1000
-                )
                 segments.append({
                     "start_ms": start_ms,
                     "end_ms": end_ms,
@@ -385,6 +394,7 @@ class Transcriber:
         """
         self._init()
         self._reset_vad()
+        self._last_speech_windows = []
         t0 = time.time()
         print(f"[Transcriber] Starting {label} at {time.strftime('%H:%M:%S')}",
               flush=True)

@@ -105,6 +105,44 @@ class DoubaoASRTests(unittest.TestCase):
                                 (3_600_000, 1000)])
         self.assertEqual(text, "课堂内容 课堂内容 课堂内容")
 
+    def test_rescue_uploads_only_selected_intervals_and_stops_on_error(self):
+        intervals = [
+            {"start_ms": 30_000, "end_ms": 40_000, "text": ""},
+            {"start_ms": 90_000, "end_ms": 100_000, "text": "嗯"},
+            {"start_ms": 150_000, "end_ms": 160_000, "text": ""},
+        ]
+        with patch.object(doubao_asr, "_encode_chunk",
+                          return_value=b"mp3") as encode, \
+             patch.object(doubao_asr, "_recognize_chunk", side_effect=[
+                 [{"start_ms": 30_000, "end_ms": 40_000,
+                   "text": "修复内容"}],
+                 doubao_asr.CloudASRError("failed"),
+             ]) as recognize:
+            recovered, attempted, failed = doubao_asr.rescue_intervals_pcm(
+                "unused", "key", intervals, session=MagicMock(),
+            )
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(attempted, 20)
+        self.assertTrue(failed)
+        self.assertEqual(encode.call_count, 2)
+        self.assertEqual(recognize.call_count, 2)
+        self.assertEqual(encode.call_args_list[0].args, ("unused", 30, 10))
+
+    def test_rescue_respects_remaining_shared_budget(self):
+        intervals = [
+            {"start_ms": i * 30_000, "end_ms": i * 30_000 + 20_000,
+             "text": ""} for i in range(20)
+        ]
+        with patch.object(doubao_asr, "_encode_chunk", return_value=b"mp3"), \
+             patch.object(doubao_asr, "_recognize_chunk", return_value=[]):
+            rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
+                "unused", "key", intervals, session=MagicMock(),
+                max_seconds=35, max_clips=2,
+            )
+        self.assertEqual(attempted, 20)
+        self.assertEqual(len(rescues), 1)
+        self.assertFalse(failed)
+
 
 if __name__ == "__main__":
     unittest.main()
