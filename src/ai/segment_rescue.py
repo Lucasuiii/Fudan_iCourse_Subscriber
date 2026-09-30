@@ -6,7 +6,7 @@ silent stretches are never sent to the cloud merely because the transcript is
 sparse.  The budget is per lecture, not per retry or account.
 """
 
-MAX_CLOUD_SECONDS = 5 * 60
+MAX_CLOUD_SECONDS = 10 * 60
 MAX_CLOUD_CLIPS = 10
 MIN_EMPTY_SPEECH_SECONDS = 5
 MIN_WEAK_SPEECH_SECONDS = 10
