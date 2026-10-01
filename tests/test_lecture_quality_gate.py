@@ -220,7 +220,7 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         )
         runner._asr_audio_path = "audio.raw"
         runner._transcript_source = "local_asr"
-        runner._cloud_seconds = 270
+        runner._cloud_seconds = 570
         runner._cloud_windows = {(i * 30_000, i * 30_000 + 10_000)
                                  for i in range(1, 9)}
         from src.runtime import config
@@ -228,10 +228,13 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         with patch.object(config, "DOUBAO_ASR_API_KEY", "key"), \
              patch.object(doubao_asr, "rescue_intervals_pcm",
                           return_value=([(suspect, local)], 20, False)) as rescue:
-            runner._refine_unclear_transcript(local[0]["text"], local, [])
+            runner._refine_unclear_transcript(local[0]["text"], local, [],
+                                              course_title="高等代数Ⅰ")
         self.assertEqual(rescue.call_args.kwargs,
                          {"max_seconds": 30, "max_clips": 2})
-        self.assertEqual(runner._cloud_seconds, 290)
+        self.assertEqual(runner._cloud_seconds, 590)
+        self.assertEqual(summarizer.find_unclear_windows.call_args.kwargs,
+                         {"course_title": "高等代数Ⅰ"})
 
     def test_no_content_bypasses_llm_and_email_batch(self):
         LectureRunner = _load_runner_class()

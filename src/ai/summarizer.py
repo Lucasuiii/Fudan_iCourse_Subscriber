@@ -8,6 +8,7 @@ from openai import OpenAI
 from src.runtime import config
 from src.ai.tavily_enrichment import enrich_summary
 from src.ai.asr_review import review_windows
+from src.ai.course_glossary import course_terms, terminology_reference
 
 _DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[2] / "prompts" / "lecture_summary.md"
@@ -64,6 +65,7 @@ class Summarizer:
                         "的授课脉络，将其整理为详细、连贯、适合复习的"
                         "课程笔记。\n\n"
                         f"<course_material>\n{content}\n</course_material>"
+                        + terminology_reference(title)
                     ),
                 },
             ],
@@ -130,7 +132,8 @@ class Summarizer:
         )
 
     def find_unclear_windows(self, windows: list[dict], ppt_pages: list[dict],
-                             excluded: set[tuple[int, int]]) -> list[dict]:
+                             excluded: set[tuple[int, int]],
+                             *, course_title: str = "") -> list[dict]:
         """One optional review call, using the existing first provider/model."""
         provider = self.providers[0]
         try:
@@ -138,6 +141,7 @@ class Summarizer:
                 self._clients[provider["name"]], provider["models"][0],
                 windows, ppt_pages, excluded,
                 disable_thinking=provider["name"] == "deepseek",
+                terms=course_terms(course_title),
             )
         except Exception as exc:
             print(f"[ASR review] Unavailable ({type(exc).__name__}); "

@@ -51,6 +51,22 @@ class SummarizerPromptTests(unittest.TestCase):
         self.assertNotIn("字符数", user_message)
         self.assertEqual(kwargs["temperature"], 0.2)
 
+    def test_course_terms_are_separate_from_unchanged_material(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="笔记"))],
+            usage=None,
+        )
+        summarizer = Summarizer.__new__(Summarizer)
+        summarizer.system_prompt = load_system_prompt()
+        summarizer._call_llm(client, "model", "数值算法与案例分析Ⅰ", "劳动举证")
+        message = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("<course_material>\n劳动举证\n</course_material>", message)
+        self.assertIn("<terminology_reference>", message)
+        self.assertIn("希尔伯特矩阵", message)
+        self.assertIn("不得全局强制替换", summarizer.system_prompt)
+        client.chat.completions.create.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,8 @@ MAX_INPUT_CHARS = 30_000
 
 def review_windows(client, model: str, windows: list[dict], ppt_pages: list[dict],
                    excluded: set[tuple[int, int]],
-                   *, disable_thinking: bool = False) -> list[dict]:
+                   *, disable_thinking: bool = False,
+                   terms: list[str] | None = None) -> list[dict]:
     # Keep neighbouring windows for context. Sample evenly only for very long
     # lectures; eligible IDs remain tied to original VAD windows.
     indices = list(range(len(windows)))
@@ -35,7 +36,8 @@ def review_windows(client, model: str, windows: list[dict], ppt_pages: list[dict
         return []
     ppt = "\n".join(str(page.get("text") or "") for page in ppt_pages)[:6_000]
     payload = json.dumps({"columns": ["id", "start_seconds", "eligible", "text"],
-                          "segments": rows, "ppt": ppt}, ensure_ascii=False)
+                          "segments": rows, "ppt": ppt,
+                          "terminology_reference": (terms or [])[:30]}, ensure_ascii=False)
     if len(payload) > MAX_INPUT_CHARS:
         # No extra calls or truncated JSON when the budget is exceeded.
         return []

@@ -24,10 +24,15 @@ class ASRReviewTests(unittest.TestCase):
                 ],
             })))],
         )
-        result = review_windows(client, "model", windows, [], {(0, 20_000)})
+        result = review_windows(client, "model", windows, [], {(0, 20_000)},
+                                terms=["扰动", "矩阵"])
         self.assertEqual(result, [windows[1]])
         client.chat.completions.create.assert_called_once()
         self.assertEqual(client.chat.completions.create.call_args.kwargs["max_tokens"], 1_000)
+        payload = json.loads(client.chat.completions.create.call_args.kwargs[
+            "messages"][1]["content"])
+        self.assertEqual(payload["terminology_reference"], ["扰动", "矩阵"])
+        self.assertEqual(windows[1]["text"], "术语可能识别错误")
 
     def test_silence_does_not_trigger_llm_call(self):
         client = MagicMock()

@@ -164,7 +164,7 @@ class LectureRunner:
         # Ambiguous technical cases are retried instead of being summarized.
         ppt_pages = self._db.get_done_ppt_pages(sub_id)
         transcript, transcript_segments = self._refine_unclear_transcript(
-            transcript, transcript_segments, ppt_pages,
+            transcript, transcript_segments, ppt_pages, course_title=course_title,
         )
         ppt_status_counts = self._db.get_ppt_status_counts(sub_id)
         ppt_uncertain = (
@@ -443,7 +443,8 @@ class LectureRunner:
             transcript = " ".join(s["text"] for s in segments)
         return transcript, segments
 
-    def _refine_unclear_transcript(self, transcript, segments, ppt_pages):
+    def _refine_unclear_transcript(self, transcript, segments, ppt_pages,
+                                   *, course_title=""):
         """Let the LLM propose existing speech windows within remaining quota."""
         remaining = MAX_CLOUD_SECONDS - self._cloud_seconds
         clips_left = MAX_CLOUD_CLIPS - len(self._cloud_windows)
@@ -454,6 +455,7 @@ class LectureRunner:
             return transcript, segments
         suspects = self._summarizer.find_unclear_windows(
             self._transcriber.last_speech_windows, ppt_pages, self._cloud_windows,
+            course_title=course_title,
         )
         if not suspects:
             return transcript, segments
