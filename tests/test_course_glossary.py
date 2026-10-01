@@ -10,6 +10,10 @@ class CourseGlossaryTests(unittest.TestCase):
     def test_normalized_course_title_and_no_cross_course_leakage(self):
         self.assertIn("扰动", course_terms("数值算法与案例分析 Ⅰ"))
         self.assertIn("行列式", course_terms("高等代数 I"))
+        self.assertIn("哈希表", course_terms("数据结构（H）"))
+        self.assertIn("BFS", course_terms("数据结构 (H)"))
+        self.assertEqual(len(course_terms("数据结构（H）")), 30)
+        self.assertEqual(course_terms("数据结构"), [])
         self.assertEqual(course_terms("高等代数II"), [])
         self.assertEqual(course_terms("其他课程"), [])
         self.assertEqual(terminology_reference("其他课程"), "")
