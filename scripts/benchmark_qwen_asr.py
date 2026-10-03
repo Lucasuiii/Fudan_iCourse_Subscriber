@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import resource
 import subprocess
 import sys
 import time
+from urllib.parse import urlparse
 
 MODEL = "Qwen/Qwen3-ASR-1.7B"
 REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
@@ -40,24 +42,74 @@ def parse_request(raw: str) -> dict:
             "offset": offset, "duration": duration}
 
 
+def auth_phase(url: str) -> str:
+    """Only allowlisted step names, never URL/token/account data in logs."""
+    path = urlparse(url).path.rstrip("/")
+    for suffix, label in (("/authenticate", "auth_context"),
+                          ("/queryAuthMethods", "auth_methods"),
+                          ("/getJsPublicKey", "public_key"),
+                          ("/authExecute", "credential_exchange"),
+                          ("/authnEngine", "cas_ticket"),
+                          ("/casapi/index.php", "icourse_cas"),
+                          ("/infosimple", "verify_icourse")):
+        if path.endswith(suffix):
+            return label
+    return "portal_or_redirect"
+
+
+def configure_auth_session(session, events):
+    """Benchmark-only timeout policy; do not replay credential POSTs or tickets."""
+    original = session.request
+
+    def request(method, url, **kwargs):
+        timeout = kwargs.get("timeout", 60)
+        read_timeout = timeout[1] if isinstance(timeout, tuple) else timeout
+        kwargs["timeout"] = (15, max(20, min(90, read_timeout * 1.5)))
+        event = {"phase": auth_phase(url), "method": method.upper()}
+        events.append(event)
+        began = time.perf_counter()
+        try:
+            response = original(method, url, **kwargs)
+            event["status"] = response.status_code
+            return response
+        except Exception as error:
+            event["error_type"] = type(error).__name__
+            raise
+        finally:
+            event["seconds"] = round(time.perf_counter() - began, 2)
+
+    session.request = request
+
+
 def fetch() -> None:
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
     request = parse_request(os.environ["QWEN_ASR_TEST_REQUEST"])
     print("Acquiring one privately selected authorized audio slice", flush=True)
-    for attempt in range(3):
-        print(f"Authentication attempt {attempt + 1}/3", flush=True)
+    failures = []
+    for attempt in range(5):
+        print(f"Authentication attempt {attempt + 1}/5", flush=True)
+        private_log = io.StringIO()
+        events = []
+        vpn = WebVPNSession()
+        configure_auth_session(vpn.session, events)
         try:
-            with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
-                vpn = WebVPNSession()
+            with contextlib.redirect_stdout(private_log), contextlib.redirect_stderr(private_log):
                 if not vpn.login() or not vpn.authenticate_icourse():
                     raise RuntimeError("Authentication did not complete")
             break
         except Exception as error:
-            print(f"Authentication attempt failed ({type(error).__name__})", flush=True)
-            if attempt == 2:
+            phase = events[-1]["phase"] if events else "initialization"
+            failures.append({"attempt": attempt + 1, "events": events,
+                             "error_type": type(error).__name__,
+                             "private_error": str(error)[-2000:],
+                             "private_log": private_log.getvalue()[-6000:]})
+            save_encrypted({"stage": "authentication", "attempts": failures})
+            print(f"Authentication attempt failed ({type(error).__name__}, phase={phase})", flush=True)
+            vpn.session.close()
+            if attempt == 4:
                 raise
-            time.sleep(5)
+            time.sleep((15, 30, 60, 90)[attempt])
     print("Authentication complete; resolving selected playback", flush=True)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
         client = ICourseClient(vpn)

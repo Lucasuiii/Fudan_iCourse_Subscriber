@@ -1,7 +1,8 @@
 import json
 import unittest
+from unittest.mock import Mock
 
-from scripts.benchmark_qwen_asr import parse_request
+from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session
 from scripts.qwen_segmentation import plan_chunks, join_chunk_text
 
 
@@ -46,6 +47,26 @@ class QwenBenchmarkTests(unittest.TestCase):
         rows = [{"start": 0, "end": 30, "text": "矩阵"},
                 {"start": 28, "end": 60, "text": "矩阵很重要"}]
         self.assertEqual(join_chunk_text(rows), "矩阵\n矩阵很重要")
+
+    def test_auth_phase_never_exposes_query_or_unknown_path(self):
+        self.assertEqual(auth_phase('https://example.org/idp/authn/authExecute?token=private'), 'credential_exchange')
+        self.assertEqual(auth_phase('https://example.org/private-account?ticket=private'), 'portal_or_redirect')
+
+    def test_timeout_policy_and_safe_diagnostics(self):
+        session = Mock()
+        response = Mock(status_code=200)
+        original = Mock(return_value=response)
+        session.request = original
+        events = []
+        configure_auth_session(session, events)
+        session.request('GET', 'https://example.org/', timeout=5)
+        self.assertEqual(original.call_args.kwargs['timeout'], (15, 20))
+        original.side_effect = TimeoutError('private-token')
+        with self.assertRaises(TimeoutError):
+            session.request('POST', 'https://example.org/authExecute', timeout=60)
+        self.assertEqual(original.call_count, 2)  # No credential POST replay.
+        self.assertNotIn('private-token', json.dumps(events))
+        self.assertEqual(events[-1]['error_type'], 'TimeoutError')
 
 
 if __name__ == "__main__":
