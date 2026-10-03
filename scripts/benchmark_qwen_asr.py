@@ -66,12 +66,13 @@ def fetch() -> None:
             raise RuntimeError("No playback available")
         media, headers = client.get_stream_params(url)
         # Input-side seeking: pull media index and the selected interval only.
+        full = os.environ.get("FULL_LECTURE") == "true"
         process = subprocess.run([
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-headers", headers, "-ss", str(request["offset"]), "-i", media,
-            "-t", str(request["duration"]), "-vn", "-ac", "1", "-ar", "16000",
+            "-headers", headers, "-ss", str(0 if full else request["offset"]), "-i", media,
+            "-t", str(10800 if full else request["duration"]), "-vn", "-ac", "1", "-ar", "16000",
             "-y", str(workspace() / "audio.wav"),
-        ], stdout=quiet, stderr=subprocess.PIPE, timeout=420)
+        ], stdout=quiet, stderr=subprocess.PIPE, timeout=1200 if full else 420)
         if process.returncode:
             save_encrypted({"stage": "audio_acquisition", "returncode": process.returncode,
                             "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
@@ -90,6 +91,9 @@ def save_encrypted(report: dict) -> None:
 
 
 def infer() -> None:
+    if os.environ.get("FULL_LECTURE") == "true":
+        infer_lecture()
+        return
     import soundfile as sf
     import torch
     import sherpa_onnx
@@ -170,6 +174,109 @@ def infer() -> None:
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
     save_encrypted(report)
     print(f"Benchmark completed: selected RTF={ratio:.3f}, peak RSS={report['peak_rss_gib']:.2f} GiB", flush=True)
+
+
+def infer_lecture() -> None:
+    """One authorized lecture, serial CPU inference, VAD and encrypted checkpoints."""
+    import gc
+    import soundfile as sf
+    import torch
+    import sherpa_onnx
+    from huggingface_hub import snapshot_download
+    from qwen_asr import Qwen3ASRModel
+    from scripts.qwen_segmentation import plan_chunks, join_chunk_text
+
+    torch.set_num_threads(4)
+    torch.set_num_interop_threads(1)
+    path = workspace() / "audio.wav"
+    info = sf.info(path)
+    if info.samplerate != 16000 or info.channels != 1 or not 0 < info.duration <= 10800.1:
+        raise ValueError("Invalid full lecture audio")
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = str(Path(os.environ["RUNNER_TEMP"]) / "silero_vad.onnx")
+    config.silero_vad.threshold = 0.5
+    config.silero_vad.min_silence_duration = 0.8
+    config.silero_vad.min_speech_duration = 0.25
+    config.silero_vad.max_speech_duration = 28.0
+    config.sample_rate = 16000
+    config.num_threads = 1
+    vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
+    windows = []
+
+    def drain():
+        while not vad.empty():
+            segment = vad.front
+            windows.append((segment.start / 16000,
+                            min(info.duration, (segment.start + len(segment.samples)) / 16000)))
+            vad.pop()
+
+    began = time.perf_counter()
+    for block in sf.blocks(path, blocksize=512, dtype="float32"):
+        vad.accept_waveform(block)
+        drain()
+    vad.flush()
+    drain()
+    chunks = plan_chunks(windows, info.duration)
+    # Compute union duration, not summed overlapping windows.
+    union_end, included = 0.0, 0.0
+    for start, end in chunks:
+        included += max(0, end - max(start, union_end))
+        union_end = max(union_end, end)
+    report = {"model": MODEL, "revision": REVISION, "source": "authorized_full_lecture",
+              "audio_seconds": info.duration, "vad_seconds": time.perf_counter() - began,
+              "acquisition_limit_reached": info.duration >= 10800,
+              "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
+              "vad_windows": windows, "planned_chunks": chunks, "full_chunks": [],
+              "complete": False, "device": "cpu", "dtype": "float32", "threads": 4}
+    save_encrypted(report)
+    del vad
+    gc.collect()
+    print(f"VAD completed: audio={info.duration:.1f}s, chunks={len(chunks)}, skipped={info.duration-included:.1f}s", flush=True)
+    if not chunks:
+        report["complete"] = True
+        report["transcript"] = ""
+        save_encrypted(report)
+        return
+    began = time.perf_counter()
+    model_path = snapshot_download(MODEL, revision=REVISION,
+                                  allow_patterns=["*.json", "*.safetensors", "*.txt"])
+    model = Qwen3ASRModel.from_pretrained(model_path, dtype=torch.float32,
+        device_map="cpu", attn_implementation="eager", max_inference_batch_size=1,
+        max_new_tokens=512)
+    report["load_including_download_seconds"] = time.perf_counter() - began
+    with sf.SoundFile(path) as source:
+        for index, (start, end) in enumerate(chunks):
+            source.seek(round(start * 16000))
+            samples = source.read(round(end * 16000) - round(start * 16000), dtype="float32")
+            began = time.perf_counter()
+            for attempt in range(2):
+                try:
+                    with torch.inference_mode():
+                        result = model.transcribe(audio=(samples, 16000), context=TERMS, language="Chinese")[0]
+                    break
+                except Exception:
+                    if attempt == 1:
+                        report["failed_chunk"] = index
+                        save_encrypted(report)
+                        raise
+                    gc.collect()
+            row = {"start": start, "end": end, "text": result.text,
+                   "seconds": time.perf_counter() - began,
+                   "attempts": attempt + 1,
+                   "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2}
+            # Linux current RSS distinguishes retained allocations from the peak.
+            row["rss_gib"] = int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024**3
+            report["full_chunks"].append(row)
+            save_encrypted(report)
+            print(f"Lecture chunk={index+1}/{len(chunks)}, seconds={row['seconds']:.2f}, RSS={row['rss_gib']:.2f}GiB", flush=True)
+            del samples, result
+            gc.collect()
+    report["transcript"] = join_chunk_text(report["full_chunks"])
+    report["full_slice_seconds"] = sum(row["seconds"] for row in report["full_chunks"])
+    report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
+    report["complete"] = info.duration < 10800
+    save_encrypted(report)
+    print("Full lecture completed; private text is encrypted only", flush=True)
 
 
 def clean() -> None:

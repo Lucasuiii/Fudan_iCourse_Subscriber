@@ -7,24 +7,36 @@ on:
         description: 'Use Qwen official public sample to isolate CPU feasibility from iCourse networking'
         type: boolean
         default: false
+      full_lecture:
+        description: 'Test the entire authorized lecture (maximum 3 hours), with VAD; no production changes'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: qwen-asr-benchmark-${{ inputs.public_sample }}
+  group: qwen-asr-benchmark
   cancel-in-progress: false
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 300
     env:
       HF_HUB_DISABLE_TELEMETRY: '1'
       TOKENIZERS_PARALLELISM: 'false'
       OMP_NUM_THREADS: '4'
       MKL_NUM_THREADS: '4'
+      FULL_LECTURE: ${{ inputs.full_lecture }}
     steps:
+      - name: Validate isolated test mode
+        env:
+          PUBLIC_SAMPLE: ${{ inputs.public_sample }}
+        run: |
+          if [ "$PUBLIC_SAMPLE" = true ] && [ "$FULL_LECTURE" = true ]; then
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -52,9 +64,13 @@ jobs:
           python -m pip install qwen-asr==0.0.6 --no-deps
           python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa soundfile qwen-omni-utils sox sherpa-onnx
       - name: Download public SenseVoice baseline
+        if: ${{ !inputs.full_lecture }}
         run: |
           curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2 -o "$RUNNER_TEMP/sensevoice.tar.bz2"
           tar xf "$RUNNER_TEMP/sensevoice.tar.bz2" -C "$RUNNER_TEMP"
+      - name: Download public speech detector
+        if: ${{ inputs.full_lecture }}
+        run: curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
       - name: Run Qwen 1.7B on CPU and encrypt the comparison
         env:
           QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
