@@ -127,7 +127,7 @@ def infer() -> None:
                                 "end": end, "text": stream.result.text,
                                 "seconds": time.perf_counter() - began})
     del baseline
-    print("SenseVoice baseline finished on the same four selected clips", flush=True)
+    print(f"SenseVoice baseline finished on {len(windows)} matching clip(s)", flush=True)
     began = time.perf_counter()
     model_path = snapshot_download(MODEL, revision=REVISION,
         allow_patterns=["*.json", "*.safetensors", "*.txt"])
@@ -162,9 +162,11 @@ def infer() -> None:
             save_encrypted(report)
             print(f"Full slice chunk={start // 30 + 1}/20, seconds={elapsed:.3f}", flush=True)
         report["full_slice_seconds"] = sum(row["seconds"] for row in report["full_chunks"])
-    else:
+    elif not public_sample:
         report["full_slice_skipped"] = "Selected clips took over 3x real time on CPU"
         print("Skipping full slice: selected-clip CPU real-time factor exceeds 3", flush=True)
+    else:
+        report["full_slice_skipped"] = "Public smoke sample only; no classroom slice used"
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
     save_encrypted(report)
     print(f"Benchmark completed: selected RTF={ratio:.3f}, peak RSS={report['peak_rss_gib']:.2f} GiB", flush=True)
