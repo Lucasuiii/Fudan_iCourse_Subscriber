@@ -38,6 +38,7 @@ jobs:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
           QWEN_ASR_TEST_REQUEST: ${{ secrets.QWEN_ASR_TEST_REQUEST }}
+          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
         run: python -m scripts.benchmark_qwen_asr fetch
       - name: Install isolated CPU inference dependencies
         run: |

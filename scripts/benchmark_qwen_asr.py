@@ -66,12 +66,16 @@ def fetch() -> None:
             raise RuntimeError("No playback available")
         media, headers = client.get_stream_params(url)
         # Input-side seeking: pull media index and the selected interval only.
-        subprocess.run([
-            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "quiet",
+        process = subprocess.run([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-headers", headers, "-ss", str(request["offset"]), "-i", media,
             "-t", str(request["duration"]), "-vn", "-ac", "1", "-ar", "16000",
             "-y", str(workspace() / "audio.wav"),
-        ], stdout=quiet, stderr=quiet, timeout=420, check=True)
+        ], stdout=quiet, stderr=subprocess.PIPE, timeout=420)
+        if process.returncode:
+            save_encrypted({"stage": "audio_acquisition", "returncode": process.returncode,
+                            "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
+            raise RuntimeError("Audio acquisition failed; encrypted diagnostic saved")
     print("Authorized slice acquisition completed; no audio artifact uploaded", flush=True)
 
 
