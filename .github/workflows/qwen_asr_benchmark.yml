@@ -2,12 +2,17 @@ name: Qwen ASR CPU Benchmark
 
 on:
   workflow_dispatch:
+    inputs:
+      public_sample:
+        description: 'Use Qwen official public sample to isolate CPU feasibility from iCourse networking'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: qwen-asr-benchmark
+  group: qwen-asr-benchmark-${{ inputs.public_sample }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +39,7 @@ jobs:
             sudo apt-get install -y ffmpeg
           fi
       - name: Fetch only the authorized test slice
+        if: ${{ !inputs.public_sample }}
         env:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
@@ -52,6 +58,7 @@ jobs:
       - name: Run Qwen 1.7B on CPU and encrypt the comparison
         env:
           QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+          PUBLIC_SAMPLE: ${{ inputs.public_sample }}
         run: python -m scripts.benchmark_qwen_asr infer
       - name: Save encrypted test result only
         if: always()

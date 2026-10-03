@@ -95,21 +95,30 @@ def infer() -> None:
     import sherpa_onnx
     from huggingface_hub import snapshot_download
     from qwen_asr import Qwen3ASRModel
+    public_sample = os.environ.get("PUBLIC_SAMPLE") == "true"
+    if public_sample:
+        import requests
+        response = requests.get("https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav", timeout=60)
+        response.raise_for_status()
+        (workspace() / "audio.wav").write_bytes(response.content)
+        print("Using Qwen official public Mandarin sample; NOT a classroom quality test", flush=True)
     audio, sr = sf.read(workspace() / "audio.wav", dtype="float32")
-    if sr != 16000 or audio.ndim != 1 or not 590 <= len(audio) / sr <= 600.1:
+    if sr != 16000 or audio.ndim != 1 or (not public_sample and not 590 <= len(audio) / sr <= 600.1):
         raise ValueError("Audio duration or format does not match the 10-minute test")
+    windows = [(0, len(audio) / sr)] if public_sample else WINDOWS
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
     report = {"model": MODEL, "revision": REVISION, "torch": torch.__version__,
               "device": "cpu", "threads": 4, "dtype": "float32", "clips": [],
               "audio_seconds": len(audio) / sr, "full_chunks": []}
+    report["source"] = "official_public_sample" if public_sample else "authorized_classroom_slice"
     save_encrypted(report)  # Check encryption before expensive inference.
     print(f"CPU threads=4; available RAM={os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024**3:.2f} GiB", flush=True)
     sense_dir = Path(os.environ["RUNNER_TEMP"]) / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
     baseline = sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model=str(sense_dir / "model.int8.onnx"), tokens=str(sense_dir / "tokens.txt"),
         num_threads=4, use_itn=True, debug=False)
-    for index, (start, end) in enumerate(WINDOWS):
+    for index, (start, end) in enumerate(windows):
         began = time.perf_counter()
         stream = baseline.create_stream()
         stream.accept_waveform(sr, audio[round(start * sr):round(end * sr)])
@@ -128,7 +137,7 @@ def infer() -> None:
     report["load_including_download_seconds"] = time.perf_counter() - began
     print("Qwen 1.7B loaded on CPU", flush=True)
     for hinted in (False, True):
-        for index, (start, end) in enumerate(WINDOWS):
+        for index, (start, end) in enumerate(windows):
             began = time.perf_counter()
             result = model.transcribe(audio=(audio[round(start * sr):round(end * sr)], sr),
                 context=TERMS if hinted else "", language="Chinese")[0]
@@ -142,7 +151,7 @@ def infer() -> None:
     ratio = sum(row["seconds"] for row in timed) / sum(row["end"] - row["start"] for row in timed)
     report["selected_clips_rtf"] = ratio
     # Avoid turning a CPU viability test into an unbounded full-course job.
-    if ratio <= 3:
+    if ratio <= 3 and not public_sample:
         for start in range(0, 600, 30):
             end = min(start + 30, len(audio) / sr)
             began = time.perf_counter()
