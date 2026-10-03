@@ -45,10 +45,21 @@ def fetch() -> None:
     from src.api.icourse import ICourseClient
     request = parse_request(os.environ["QWEN_ASR_TEST_REQUEST"])
     print("Acquiring one privately selected authorized audio slice", flush=True)
+    for attempt in range(3):
+        print(f"Authentication attempt {attempt + 1}/3", flush=True)
+        try:
+            with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+                vpn = WebVPNSession()
+                if not vpn.login() or not vpn.authenticate_icourse():
+                    raise RuntimeError("Authentication did not complete")
+            break
+        except Exception as error:
+            print(f"Authentication attempt failed ({type(error).__name__})", flush=True)
+            if attempt == 2:
+                raise
+            time.sleep(5)
+    print("Authentication complete; resolving selected playback", flush=True)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
-        vpn = WebVPNSession()
-        if not vpn.login() or not vpn.authenticate_icourse():
-            raise RuntimeError("Authentication did not complete")
         client = ICourseClient(vpn)
         url = client.get_video_url(request["course_id"], request["sub_id"])
         if not url:
