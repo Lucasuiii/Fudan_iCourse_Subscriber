@@ -207,8 +207,7 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
     attempted = 0.0
     failed = False
     max_seconds = min(MAX_CLOUD_SECONDS, max(0, max_seconds))
-    # Default production cap remains 10; isolated full-course trial may request 12.
-    max_clips = min(12, max(0, max_clips))
+    max_clips = min(MAX_CLOUD_CLIPS, max(0, max_clips))
     try:
         for interval in intervals:
             if len(rescues) >= max_clips:

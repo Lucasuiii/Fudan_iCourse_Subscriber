@@ -75,6 +75,7 @@ class AutomaticGlossary:
                 record=json.loads(value)
                 lecture=self.db.get_lecture(str(record.get('sub_id'))) if isinstance(record,dict) else None
                 if (isinstance(record,dict) and record.get('course_id')==self.course_id
+                        and isinstance(record.get('updated_at', ''), str)
                         and lecture and not lecture.get('deleted_at')
                         and str(lecture.get('course_id'))==self.course_id):
                     records.append(record)

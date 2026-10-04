@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import io
 import sys
 import unittest
 from types import SimpleNamespace
@@ -7,6 +8,49 @@ from src.ai.qwen_transcriber import QwenTranscriber, MODEL, REVISION
 
 
 class QwenRuntimeTests(unittest.TestCase):
+    def consume(self, transcriber, data, read_fn=None, chunks=None):
+        """Exercise the PCM loop without loading model weights or native VAD."""
+        vad = SimpleNamespace(empty=lambda: True, accept_waveform=lambda _: None,
+                              flush=lambda: None)
+        sherpa = SimpleNamespace(
+            VadModelConfig=lambda: SimpleNamespace(silero_vad=SimpleNamespace()),
+            VoiceActivityDetector=lambda *args, **kwargs: vad,
+        )
+        import tempfile
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(data); audio.flush()
+            with patch.dict(sys.modules, {'sherpa_onnx': sherpa}), \
+                 patch('src.ai.qwen_transcriber.plan_long_chunks', return_value=chunks or []):
+                return transcriber._consume_pcm_stream(
+                    read_fn or io.BytesIO(data).read, lambda: True,
+                    lambda: b'', lambda: 0, audio_path=audio.name,
+                )
+
+    def test_drains_final_pcm_written_between_empty_read_and_process_exit(self):
+        import numpy as np
+        block = np.zeros(512, dtype=np.float32).tobytes()
+        tail = np.zeros(10, dtype=np.float32).tobytes()
+        reads = iter([block, b'', tail, b''])
+        transcriber = QwenTranscriber()
+        self.consume(transcriber, block + tail, lambda _: next(reads, b''))
+        self.assertEqual(transcriber.last_audio_duration, 522 / 16000)
+
+    def test_timed_segments_keep_boundary_dedupe_and_raw_alignment_text(self):
+        import numpy as np
+        transcriber = QwenTranscriber()
+        transcriber._init = MagicMock()
+        transcriber._recognize = MagicMock(side_effect=[
+            {'text': '前面内容边界重复这句话'},
+            {'text': '边界重复这句话后续内容'},
+        ])
+        text, segments = self.consume(
+            transcriber, np.zeros(1024, dtype=np.float32).tobytes(),
+            chunks=[(0, 0.02), (0.015, 0.064)],
+        )
+        self.assertEqual(text, '\n'.join(s['text'] for s in segments))
+        self.assertEqual(segments[1]['text'], '后续内容')
+        self.assertEqual(transcriber.last_chunks[1]['text'], '边界重复这句话后续内容')
+
     def make(self,texts,tokens=3):
         t=QwenTranscriber()
         t._model=MagicMock()

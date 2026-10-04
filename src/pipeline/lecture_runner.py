@@ -1,8 +1,8 @@
 """Per-lecture state machine: prefetch → ASR → OCR drain → summarize → release.
 
 One ``LectureRunner`` instance drives one lecture from "started" to either
-"summary saved" or "deliberately skipped".  The class is single-use — make a
-new instance per lecture so error state can't leak across runs.
+"summary saved" or "deliberately skipped". Instances may be reused; all
+lecture-specific evidence and budgets are reset before each run.
 
 Phases (named like the original ``main.process_lecture`` for diff-friendly
 log greps):
@@ -88,6 +88,10 @@ class LectureRunner:
         self._summarizer = summarizer
         self._reporter = reporter
         self._ppt = PPTPipeline(db, scheduler, reporter)
+        self._reset_lecture_state()
+
+    def _reset_lecture_state(self):
+        """Keep evidence, terminology and cloud budgets within one lecture."""
         self._transcript_source = "unknown"
         self._asr_actual_duration = 0.0
         self._asr_expected_duration = 0.0
@@ -111,6 +115,7 @@ class LectureRunner:
         lecture in the batch.
         """
         sub_id = str(lecture["sub_id"])
+        self._reset_lecture_state()
         self._transcriber.reset_lecture_state()
         if os.environ.get('AUTO_COURSE_TERMS','').lower() == 'true':
             from src.ai.automatic_glossary import AutomaticGlossary
@@ -123,13 +128,6 @@ class LectureRunner:
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
-        self._transcript_source = "unknown"
-        self._asr_actual_duration = 0.0
-        self._asr_expected_duration = 0.0
-        self._cloud_seconds = 0.0
-        self._cloud_windows = set()
-        self._cloud_failed = False
-        self._asr_audio_path = None
         self._reporter.lecture_start(course_title, sub_title, date)
 
         existing = self._db.get_lecture(sub_id)
@@ -326,7 +324,7 @@ class LectureRunner:
                         sub_id: str) -> tuple[Optional[str], Optional[list]]:
         """Return (transcript, segments) or (None, None) on skip.
 
-        Cloud ASR takes priority; a failure uses local ASR on the same audio.
+        Local ASR takes priority; cloud rescue only reviews selected windows.
         Official subtitles are never used as the main transcript.
         """
         if existing and existing.get("transcript"):

@@ -8,7 +8,7 @@ import subprocess
 import time
 
 from src.runtime import config
-from scripts.qwen_segmentation import plan_long_chunks, join_chunk_text
+from scripts.qwen_segmentation import plan_long_chunks, deduplicated_chunk_rows
 from scripts.qwen_quality import context_echo, low_information, bounded_retry
 
 MODEL='Qwen/Qwen3-ASR-1.7B'
@@ -116,13 +116,17 @@ class QwenTranscriber:
         while True:
             if time.monotonic()-began>timeout: raise TimeoutError('Qwen lecture timeout')
             raw=read_fn(512*4)
+            if not raw and is_eof_fn():
+                # ffmpeg may have written its final samples between the empty
+                # read and poll(). Drain again after exit before declaring EOF.
+                raw=read_fn(512*4)
+                if not raw: break
             if raw:
                 pending+=raw
                 if len(pending)<512*4: continue
                 block,pending=pending[:512*4],pending[512*4:]
                 vad.accept_waveform(np.frombuffer(block,dtype=np.float32))
                 total+=512;self._drain_vad(vad,self.last_vad_windows)
-            elif is_eof_fn(): break
             else: time.sleep(wait_on_empty_sec)
         if pending:
             if len(pending)%4: raise RuntimeError('Incomplete PCM sample')
@@ -164,9 +168,12 @@ class QwenTranscriber:
                     del samples;gc.collect()
         finally:
             self.release_model()  # leave RAM for OCR / the separate forced aligner
+        # Timed segments also feed summaries and cloud/official merges. Keep
+        # their body deduplicated while retaining raw chunks for alignment.
+        rows=deduplicated_chunk_rows(self.last_chunks)
         segments=[{'start_ms':round(r['start']*1000),'end_ms':round(r['end']*1000),'text':r['text']}
-                  for r in self.last_chunks if r['text']]
-        return join_chunk_text(self.last_chunks),segments
+                  for r in rows]
+        return '\n'.join(r['text'] for r in rows),segments
 
     def transcribe_tail(self, audio_path, ffmpeg_proc, stderr_chunks, timeout=18000):
         began=time.monotonic()

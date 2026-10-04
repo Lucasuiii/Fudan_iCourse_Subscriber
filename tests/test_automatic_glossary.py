@@ -11,6 +11,18 @@ from scripts.merge_db import merge
 
 
 class AutomaticGlossaryTests(unittest.TestCase):
+    def test_malformed_history_timestamp_does_not_block_valid_terms(self):
+        db = MagicMock()
+        db.get_lecture.return_value = {'course_id': '10', 'deleted_at': None}
+        valid = {'course_id': '10', 'sub_id': '1', 'updated_at': '2026-10-04T10:00:00+00:00',
+                 'keywords': [{'term': 'Householder', 'source': 'ppt'}]}
+        db.read_meta_prefix.return_value = [json.dumps(valid)] + [
+            json.dumps({**valid, 'sub_id': '2', 'updated_at': stamp,
+                        'keywords': [{'term': '坏记录', 'source': 'ppt'}]})
+            for stamp in (None, [], {}, 123)
+        ]
+        self.assertEqual(AutomaticGlossary(db, '10').terms(), ['Householder'])
+
     def test_merge_preserves_newer_glossary_and_unrelated_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             local=Database(str(Path(tmp)/'local.db'))
