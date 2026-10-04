@@ -590,7 +590,9 @@ def generate_summary():
                    'cloud':[c['cloud_text'] for c in report.get('rescue_comparisons',[]) if c.get('cloud_text')]}
         system += '\n\n' + INSTRUCTION
         user = json.dumps({'course':selection.get('course_title'),'material':material,
-                           'evidence_sources':sources},ensure_ascii=False)
+                           'evidence_sources':{'asr':'material中的本地 ASR 正文',
+                              'ppt':'material中的PPT OCR辅助材料',
+                              'cloud':'material中的局部云端复核cloud_text字段'}},ensure_ascii=False)
     client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
                     max_retries=0, timeout=600)
     began = time.perf_counter()

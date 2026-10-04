@@ -390,7 +390,9 @@ class LectureRunner:
                 if weak:
                     rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
                         handle.path, config.DOUBAO_ASR_API_KEY, weak,
+                        **({'hotwords':self._historical_terms} if self._automatic_glossary else {}),
                     )
+                    self._cloud_term_sources.extend(s['text'] for _,result in rescues for s in result)
                     self._cloud_seconds = attempted
                     self._cloud_failed = failed
                     self._cloud_windows.update(

@@ -163,7 +163,9 @@ class Summarizer:
                     response=client.chat.completions.create(model=model,
                         messages=[{'role':'system','content':self.system_prompt+'\n\n'+INSTRUCTION},
                                   {'role':'user','content':json.dumps({'course':title,'material':content,
-                                    'evidence_sources':sources,'historical_terms':terms[:30]},ensure_ascii=False)}],
+                                    'evidence_sources':{'asr':'material中的ASR/转写原文',
+                                      'ppt':'material中的PPT/OCR原文','cloud':sources.get('cloud',[])},
+                                    'historical_terms':terms[:30]},ensure_ascii=False)}],
                         response_format={'type':'json_object'},timeout=600,**options)
                     if not response.choices or response.choices[0].finish_reason!='stop':
                         raise ValueError('Incomplete structured summary')

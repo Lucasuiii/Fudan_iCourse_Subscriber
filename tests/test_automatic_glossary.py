@@ -75,6 +75,8 @@ class AutomaticGlossaryTests(unittest.TestCase):
         self.assertEqual(keywords[0]['term'],'Householder')
         client.chat.completions.create.assert_called_once()
         self.assertEqual(client.chat.completions.create.call_args.kwargs['extra_body']['thinking']['type'],'enabled')
+        payload=json.loads(client.chat.completions.create.call_args.kwargs['messages'][1]['content'])
+        self.assertIsInstance(payload['evidence_sources']['ppt'],str)
 
 
 if __name__=='__main__':
