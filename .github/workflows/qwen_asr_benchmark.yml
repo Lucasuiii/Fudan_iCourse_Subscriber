@@ -19,9 +19,14 @@ on:
         description: 'On the 10-minute long-chunk test only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
         type: boolean
         default: false
+      reuse_run_id:
+        description: 'Optional prior encrypted 10-minute quality artifact: rerun alignment/rescue only'
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: qwen-asr-benchmark
@@ -39,6 +44,7 @@ jobs:
       FULL_LECTURE: ${{ inputs.full_lecture }}
       LONG_CHUNK_SAMPLE: ${{ inputs.long_chunk_sample }}
       QUALITY_SAMPLE: ${{ inputs.quality_sample }}
+      REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
     steps:
       - name: Validate isolated test mode
         env:
@@ -52,6 +58,9 @@ jobs:
           fi
           if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
             exit 1
+          fi
+          if [ -n "$REUSE_RUN_ID" ]; then
+            [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$QUALITY_SAMPLE" = true ] || exit 1
           fi
       - uses: actions/checkout@v4
         with:
@@ -88,13 +97,22 @@ jobs:
           curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2 -o "$RUNNER_TEMP/sensevoice.tar.bz2"
           tar xf "$RUNNER_TEMP/sensevoice.tar.bz2" -C "$RUNNER_TEMP"
       - name: Download public speech detector
-        if: ${{ inputs.full_lecture || inputs.long_chunk_sample }}
+        if: ${{ (inputs.full_lecture || inputs.long_chunk_sample) && inputs.reuse_run_id == '' }}
         run: curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
       - name: Run Qwen 1.7B on CPU and encrypt the comparison
+        if: ${{ inputs.reuse_run_id == '' }}
         env:
           QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
           PUBLIC_SAMPLE: ${{ inputs.public_sample }}
         run: python -m scripts.benchmark_qwen_asr infer
+      - name: Restore encrypted prior quality result only
+        if: ${{ inputs.reuse_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: qwen-asr-encrypted-result
+          path: ${{ runner.temp }}/qwen-benchmark
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
       - name: Review references and rescue bounded suspect speech without overwriting
         if: ${{ inputs.quality_sample }}
         env:

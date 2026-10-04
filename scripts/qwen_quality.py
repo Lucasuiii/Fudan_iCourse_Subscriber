@@ -128,6 +128,69 @@ def locate_suspects(chunks, suspects, subtitles, vad_windows, *, budget=120):
     return intervals,accepted,unresolved
 
 
+def aligned_quote_span(chunk, quote, items, vad_windows):
+    """Extract a unique quote from whole-chunk alignment, with fail-closed QA.
+
+    Alignment fits supplied words to audio; it does NOT establish correctness.
+    No transcript-length interpolation, no timestamp guessing.
+    """
+    source=normalize(chunk['text'])
+    target=normalize(quote)
+    if len(target)<8 or source.count(target)!=1:
+        raise ValueError('invalid_or_repeated_quote')
+    chars=[]
+    spans=[]
+    last=0.0
+    for item in items:
+        token=normalize(item['text'])
+        start,end=item['start'],item['end']
+        if not token:
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)
+                and 0<=start<=end<=chunk['end']-chunk['start']+0.1
+                and start>=last-0.05):
+            raise ValueError('invalid_alignment_timestamps')
+        last=end
+        chars.extend(token)
+        spans.extend([(start,end)]*len(token))
+    if ''.join(chars)!=source:
+        raise ValueError('alignment_text_mismatch')
+    pos=source.index(target)
+    chosen=spans[pos:pos+len(target)]
+    if sum(b>a for a,b in chosen)/len(chosen)<0.7:
+        raise ValueError('collapsed_alignment')
+    start,end=chosen[0][0]+chunk['start'],chosen[-1][1]+chunk['start']
+    if not (0.5<=end-start<=50 and 0.5<=len(target)/(end-start)<=25):
+        raise ValueError('implausible_quote_span')
+    covered=sum(max(0,min(end,b)-max(start,a)) for a,b in vad_windows)
+    if covered/(end-start)<0.5:
+        raise ValueError('quote_without_sufficient_speech')
+    return start,end
+
+
+def aligned_rescue_intervals(chunks, located, *, budget=120):
+    intervals=[]
+    accepted=[]
+    unresolved=[]
+    share=min(60,max(0,budget)/len(located)) if located else 0
+    for item in located:
+        chunk=chunks[item['id']]
+        if item['end']-item['start']>share:
+            unresolved.append({**item,'state':'quote_exceeds_budget_share'})
+            continue
+        pad=min(3,(share-(item['end']-item['start']))/2)
+        a=math.ceil(max(chunk['start'],item['start']-pad)*1000)
+        b=math.floor(min(chunk['end'],item['end']+pad)*1000)
+        if b<=a or any(a<x['end_ms'] and x['start_ms']<b for x in intervals):
+            unresolved.append({**item,'state':'overlapping_quote_span'})
+            continue
+        intervals.append({'start_ms':a,'end_ms':b,'chunk_id':item['id'],
+                          'text':item['quote'],'localization':'audio_forced_alignment',
+                          'quote_start_ms':round(item['start']*1000),'quote_end_ms':round(item['end']*1000)})
+        accepted.append(item)
+    return intervals,accepted,unresolved
+
+
 def review_quality(client, model, report, evidence):
     rows = [{'id': i, 'text': x['text'][:1800], 'start': x['start'], 'end': x['end']}
             for i,x in enumerate(report['full_chunks'])]

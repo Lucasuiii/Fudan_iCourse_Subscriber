@@ -400,19 +400,32 @@ def quality_review():
     """One review request, at most 120s cloud audio; keep variants, no DB writes."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from openai import OpenAI
-    from scripts.qwen_quality import review_quality,locate_suspects
+    from scripts.qwen_quality import review_quality
+    from scripts.qwen_audio_alignment import align_suspects
     from src.ai.doubao_asr import rescue_intervals_pcm
     d=(workspace()/'result.enc').read_bytes()
     key=base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'],validate=True)
     report=json.loads(AESGCM(key).decrypt(d[5:17],d[17:],b'qwen-asr-benchmark-v1'))
+    if os.environ.get('REUSE_RUN_ID'):
+        import soundfile as sf
+        if (report.get('source')!='authorized_long_chunk_slice' or not report.get('complete')
+                or abs(sf.info(workspace()/'audio.wav').duration-report.get('audio_seconds',0))>0.1):
+            raise ValueError('Cached slice does not match test mode or duration')
+        report['cached_asr_source_run']=os.environ['REUSE_RUN_ID']
+        for field in ('cloud_review','rescue_comparisons','localization','alignment_items'):
+            report.pop(field,None)
     evidence=json.loads((workspace()/'evidence.json').read_text())
     report['reference_evidence']=evidence
-    selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
-                            'deepseek-v4-flash',report,evidence)
+    # Cached encrypted ASR + selected quotes allow testing the failing suffix
+    # without paying for another full local transcription or review request.
+    selected=report.get('review_suspects') if os.environ.get('REUSE_RUN_ID') else None
+    if selected is None:
+        selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
+                                'deepseek-v4-flash',report,evidence)
     report['review_suspects']=selected
     save_encrypted(report)
-    intervals,located,unresolved=locate_suspects(report['full_chunks'],selected,
-                                               evidence.get('official_subtitles',[]),report['vad_windows'])
+    intervals,located,unresolved,metrics=align_suspects(report,selected,workspace()/'audio.wav',save_encrypted)
+    report['audio_alignment_metrics']=metrics
     report['localization']={'located':located,'unresolved':unresolved}
     save_encrypted(report)
     raw=workspace()/'audio.raw'
@@ -428,7 +441,12 @@ def quality_review():
         rescues,attempted,failed=[],0,False
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
                             'hotword_hints_enabled':True,
-                            'selection_limit':'Unique text matched to official subtitle segment times, not word alignment. Unresolved locations are not uploaded. Originals retained.'}
+                            'selection_limit':'Whole-chunk audio forced alignment locates quoted text; not a correctness guarantee. Unresolved locations are not uploaded. Originals retained.'}
+    report['rescue_comparisons']=[{'chunk_id':w['chunk_id'],'original_quote':w['text'],
+        'cloud_text':' '.join(s['text'] for s in segments),
+        'quote_start_ms':w['quote_start_ms'],'quote_end_ms':w['quote_end_ms'],
+        'returned_speech_overlaps_quote':any(s['start_ms']<w['quote_end_ms'] and w['quote_start_ms']<s['end_ms'] for s in segments),
+        'state':'variants_require_review' if segments else 'no_cloud_text'} for w,segments in rescues]
     save_encrypted(report)
     print(f"Quality check: suspects={len(selected)}, located={len(located)}, unresolved={len(unresolved)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)
 
