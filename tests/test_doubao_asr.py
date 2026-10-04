@@ -1,4 +1,5 @@
 import tempfile
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -6,6 +7,24 @@ from src.ai import doubao_asr
 
 
 class DoubaoASRTests(unittest.TestCase):
+    def test_optional_hotword_bounds(self):
+        self.assertIsNone(doubao_asr.hotword_corpus(None))
+        result=doubao_asr.hotword_corpus(['逆矩阵','逆矩阵',None,'','bad\nword','x'*31,'条件数'])
+        self.assertEqual(json.loads(result['context']),{'hotwords':[{'word':'逆矩阵'},{'word':'条件数'}]})
+        self.assertLessEqual(len(json.loads(doubao_asr.hotword_corpus([str(i) for i in range(100)])['context'])['hotwords']),20)
+
+    def test_hotword_payload_is_opt_in(self):
+        for words in (None,['希尔伯特矩阵']):
+            submitted=MagicMock(headers={'X-Api-Status-Code':'20000000'})
+            queried=MagicMock(headers={'X-Api-Status-Code':'20000000'})
+            queried.json.return_value={'result':{'text':'矩阵'}}
+            session=MagicMock()
+            session.post.side_effect=[submitted,queried]
+            doubao_asr._recognize_chunk(b'mp3','test',0,1000,session,hotwords=words)
+            request=session.post.call_args_list[0].kwargs['json']['request']
+            self.assertEqual('corpus' in request,bool(words))
+            self.assertNotIn('correct_table_name',request)
+
     def test_wait_accepts_large_media_timeline_mismatch(self):
         with tempfile.NamedTemporaryFile() as audio:
             audio.write(b"\0" * doubao_asr.BYTES_PER_SECOND * 8)

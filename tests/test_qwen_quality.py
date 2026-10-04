@@ -2,7 +2,7 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality
+from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality,usable_ppt
 
 
 class QualityTests(unittest.TestCase):
@@ -20,9 +20,22 @@ class QualityTests(unittest.TestCase):
         self.assertLessEqual(sum(x['end_ms']-x['start_ms'] for x in result),120000)
         self.assertLessEqual(len(result),10)
         self.assertTrue(all(x['end_ms']-x['start_ms']<=60000 for x in result))
+        self.assertEqual({x['chunk_id'] for x in result},{0,1,2})
+        self.assertEqual(len(result),3)
         for x in result:
-            self.assertTrue(any(a*1000<=x['start_ms']<x['end_ms']<=b*1000 for a,b in windows))
+            chunk=chunks[x['chunk_id']]
+            self.assertTrue(chunk['start']*1000<=x['start_ms']<x['end_ms']<=chunk['end']*1000)
+            self.assertTrue(any(a*1000<x['end_ms'] and x['start_ms']<b*1000 for a,b in windows))
         self.assertEqual(select_rescue_windows(chunks,[0],[]),[])
+
+    def test_long_silence_not_bridged(self):
+        r=select_rescue_windows([{'start':0,'end':120}],[0],[(0,10),(90,100)])
+        self.assertTrue(all(x['end_ms']-x['start_ms']<=10000 for x in r))
+
+    def test_desktop_and_stale_page_filtered(self):
+        self.assertFalse(usable_ppt('此电脑 回收站 巡检.exe 多媒体值班室',0))
+        self.assertFalse(usable_ppt('矩阵逆与条件数',-5220))
+        self.assertTrue(usable_ppt('矩阵逆与条件数',-100))
 
     def test_review_rejects_invented_ids_and_preserves_text(self):
         client=MagicMock()

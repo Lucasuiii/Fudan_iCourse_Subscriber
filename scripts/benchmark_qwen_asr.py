@@ -138,6 +138,7 @@ def fetch_evidence(client, request):
     """Optional bounded local OCR; no screenshot URLs stored in the report."""
     from src.ai.ocr import ocr_image_text
     from src.api.icourse import fetch_ppt_image
+    from scripts.qwen_quality import usable_ppt
     evidence = {"official_subtitles": [], "ppt": [], "unavailable": []}
     offset, stop = request['offset'], request['offset'] + request['duration']
     with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
@@ -156,15 +157,18 @@ def fetch_evidence(client, request):
         try:
             pages=client.get_ppt_list(request['course_id'],request['sub_id'])
             preceding=[p for p in pages if p['created_sec']<=offset]
-            chosen=preceding[-1:]+[p for p in pages if offset<p['created_sec']<stop]
+            chosen=[p for p in preceding[-1:] if p['created_sec']>=offset-300]+[p for p in pages if offset<p['created_sec']<stop]
             for page in chosen[:6]:
                 try:
                     image=fetch_ppt_image(client,page,max_attempts=1,timeout=30)
                     if not image or len(image)>8*1024*1024:
                         evidence['unavailable'].append('ppt_page')
                         continue
-                    evidence['ppt'].append({'start':page['created_sec']-offset,
-                                             'text':ocr_image_text(image)[:1000]})
+                    text=ocr_image_text(image)[:1000]
+                    if usable_ppt(text,page['created_sec']-offset):
+                        evidence['ppt'].append({'start':page['created_sec']-offset,'text':text})
+                    else:
+                        evidence['unavailable'].append('ppt_filtered')
                 except Exception:
                     evidence['unavailable'].append('ppt_page')
         except Exception:
@@ -414,10 +418,13 @@ def quality_review():
                         '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
         rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
-                                                   intervals,max_seconds=120,max_clips=10)
+                                                   intervals,max_seconds=120,max_clips=10,
+                                                   hotwords=['希尔伯特矩阵','逆矩阵','条件数','扰动','奇异值',
+                                                             '指数','舍入误差','显式表达式','范数','高斯消去法'])
     else:
         rescues,attempted,failed=[],0,False
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
+                            'hotword_hints_enabled':True,
                             'selection_limit':'Speech windows within suspect chunks; no exact word alignment. Originals retained.'}
     save_encrypted(report)
     print(f"Quality check: suspects={len(selected)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)

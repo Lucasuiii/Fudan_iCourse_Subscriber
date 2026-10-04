@@ -8,6 +8,7 @@ never hand its service a signed iCourse or WebVPN URL.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import subprocess
@@ -87,7 +88,7 @@ def _encode_chunk(path: str, start_s: int, duration_s: float) -> bytes:
 
 def _recognize_chunk(audio: bytes, api_key: str, offset_ms: int,
                      duration_ms: int, session: requests.Session,
-                     poll_timeout=300) -> list[dict]:
+                     poll_timeout=300, *, hotwords: list[str] | None = None) -> list[dict]:
     task_id = str(uuid.uuid4())
     headers = {
         "X-Api-Key": api_key,
@@ -109,6 +110,9 @@ def _recognize_chunk(audio: bytes, api_key: str, offset_ms: int,
             "show_utterances": True,
         },
     }
+    corpus = hotword_corpus(hotwords)
+    if corpus:
+        payload['request']['corpus'] = corpus
     try:
         response = session.post(
             f"{BASE_URL}/submit", headers=headers, json=payload,
@@ -187,6 +191,7 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
                          *, session: requests.Session | None = None,
                          max_seconds: float = MAX_CLOUD_SECONDS,
                          max_clips: int = MAX_CLOUD_CLIPS,
+                         hotwords: list[str] | None = None,
                          ) -> tuple[list[tuple[dict, list[dict]]], float, bool]:
     """Recognize only selected short speech intervals.
 
@@ -218,6 +223,7 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
                 segments = _recognize_chunk(
                     audio, api_key, interval["start_ms"],
                     int(duration * 1000), session,
+                    **({'hotwords': hotwords} if hotwords else {}),
                 )
             except CloudASRError:
                 failed = True
@@ -227,3 +233,24 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
         if own_session:
             session.close()
     return rescues, attempted, failed
+
+
+def hotword_corpus(words):
+    """Optional bounded hints, not forced substitutions; default unchanged.
+
+    Standard file API: request.corpus.context is a serialized JSON string.
+    https://www.volcengine.com/docs/6561/1354868
+    """
+    selected=[]
+    for word in words or []:
+        if not isinstance(word,str):
+            continue
+        word=word.strip()
+        if not word or len(word)>30 or any(ord(c)<32 for c in word) or word in selected:
+            continue
+        if sum(map(len,selected))+len(word)>240:
+            continue
+        selected.append(word)
+        if len(selected)>=20:
+            break
+    return {'context':json.dumps({'hotwords':[{'word':w} for w in selected]},ensure_ascii=False)} if selected else None
