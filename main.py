@@ -15,6 +15,7 @@ Anything more interesting belongs in one of ``src/*`` modules.
 
 import sys
 import time
+import os
 from collections import OrderedDict
 
 from src.runtime import config
@@ -71,6 +72,8 @@ def _check_session(client: ICourseClient) -> None:
 
 def _in_run_scope(course_id: str, lecture: dict) -> bool:
     """Keep date reruns isolated from routine allowlists and unsent recovery."""
+    if os.environ.get('PARALLEL_COURSE_SCOPE') == 'true' and str(course_id) not in config.COURSE_IDS:
+        return False
     if config.RERUN_TARGET_IDS:
         return str(lecture["sub_id"]) in config.RERUN_TARGET_IDS
     return lecture_is_selected(
@@ -402,6 +405,7 @@ def run():
     summarizer = Summarizer() if config.COURSE_IDS else None
     emailer = Emailer() if (
         config.SMTP_EMAIL and config.SMTP_PASSWORD and config.RECEIVER_EMAILS
+        and os.environ.get('PARALLEL_COURSE_WORKER') != 'true'
     ) else None
 
     vpn = login_with_retry()
@@ -409,7 +413,7 @@ def run():
     email_items: list = []
 
     # Discover new semesters every run; only fetch catalogs not yet stored.
-    if not config.RERUN_TARGET_IDS:
+    if not config.RERUN_TARGET_IDS and os.environ.get('PARALLEL_COURSE_WORKER') != 'true':
         _crawl_semester_catalog(client, db, reporter)
 
     if not config.COURSE_IDS:
