@@ -8,7 +8,7 @@ MODEL='Qwen/Qwen3-ForcedAligner-0.6B'
 REVISION='c7cbfc2048c462b0d63a45797104fc9db3ad62b7'
 
 
-def align_suspects(report,selected,path,checkpoint):
+def align_suspects(report,selected,path,checkpoint, *, budget=120):
     if not selected:
         return [],[],[],{'model':MODEL,'seconds':0}
     import torch
@@ -45,7 +45,7 @@ def align_suspects(report,selected,path,checkpoint):
             checkpoint(report)
             del samples
             gc.collect()
-    intervals,accepted,rejected=aligned_rescue_intervals(report['full_chunks'],located)
+    intervals,accepted,rejected=aligned_rescue_intervals(report['full_chunks'],located,budget=budget)
     metrics={'model':MODEL,'revision':REVISION,'seconds_including_load':time.perf_counter()-began,
              'peak_rss_gib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024**2,
              'note':'Structural QA and VAD checks, not calibrated alignment confidence or transcript accuracy.'}

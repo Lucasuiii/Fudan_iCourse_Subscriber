@@ -2,11 +2,32 @@ import json
 import unittest
 from unittest.mock import Mock,patch
 
-from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds
+from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context
 from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_latest_selection_includes_reviewing_but_not_future(self):
+        detail={'title':'数值算法','lectures':[
+            {'date':'2026-09-22','sub_id':'1','sub_title':'2026-09-22第1-2节','has_playback':True},
+            {'date':'2026-09-29','sub_id':'2','sub_title':'2026-09-29第1-2节','has_playback':False},
+            {'date':'2026-10-06','sub_id':'3','sub_title':'2026-10-06第1-2节'}]}
+        result=latest_request(detail,{'course_id':'38146'},today='2026-10-04')
+        self.assertEqual(result['sub_id'],'2')
+        self.assertEqual(result['offset'],0)
+        with self.assertRaises(ValueError):
+            latest_request({'lectures':[]},{},today='2026-10-04')
+        with patch.dict('os.environ',{'LATEST_LECTURE':'true'}):
+            self.assertNotIn('希尔伯特',recognition_context())
+
+    def test_summary_keeps_cloud_as_variant_and_rejects_partial(self):
+        report={'complete':True,'transcript':'原始课堂正文','full_chunks':[],
+                'rescue_comparisons':[{'original_quote':'原句','cloud_text':'另一版本'}]}
+        material=summary_material(report,{})
+        self.assertIn('原始课堂正文',material)
+        self.assertIn('另一识别版本',material)
+        with self.assertRaises(ValueError):
+            summary_material({**report,'complete':False},{})
     def test_bounded_sample_duration(self):
         with patch.dict('os.environ',{'SAMPLE_MINUTES':'30','LONG_CHUNK_SAMPLE':'true'}):
             self.assertEqual(sample_seconds(),1800)

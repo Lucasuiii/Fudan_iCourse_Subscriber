@@ -1,4 +1,4 @@
-"""Manual, isolated CPU benchmark. No database, summary API, or email calls.
+"""Manual, isolated CPU benchmark. No database or email calls.
 
 Course selection is a Secret. Audio stays on the ephemeral runner. The only
 artifact is AES-GCM encrypted with a separate test key; logs contain metrics.
@@ -15,6 +15,9 @@ import resource
 import subprocess
 import sys
 import time
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 MODEL = "Qwen/Qwen3-ASR-1.7B"
@@ -22,6 +25,38 @@ REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
 WINDOWS = [(62.022, 76.128), (176.294, 187.328),
            (209.926, 217.824), (511.110, 523.744)]
 TERMS = "数值算法与案例分析。术语：良态问题、病态问题、扰动、希尔伯特矩阵、Hilbert矩阵、逆矩阵、条件数、delta、范数。"
+
+
+def recognition_context():
+    # New lecture topics are unknown; do not reuse previous lecture's hotwords.
+    return '数值算法与案例分析。' if os.environ.get('LATEST_LECTURE') == 'true' else TERMS
+
+
+def latest_request(detail, request, today=None):
+    """Latest listed non-future lecture, NOT gated on playback_status.
+
+    If its playback cannot be resolved, fail rather than silently test older audio.
+    """
+    today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    candidates = []
+    for lecture in detail.get('lectures', []):
+        date = str(lecture.get('date', ''))
+        try:
+            datetime.strptime(date, '%Y-%m-%d')
+        except ValueError:
+            continue
+        if date > today or not str(lecture.get('sub_id', '')).isdigit():
+            continue
+        match = re.search(r'第\s*(\d+)', str(lecture.get('sub_title', '')))
+        candidates.append((date, int(match.group(1)) if match else -1,
+                           int(lecture['sub_id']), lecture))
+    if not candidates:
+        raise ValueError('No dated non-future lecture available')
+    lecture = max(candidates, key=lambda item: item[:3])[3]
+    return {**request, 'sub_id': str(lecture['sub_id']), 'offset': 0,
+            'duration': 1800, 'selection': {'course_title': detail.get('title'),
+             'sub_title': lecture.get('sub_title'), 'date': lecture['date'],
+             'sub_id': str(lecture['sub_id']), 'offset': 0, 'duration': 1800}}
 
 
 def workspace() -> Path:
@@ -124,6 +159,12 @@ def fetch() -> None:
     print("Authentication complete; resolving selected playback", flush=True)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
         client = ICourseClient(vpn)
+        if os.environ.get('LATEST_LECTURE') == 'true':
+            request = latest_request(client.get_course_detail(request['course_id']), request)
+        if os.environ.get('FULL_LECTURE') == 'true':
+            request['offset'], request['duration'] = 0, 10800
+            if request.get('selection'):
+                request['selection'].update(offset=0, duration=10800)
         url = client.get_video_url(request["course_id"], request["sub_id"])
         if not url:
             raise RuntimeError("No playback available")
@@ -151,7 +192,8 @@ def fetch_evidence(client, request):
     from src.ai.ocr import ocr_image_text
     from src.api.icourse import fetch_ppt_image
     from scripts.qwen_quality import usable_ppt
-    evidence = {"official_subtitles": [], "ppt": [], "unavailable": []}
+    evidence = {"official_subtitles": [], "ppt": [], "unavailable": [],
+                "selection": request.get('selection')}
     offset, stop = request['offset'], request['offset'] + request['duration']
     with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
         try:
@@ -346,6 +388,10 @@ def infer_lecture() -> None:
               "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
               "vad_windows": windows, "planned_chunks": chunks, "full_chunks": [],
               "complete": False, "device": "cpu", "dtype": "float32", "threads": 4}
+    if (workspace() / 'evidence.json').exists():
+        report['selection'] = json.loads((workspace() / 'evidence.json').read_text()).get('selection')
+    context = recognition_context()
+    report['recognition_context'] = context
     save_encrypted(report)
     del vad
     gc.collect()
@@ -370,7 +416,7 @@ def infer_lecture() -> None:
             for attempt in range(1 if sample_only else 2):
                 try:
                     with torch.inference_mode():
-                        result = model.transcribe(audio=(samples, 16000), context=TERMS, language="Chinese")[0]
+                        result = model.transcribe(audio=(samples, 16000), context=context, language="Chinese")[0]
                     break
                 except Exception:
                     if sample_only or attempt == 1:
@@ -384,7 +430,7 @@ def infer_lecture() -> None:
                    "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2}
             row['initial_seconds'] = row['seconds']
             token_limit = 2048
-            row["context_echo"] = context_echo(result.text, TERMS)
+            row["context_echo"] = context_echo(result.text, context)
             if os.environ.get("QUALITY_SAMPLE") == "true" and row['context_echo']:
                 row['original_text'] = row['text']
                 retry_start=time.perf_counter()
@@ -394,7 +440,7 @@ def infer_lecture() -> None:
                 row['text']=result.text
                 row['unhinted_retry_seconds']=time.perf_counter()-retry_start
                 row['retry_timed_out'] = retry['timed_out'] or row['unhinted_retry_seconds'] >= 60
-                row['context_echo']=context_echo(result.text,TERMS)
+                row['context_echo']=context_echo(result.text,context)
                 row['quality_state']='unresolved_context_echo' if row['context_echo'] else 'unhinted_retry'
             row['text_token_count'] = len(model.processor.tokenizer.encode(result.text, add_special_tokens=False))
             row['possible_truncation'] = row['text_token_count'] >= token_limit - 8
@@ -445,12 +491,16 @@ def quality_review():
     # Cached encrypted ASR + selected quotes allow testing the failing suffix
     # without paying for another full local transcription or review request.
     selected=report.get('review_suspects') if os.environ.get('REUSE_RUN_ID') else None
+    full = os.environ.get('FULL_LECTURE') == 'true'
+    budget = 600 if full else 120
+    report['quality_limits'] = {'cloud_seconds':budget, 'max_suspects':12 if full else 4}
     if selected is None:
         selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
-                                'deepseek-v4-flash',report,evidence)
+                                'deepseek-v4-flash',report,evidence,
+                                max_suspects=12 if full else 4, input_budget=96000 if full else 30000)
     report['review_suspects']=selected
     save_encrypted(report)
-    intervals,located,unresolved,metrics=align_suspects(report,selected,workspace()/'audio.wav',save_encrypted)
+    intervals,located,unresolved,metrics=align_suspects(report,selected,workspace()/'audio.wav',save_encrypted,budget=budget)
     report['audio_alignment_metrics']=metrics
     report['localization']={'located':located,'unresolved':unresolved}
     save_encrypted(report)
@@ -460,9 +510,12 @@ def quality_review():
                         '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
         rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
-                                                   intervals,max_seconds=120,max_clips=10,
-                                                   hotwords=['希尔伯特矩阵','逆矩阵','条件数','扰动','奇异值',
-                                                             '指数','舍入误差','显式表达式','范数','高斯消去法'])
+                                                   intervals,max_seconds=budget,max_clips=12 if full else 10,
+                                                   hotwords=(['数值算法','舍入误差','截断误差','收敛性','误差估计',
+                                                              '条件数','迭代法','插值','线性方程组','数值积分']
+                                                             if os.environ.get('LATEST_LECTURE') == 'true' else
+                                                             ['希尔伯特矩阵','逆矩阵','条件数','扰动','奇异值',
+                                                              '指数','舍入误差','显式表达式','范数','高斯消去法']))
     else:
         rescues,attempted,failed=[],0,False
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
@@ -477,6 +530,56 @@ def quality_review():
     print(f"Quality check: suspects={len(selected)}, located={len(located)}, unresolved={len(unresolved)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)
 
 
+def summary_material(report, evidence):
+    """Keep cloud variants separate; never blindly replace the local transcript."""
+    if not report.get('complete') or not report.get('transcript', '').strip():
+        raise ValueError('Cannot summarize incomplete or empty transcription')
+    material = '本地 ASR 正文（按录音顺序）：\n' + report['transcript']
+    pages = [p for p in evidence.get('ppt', []) if p.get('text')]
+    material += '\n\nPPT OCR 辅助材料：\n' + json.dumps(pages, ensure_ascii=False)
+    material += ('\n\n局部云端复核（只是另一识别版本，不保证正确；只可结合上下文判断，'
+                 '不可靠的公式不要补成确定结论）：\n'
+                 + json.dumps(report.get('rescue_comparisons', []), ensure_ascii=False))
+    material += ('\n\n未解决的定位疑点：\n'
+                 + json.dumps(report.get('localization', {}).get('unresolved', []), ensure_ascii=False))
+    rejected = [{'start':r['start'],'end':r['end'],'state':r.get('quality_state')}
+                for r in report.get('full_chunks', []) if not r.get('text')]
+    material += ('\n\n被排除的空白/低信息/超时片段（不能据此编造缺失内容）：\n'
+                 + json.dumps(rejected, ensure_ascii=False))
+    if len(material) > 96000:
+        raise ValueError('Summary material exceeds single-call test budget')
+    return material
+
+
+def generate_summary():
+    """One explicit summary request; encrypted output only, no production pipeline."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from openai import OpenAI
+    from src.ai.summarizer import load_system_prompt
+    data = (workspace() / 'result.enc').read_bytes()
+    key = base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'], validate=True)
+    report = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
+    evidence = json.loads((workspace() / 'evidence.json').read_text())
+    material = summary_material(report, evidence)
+    selection = report.get('selection') or {}
+    client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
+                    max_retries=0, timeout=240)
+    began = time.perf_counter()
+    response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
+        max_tokens=12000, messages=[{'role':'system','content':load_system_prompt()},
+        {'role':'user','content':f"课程：{selection.get('course_title','数值算法与案例分析')}\n"
+                               f"课次：{selection.get('sub_title','')}\n<course_material>\n"
+                               + material + '\n</course_material>'}])
+    if not response.choices or response.choices[0].finish_reason != 'stop' or not response.choices[0].message.content:
+        raise ValueError('Incomplete summary response')
+    report['test_summary'] = {'markdown':response.choices[0].message.content,
+                             'model':'deepseek-v4-flash', 'seconds':time.perf_counter()-began,
+                             'usage':response.usage.model_dump() if response.usage else None,
+                             'production_written':False, 'email_sent':False}
+    save_encrypted(report)
+    print('Isolated summary completed; text encrypted, no database or email writes', flush=True)
+
+
 def clean() -> None:
     # Only this workflow's exact private outputs, never a broad temp directory.
     for name in ("audio.wav", "audio.raw", "evidence.json", "result.enc"):
@@ -486,7 +589,7 @@ def clean() -> None:
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) == 2 else "invalid"
     try:
-        {"fetch": fetch, "infer": infer, "review": quality_review, "clean": clean}[mode]()
+        {"fetch": fetch, "infer": infer, "review": quality_review, "summary": generate_summary, "clean": clean}[mode]()
     except Exception as error:
         # Exception bodies and command arguments may contain private URLs.
         print(f"Benchmark {mode} failed ({type(error).__name__}); private details withheld", flush=True)

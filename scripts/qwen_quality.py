@@ -233,7 +233,9 @@ def aligned_rescue_intervals(chunks, located, *, budget=120):
     return intervals,accepted,unresolved
 
 
-def review_quality(client, model, report, evidence):
+def review_quality(client, model, report, evidence, *, max_suspects=4, input_budget=30000):
+    max_suspects = min(12, max(1, max_suspects))
+    input_budget = min(96000, max(1, input_budget))
     rows = [{'id': i, 'text': x['text'][:1800], 'start': x['start'], 'end': x['end']}
             for i,x in enumerate(report['full_chunks'])]
     prompt = (
@@ -244,7 +246,7 @@ def review_quality(client, model, report, evidence):
         'quote必须逐字引用对应chunks.text中连续且唯一的一段原文，包含疑点和附近上下文，'
         '长度8到100字符。不得纠正引用、拼接不连续文字、编造时间。'
         '只输出JSON {"suspects":[{"id":现有整数id,"quote":"连续原文引用","reason":"具体疑点"}]}，'
-        '按优先级最多选4段，没有可靠疑点则空列表。id只能来自chunks。'
+        f'按优先级最多选{max_suspects}段，没有可靠疑点则空列表。id只能来自chunks。'
     )
     refs=evidence.get('official_subtitles',[])
     indices=range(len(refs)) if len(refs)<=100 else sorted({round(i*(len(refs)-1)/99) for i in range(100)})
@@ -252,18 +254,18 @@ def review_quality(client, model, report, evidence):
     payload = json.dumps({'chunks': rows, 'evidence': bounded_evidence},ensure_ascii=False)
     # Keep every ASR chunk/quote candidate; reduce optional reference context
     # first if a longer sample would exceed the one-call text budget.
-    while len(payload)>30000 and len(bounded_evidence['official_subtitles'])>1:
+    while len(payload)>input_budget and len(bounded_evidence['official_subtitles'])>1:
         bounded_evidence['official_subtitles']=bounded_evidence['official_subtitles'][::2]
         payload=json.dumps({'chunks':rows,'evidence':bounded_evidence},ensure_ascii=False)
-    if len(payload)>30000:
+    if len(payload)>input_budget:
         raise ValueError('Review exceeds bounded input')
     response = client.chat.completions.create(model=model,
         messages=[{'role':'system','content':prompt},{'role':'user','content':payload}],
-        temperature=0,max_tokens=1000,timeout=60,
+        temperature=0,max_tokens=3000 if max_suspects>4 else 1000,timeout=120 if max_suspects>4 else 60,
         extra_body={'thinking':{'type':'disabled'}},response_format={'type':'json_object'})
     result=json.loads(response.choices[0].message.content)
     selected=[]
-    for item in result.get('suspects',[])[:4]:
+    for item in result.get('suspects',[])[:max_suspects]:
         if (isinstance(item,dict) and type(item.get('id')) is int
             and 0<=item['id']<len(rows) and isinstance(item.get('reason'),str)
             and item['reason'].strip() and isinstance(item.get('quote'),str)

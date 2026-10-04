@@ -26,6 +26,14 @@ on:
         description: 'Long-chunk sample only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
         type: boolean
         default: false
+      latest_lecture:
+        description: 'Select the private course latest non-future lecture for an isolated test'
+        type: boolean
+        default: false
+      generate_summary:
+        description: 'Generate one encrypted test summary, without database writes or email'
+        type: boolean
+        default: false
       reuse_run_id:
         description: 'Optional prior encrypted 10-minute quality artifact: rerun alignment/rescue only'
         type: string
@@ -53,6 +61,8 @@ jobs:
       QUALITY_SAMPLE: ${{ inputs.quality_sample }}
       REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
       SAMPLE_MINUTES: ${{ inputs.sample_minutes }}
+      LATEST_LECTURE: ${{ inputs.latest_lecture }}
+      GENERATE_SUMMARY: ${{ inputs.generate_summary }}
     steps:
       - name: Validate isolated test mode
         env:
@@ -64,11 +74,17 @@ jobs:
           if [ "$LONG_CHUNK_SAMPLE" = true ] && { [ "$FULL_LECTURE" = true ] || [ "$PUBLIC_SAMPLE" = true ]; }; then
             exit 1
           fi
-          if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
+          if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ] && [ "$FULL_LECTURE" != true ]; then
             exit 1
           fi
           if [ "$SAMPLE_MINUTES" = 30 ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
             exit 1
+          fi
+          if [ "$LATEST_LECTURE" = true ]; then
+            { [ "$LONG_CHUNK_SAMPLE" = true ] || [ "$FULL_LECTURE" = true ]; } && [ "$QUALITY_SAMPLE" = true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+          fi
+          if [ "$GENERATE_SUMMARY" = true ]; then
+            [ "$QUALITY_SAMPLE" = true ] && [ "$PUBLIC_SAMPLE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
           fi
           if [ -n "$REUSE_RUN_ID" ]; then
             [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$QUALITY_SAMPLE" = true ] || exit 1
@@ -131,6 +147,12 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
         run: python -m scripts.benchmark_qwen_asr review
+      - name: Generate encrypted isolated lecture summary
+        if: ${{ inputs.generate_summary }}
+        env:
+          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python -m scripts.benchmark_qwen_asr summary
       - name: Save encrypted test result only
         if: always()
         uses: actions/upload-artifact@v4
