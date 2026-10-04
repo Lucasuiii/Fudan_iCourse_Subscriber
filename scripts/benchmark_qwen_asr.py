@@ -19,6 +19,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
+from scripts.qwen_segmentation import reaches_acquisition_limit
 
 MODEL = "Qwen/Qwen3-ASR-1.7B"
 REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
@@ -431,13 +432,14 @@ def infer_runtime_sample():
     report={'source':'official_public_runtime_smoke' if public else 'authorized_full_runtime',
             'model':MODEL,'revision':REVISION,'complete':False,'selection':selection,
             'recognition_terms':terms,'reference_evidence':evidence,
-            'acquisition_limit_reached':not public and info.duration >= 10800}
+            'acquired_audio_seconds':info.duration,
+            'acquisition_limit_reached':not public and reaches_acquisition_limit(info.duration)}
     save_encrypted(report)  # Validate encryption before expensive inference.
     try:
-        transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
-        if not transcript.strip(): raise ValueError('Production runtime transcript empty')
         if report['acquisition_limit_reached']:
             raise ValueError('Audio reached the full-lecture acquisition cap')
+        transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
+        if not transcript.strip(): raise ValueError('Production runtime transcript empty')
         report.update(transcript=transcript,segments=segments,complete=True)
     except Exception as error:
         report['error_type']=type(error).__name__
@@ -508,7 +510,7 @@ def infer_lecture() -> None:
               "chunk_target_seconds": 120, "max_new_tokens": 2048,
               "requested_sample_seconds": expected,
               "audio_seconds": info.duration, "vad_seconds": time.perf_counter() - began,
-              "acquisition_limit_reached": info.duration >= 10800,
+              "acquisition_limit_reached": reaches_acquisition_limit(info.duration),
               "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
               "vad_windows": windows, "planned_chunks": chunks, "full_chunks": [],
               "complete": False, "device": "cpu", "dtype": "float32", "threads": 4}
@@ -518,6 +520,8 @@ def infer_lecture() -> None:
     report['recognition_context'] = context
     save_encrypted(report)
     del vad
+    if report['acquisition_limit_reached']:
+        raise ValueError('Audio reached the full-lecture acquisition cap')
     gc.collect()
     print(f"VAD completed: audio={info.duration:.1f}s, chunks={len(chunks)}, skipped={info.duration-included:.1f}s", flush=True)
     if not chunks:
@@ -587,7 +591,7 @@ def infer_lecture() -> None:
     report["transcript"] = join_chunk_text(report["full_chunks"])
     report["full_slice_seconds"] = sum(row["seconds"] for row in report["full_chunks"])
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
-    report["complete"] = info.duration < 10800
+    report["complete"] = not reaches_acquisition_limit(info.duration)
     save_encrypted(report)
     print("Full lecture completed; private text is encrypted only", flush=True)
 
@@ -668,6 +672,9 @@ def summary_material(report, evidence):
     if not report.get('complete') or not report.get('transcript', '').strip():
         raise ValueError('Cannot summarize incomplete or empty transcription')
     material = '本地 ASR 正文（按录音顺序）：\n' + report['transcript']
+    if report.get('full_lecture_complete') is False:
+        material = ('输入范围限制：完整课堂范围未经验证，可能存在时长差异或获取截断。'
+                    '仅总结已识别的输入，不得声称覆盖整堂课。\n' + material)
     pages = [p for p in evidence.get('ppt', []) if p.get('text')]
     material += '\n\nPPT OCR 辅助材料：\n' + json.dumps(pages, ensure_ascii=False)
     material += ('\n\n局部云端复核（只是另一识别版本，不保证正确；只可结合上下文判断，'

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from scripts.qwen_segmentation import deduplicated_chunk_rows
+from scripts.qwen_segmentation import deduplicated_chunk_rows, reaches_acquisition_limit
 from src.ai.qwen_transcriber import MODEL, REVISION, RATE
 
 MAX_COURSES = 5
@@ -28,8 +28,13 @@ def parse_baselines(raw):
                                                'qwen-asr-encrypted-result'):
             raise ValueError('Invalid baseline reference')
         item = {'run_id': run, 'artifact': artifact}
-        if item in output:
+        if any((v['run_id'], v['artifact']) == (run, artifact) for v in output):
             raise ValueError('Duplicate baseline reference')
+        if 'reuse_source_slot' in value:
+            source_slot = value['reuse_source_slot']
+            if type(source_slot) is not int or not 0 <= source_slot < MAX_COURSES:
+                raise ValueError('Invalid ASR reuse source slot')
+            item['reuse_source_slot'] = source_slot
         output.append(item)
     return output
 
@@ -43,14 +48,16 @@ def build_plan(baseline, *, reference, course_slot, run_id, audio_sha256, mode='
                             run_id=run_id, audio_sha256=audio_sha256, mode=mode)
 
 
-def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2'):
+def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2', allow_partial=False):
     """Plan independently acquired VAD blocks without claiming ASR is complete."""
     baseline = audio
     selection = baseline.get('selection') or {}
     if any(not str(selection.get(k, '')).isdigit() for k in ('course_id', 'sub_id')):
         raise ValueError('Baseline lacks an exact private lecture selection')
     duration = baseline.get('audio_seconds')
-    if not isinstance(duration, (int, float)) or not math.isfinite(duration) or not 0 < duration < 10800:
+    if (not isinstance(duration, (int, float)) or not math.isfinite(duration)
+            or duration <= 0 or duration > 10800.1
+            or (reaches_acquisition_limit(duration) and not allow_partial)):
         raise ValueError('Invalid baseline audio duration')
     rows = baseline.get('full_chunks')
     if not isinstance(rows, list) or not rows:
@@ -78,13 +85,16 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
     terms = baseline.get('recognition_terms', [])
     if not isinstance(terms, list) or len(terms) > 30 or any(not isinstance(t, str) for t in terms):
         raise ValueError('Invalid baseline terminology')
-    return {'schema': 1, 'run_id': str(run_id), 'course_slot': course_slot,
+    plan = {'schema': 1, 'run_id': str(run_id), 'course_slot': course_slot,
             'reference': reference, 'selection': selection, 'model': MODEL, 'revision': REVISION,
             'recognition_terms': terms, 'audio_seconds': duration, 'audio_sha256': audio_sha256,
             'vad_windows': baseline.get('vad_windows', []), 'blocks': blocks,
             'pending_audio_seconds': pending, 'strategy': mode,
             'shards': [{'shard_id': i, 'chunk_ids': sorted(ids), 'audio_seconds': loads[i]/RATE}
                        for i, ids in enumerate(groups)]}
+    if allow_partial:
+        plan['allow_partial_comparison'] = True
+    return plan
 
 
 def validate_plan(plan):
@@ -177,6 +187,9 @@ def assemble(plan, results, baseline):
                          'worker_attempts': [r.get('attempts', []) for r in results]},
             'baseline_comparison': {'reference': plan['reference'], 'baseline_asr_seconds': baseline.get('seconds'),
                 'baseline_summary_complete': bool(baseline.get('test_summary')),
+                'baseline_asr_complete': baseline.get('complete') is True,
+                'same_audio_duration_verified': abs(plan['audio_seconds']-baseline['audio_seconds']) <= 0.1,
+                'baseline_audio_seconds': baseline['audio_seconds'],
                 'baseline_cloud_review': baseline.get('cloud_review'),
                 'changed_chunk_ids': changed, 'same_block_timeline_verified': same_timeline,
                 'baseline_chunk_count': len(baseline['full_chunks']), 'sharded_chunk_count': len(rows),

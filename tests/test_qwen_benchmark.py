@@ -88,7 +88,7 @@ class QwenBenchmarkTests(unittest.TestCase):
             self.assertEqual(recognition_context(), '')
             self.assertEqual(review_hotwords({}, {}), [])
 
-    def run_private_runtime(self, error=None):
+    def run_private_runtime(self, error=None, duration=160):
         import tempfile
         from pathlib import Path
         from unittest.mock import MagicMock
@@ -104,7 +104,7 @@ class QwenBenchmarkTests(unittest.TestCase):
             reports=[]
             with patch.dict('os.environ', {'PUBLIC_SAMPLE': 'false', 'FULL_LECTURE': 'true'}), \
                  patch('scripts.benchmark_qwen_asr.workspace', return_value=root), \
-                 patch.dict(sys.modules, {'soundfile': SimpleNamespace(info=lambda _: SimpleNamespace(samplerate=16000, channels=1, duration=160))}), \
+                 patch.dict(sys.modules, {'soundfile': SimpleNamespace(info=lambda _: SimpleNamespace(samplerate=16000, channels=1, duration=duration))}), \
                  patch('scripts.benchmark_qwen_asr.subprocess.run'), \
                  patch('src.ai.transcriber.Transcriber', return_value=t), \
                  patch('scripts.benchmark_qwen_asr.save_encrypted', side_effect=lambda r: reports.append(json.loads(json.dumps(r)))):
@@ -132,6 +132,14 @@ class QwenBenchmarkTests(unittest.TestCase):
         self.assertEqual(reports[-1]['full_chunks'][0]['text'], '概率课堂')
         self.assertNotIn('private diagnostic', json.dumps(reports))
         t.release_model.assert_called_once()
+
+    def test_rounded_acquisition_cutoff_is_rejected_before_model_inference(self):
+        for duration in (10799.999, 10800, 10800.05):
+            t, reports = self.run_private_runtime(ValueError('acquisition cap'), duration=duration)
+            t.transcribe_tail.assert_not_called()
+            self.assertFalse(reports[-1]['complete'])
+            self.assertTrue(reports[-1]['acquisition_limit_reached'])
+            self.assertEqual(reports[-1]['acquired_audio_seconds'], duration)
 
     def test_incomplete_summary_preserves_diagnostic_not_success(self):
         report={}
@@ -168,6 +176,9 @@ class QwenBenchmarkTests(unittest.TestCase):
         self.assertIn('另一识别版本',material)
         with self.assertRaises(ValueError):
             summary_material({**report,'complete':False},{})
+        bounded = summary_material({**report, 'full_lecture_complete': False}, {})
+        self.assertIn('完整课堂范围未经验证', bounded)
+        self.assertIn('不得声称覆盖整堂课', bounded)
     def test_bounded_sample_duration(self):
         with patch.dict('os.environ',{'SAMPLE_MINUTES':'30','LONG_CHUNK_SAMPLE':'true'}):
             self.assertEqual(sample_seconds(),1800)

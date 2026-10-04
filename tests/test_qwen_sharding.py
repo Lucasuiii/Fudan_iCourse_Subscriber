@@ -11,7 +11,7 @@ from unittest.mock import patch, Mock
 import wave
 
 from scripts.qwen_sharding import (build_plan, validate_plan, validate_result, assemble,
-                                  fingerprint, parse_baselines, MAX_RUNNERS)
+                                  fingerprint, parse_baselines, MAX_RUNNERS, build_audio_plan)
 from scripts import sharded_qwen_pilot as pilot, benchmark_qwen_asr as benchmark
 from src.ai.qwen_transcriber import MODEL, REVISION
 
@@ -131,10 +131,22 @@ class ShardPlanTests(unittest.TestCase):
                 data['complete'] = False
             with self.assertRaises(ValueError):
                 pilot.validate_baseline_match(plan, data)
+        plan['allow_partial_comparison'] = True
+        older = baseline(6)
+        older['complete'] = False
+        pilot.validate_baseline_match(plan, older)
+        near_cap = baseline(10799.999)
+        partial = build_audio_plan(near_cap, reference=plan['reference'], course_slot=0,
+            run_id='100', audio_sha256='a'*64, allow_partial=True)
+        self.assertTrue(partial['allow_partial_comparison'])
 
     def test_baseline_and_request_boundaries(self):
         reference = {'run_id': '1', 'artifact': 'qwen-asr-encrypted-result-0'}
         self.assertEqual(parse_baselines(json.dumps([reference])), [reference])
+        self.assertEqual(parse_baselines(json.dumps([{**reference, 'reuse_source_slot': 1}]))[0]['reuse_source_slot'], 1)
+        for value in (-1, 5, True, '1'):
+            with self.assertRaises(ValueError):
+                parse_baselines(json.dumps([{**reference, 'reuse_source_slot': value}]))
         for values in ([], [reference]*2, [reference]*6, [{'run_id': '1', 'artifact': '../../private'}]):
             with self.assertRaises(ValueError):
                 parse_baselines(json.dumps(values))
@@ -144,6 +156,10 @@ class ShardPlanTests(unittest.TestCase):
             data[field] = value
             with self.assertRaises(ValueError):
                 plan_for(data)
+        for duration in (10799.999, 10800):
+            with self.assertRaises(ValueError):
+                plan_for(baseline(duration))
+        plan_for(baseline(10799))
 
 
 class ShardRuntimeTests(unittest.TestCase):
@@ -298,7 +314,9 @@ class ShardRuntimeTests(unittest.TestCase):
         summary.assert_not_called()
 
     def test_independent_asr_starts_before_baseline_then_attaches_it_before_review(self):
-        data, manifest, prepared, _ = self.prepare_fixture(independent=True)
+        with patch.dict(os.environ, {'ALLOW_PARTIAL_COMPARISON': 'true'}):
+            data, manifest, prepared, _ = self.prepare_fixture(independent=True)
+        data['audio_seconds'] = 6  # Same lecture, different acquired duration is explicitly allowed.
         self.assertEqual(manifest['preparation_mode'], 'independent_vad')
         self.assertEqual(json.loads(pilot.unseal(prepared/'input.enc', 'gather-input')['baseline.json'])['source'],
                          'pending_baseline')
@@ -323,6 +341,8 @@ class ShardRuntimeTests(unittest.TestCase):
             report = pilot.legacy_report(benchmark.workspace()/'result.enc')
             self.assertEqual(report['baseline_snapshot'], data)
             self.assertEqual(report['reference_evidence'], data['reference_evidence'])
+            self.assertTrue(report['comparison_is_partial'])
+            self.assertFalse(report['full_lecture_complete'])
             report.update(quality_limits={'cloud_seconds': 600, 'max_clips': 12, 'max_suspects': 12},
                           cloud_review={'attempted_audio_seconds': 0, 'completed_clips': 0})
             benchmark.save_encrypted(report)
@@ -339,6 +359,14 @@ class ShardRuntimeTests(unittest.TestCase):
         self.assertTrue(pilot.legacy_report(location/'out'/'result.enc')['shard_review_complete'])
 
     def test_quota_experiment_reuses_verified_asr_without_fetch_or_model(self):
+        self.exercise_asr_reuse()
+
+    def test_partial_finalization_reuses_completed_asr_without_prior_final_or_model(self):
+        self.exercise_asr_reuse(asr_only=True)
+
+    def exercise_asr_reuse(self, *, asr_only=False):
+        source_slot = 1 if asr_only else 0
+        os.environ['COURSE_SLOT'] = str(source_slot)
         data, manifest, prepared, _ = self.prepare_fixture(independent=True)
         results = [self.worker_fixture(prepared, manifest, data, i)[0] for i in range(2)]
         raw = [json.loads(pilot.unseal(path, f'result-{i}')['result.json']) for i, path in enumerate(results)]
@@ -347,24 +375,34 @@ class ShardRuntimeTests(unittest.TestCase):
         benchmark.save_encrypted(report)
         source_final = self.base/'source-final.enc'
         shutil.copyfile(benchmark.workspace()/'result.enc', source_final)
-        artifacts = {'qwen-shard-input-0': prepared/'input.enc', 'qwen-shard-final-0': source_final}
+        artifacts = {f'qwen-shard-input-{source_slot}': prepared/'input.enc', f'qwen-shard-final-{source_slot}': source_final}
         for i, path in enumerate(results):
-            artifacts[f'qwen-shard-audio-0-{i}'] = prepared/f'shard-{i}.enc'
-            artifacts[f'qwen-shard-result-0-{i}'] = path
+            artifacts[f'qwen-shard-audio-{source_slot}-{i}'] = prepared/f'shard-{i}.enc'
+            artifacts[f'qwen-shard-result-{source_slot}-{i}'] = path
         def download(args, **kwargs):
+            if asr_only:
+                self.assertNotEqual(args[args.index('--name')+1], f'qwen-shard-final-{source_slot}')
             source = artifacts[args[args.index('--name')+1]]
             target = Path(args[args.index('--dir')+1])
             target.mkdir(parents=True, exist_ok=True)
             filename = source.name if source != source_final else 'result.enc'
             shutil.copyfile(source, target/filename)
         self.stage('reuse-prepare')
-        os.environ.update(GITHUB_RUN_ID='101', REUSE_SHARDED_RUN_ID='100', QWEN_REVIEW_PROFILE='pilot15')
-        with patch.object(pilot, 'command', side_effect=download), patch.object(benchmark, 'fetch') as fetch:
+        os.environ.update(GITHUB_RUN_ID='101', REUSE_SHARDED_RUN_ID='100', QWEN_REVIEW_PROFILE='pilot15',
+                          COURSE_SLOT='0', REUSE_SOURCE_SLOT=str(source_slot),
+                          ALLOW_PARTIAL_COMPARISON='true' if asr_only else 'false')
+        listing = {'total_count': 0, 'artifacts': []}
+        with patch.object(pilot.subprocess, 'check_output', return_value=json.dumps(listing).encode()), \
+             patch.object(pilot, 'command', side_effect=download), patch.object(benchmark, 'fetch') as fetch:
             pilot.prepare()
         fetch.assert_not_called()
         reused = pilot.root()/'out'
         new_plan = json.loads(pilot.unseal(reused/'plan.enc', 'plan')['manifest.json'])
         self.assertEqual(new_plan['asr_reuse_run_id'], '100')
+        self.assertEqual(new_plan['course_slot'], 0)
+        self.assertEqual(new_plan['asr_reuse_source_slot'], source_slot)
+        if asr_only:
+            self.assertTrue(new_plan['allow_partial_comparison'])
         new_results = []
         for i in range(2):
             location = self.stage(f'reused-worker-{i}')
@@ -384,8 +422,16 @@ class ShardRuntimeTests(unittest.TestCase):
                          for i, p in enumerate(new_results)], data)['full_chunks'], report['full_chunks'])
         self.stage('reuse-invalid')
         os.environ['SHARD_MODE'] = 'auto'
-        with patch.object(pilot, 'command', side_effect=download), self.assertRaises(ValueError):
+        with patch.object(pilot.subprocess, 'check_output', return_value=json.dumps(listing).encode()), \
+             patch.object(pilot, 'command', side_effect=download), self.assertRaises(ValueError):
             pilot.prepare_reuse()
+        if asr_only:
+            os.environ['SHARD_MODE'] = '2'
+            listing['artifacts'] = [{'name': f'qwen-shard-final-{source_slot}'}]
+            listing['total_count'] = 1
+            with patch.object(pilot.subprocess, 'check_output', return_value=json.dumps(listing).encode()), \
+                 patch.object(pilot, 'command', side_effect=download), self.assertRaises(ValueError):
+                pilot.prepare_reuse()
 
     def test_interrupted_review_persists_quota_marker_and_does_not_repeat(self):
         data, manifest, prepared, _ = self.prepare_fixture()

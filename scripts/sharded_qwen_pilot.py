@@ -21,6 +21,7 @@ import zipfile
 
 from scripts.qwen_sharding import (MAX_COURSES, MAX_RUNNERS, parse_baselines, build_plan, build_audio_plan,
     validate_plan, validate_result, assemble, fingerprint)
+from scripts.qwen_segmentation import reaches_acquisition_limit
 
 MAX_BUNDLE = 512 * 1024 * 1024
 
@@ -178,6 +179,10 @@ def prepare():
         benchmark.fetch()  # Existing private selection and playback fallback chain.
     fetch_seconds = time.perf_counter()-began_fetch
     wav = benchmark.workspace() / 'audio.wav'
+    with wave.open(str(wav), 'rb') as source:
+        if (reaches_acquisition_limit(source.getnframes()/source.getframerate())
+                and os.environ.get('ALLOW_PARTIAL_COMPARISON') != 'true'):
+            raise ValueError('Audio reached the full-lecture acquisition cap; ASR forbidden')
     with wav.open('rb') as source:
         digest = hashlib.file_digest(source, 'sha256').hexdigest()
     if mode == 'private_latest':
@@ -199,7 +204,8 @@ def prepare():
                     'recognition_terms': course_terms(selection.get('course_title', '')),
                     'vad_windows': transcriber.last_vad_windows}
         manifest = build_audio_plan(planning, reference=reference, course_slot=slot,
-            run_id=os.environ['GITHUB_RUN_ID'], audio_sha256=digest, mode=os.environ['SHARD_MODE'])
+            run_id=os.environ['GITHUB_RUN_ID'], audio_sha256=digest, mode=os.environ['SHARD_MODE'],
+            allow_partial=os.environ.get('ALLOW_PARTIAL_COMPARISON') == 'true')
         manifest['preparation_mode'] = 'independent_vad'
         baseline = {'source': 'pending_baseline', 'reference': reference, 'reference_evidence': evidence}
     else:
@@ -247,42 +253,59 @@ def prepare_reuse():
         raise ValueError('Invalid ASR reuse source')
     started = time.perf_counter()
     slot = int(os.environ['COURSE_SLOT'])
+    source_slot = int(os.environ.get('REUSE_SOURCE_SLOT') or slot)
+    if not 0 <= source_slot < MAX_COURSES:
+        raise ValueError('Invalid ASR reuse source slot')
     def download(name):
         folder = root()/'reuse'/name
         command(['gh', 'run', 'download', source_run, '--repo', os.environ['GITHUB_REPOSITORY'],
                  '--name', name, '--dir', str(folder)])
         return folder
-    input_path = download(f'qwen-shard-input-{slot}')/'input.enc'
-    final = legacy_report(download(f'qwen-shard-final-{slot}')/'result.enc')
+    input_path = download(f'qwen-shard-input-{source_slot}')/'input.enc'
+    partial = os.environ.get('ALLOW_PARTIAL_COMPARISON') == 'true'
+    final = None
+    if partial:
+        listing = json.loads(subprocess.check_output(['gh', 'api',
+            f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{source_run}/artifacts?per_page=100"],
+            stderr=subprocess.PIPE, timeout=60))
+        if listing['total_count'] > 100:
+            raise ValueError('Reuse artifact listing exceeds bounded page')
+        if any(a['name'] == f'qwen-shard-final-{source_slot}' for a in listing['artifacts']):
+            raise ValueError('ASR-only finalization cannot reset an existing finalization or cloud quota')
+    else:
+        final = legacy_report(download(f'qwen-shard-final-{source_slot}')/'result.enc')
     with environment({'GITHUB_RUN_ID': source_run}):
-        files = unseal(input_path, 'gather-input')
+        files = unseal(input_path, 'gather-input', slot=source_slot)
     original = json.loads(files['manifest.json'])
     validate_plan(original)
-    if (original['run_id'] != source_run or original['course_slot'] != slot
+    if (original['run_id'] != source_run or original['course_slot'] != source_slot
             or original['strategy'] != os.environ['SHARD_MODE']
             or original['reference'] != {'run_id': os.environ['BASELINE_RUN_ID'], 'artifact': os.environ['BASELINE_ARTIFACT']}
-            or final.get('source') != 'authorized_sharded_runtime' or final.get('complete') is not True
-            or final.get('sharding', {}).get('plan_hash') != fingerprint(original)
-            or not final.get('shard_review_complete') or not final.get('test_summary')):
+            or (not partial and (final.get('source') != 'authorized_sharded_runtime' or final.get('complete') is not True
+                or final.get('sharding', {}).get('plan_hash') != fingerprint(original)
+                or not final.get('shard_review_complete') or not final.get('test_summary')))):
         raise ValueError('Reuse requires a completed matching experiment; keep baseline order and shard mode unchanged')
-    if json.loads(files['baseline.json']).get('source') == 'pending_baseline':
+    if not partial and json.loads(files['baseline.json']).get('source') == 'pending_baseline':
         baseline = final.get('baseline_snapshot')
         if not baseline:
             raise ValueError('Completed independent experiment lacks its verified baseline snapshot')
         validate_baseline_match(original, baseline)
         files['baseline.json'] = encoded(baseline)
         files['evidence.json'] = encoded(baseline.get('reference_evidence', {}))
-    manifest = {**original, 'run_id': os.environ['GITHUB_RUN_ID'], 'asr_reuse_run_id': source_run}
+    manifest = {**original, 'run_id': os.environ['GITHUB_RUN_ID'], 'course_slot': slot,
+                'asr_reuse_run_id': source_run, 'asr_reuse_source_slot': source_slot}
+    if partial:
+        manifest['allow_partial_comparison'] = True
     out = root()/'out'
     seal({'manifest.json': encoded(manifest)}, 'plan', out/'plan.enc')
     original_results = []
     for shard in original['shards']:
         n = shard['shard_id']
-        audio_path = download(f'qwen-shard-audio-{slot}-{n}')/f'shard-{n}.enc'
-        result_path = download(f'qwen-shard-result-{slot}-{n}')/'worker-result.enc'
+        audio_path = download(f'qwen-shard-audio-{source_slot}-{n}')/f'shard-{n}.enc'
+        result_path = download(f'qwen-shard-result-{source_slot}-{n}')/'worker-result.enc'
         with environment({'GITHUB_RUN_ID': source_run}):
-            audio = unseal(audio_path, f'input-{n}')
-            result = json.loads(unseal(result_path, f'result-{n}')['result.json'])
+            audio = unseal(audio_path, f'input-{n}', slot=source_slot)
+            result = json.loads(unseal(result_path, f'result-{n}', slot=source_slot)['result.json'])
         if json.loads(audio['manifest.json']) != original:
             raise ValueError('Reuse audio belongs to another plan')
         validate_result(original, result, n, require_complete=True)
@@ -293,12 +316,15 @@ def prepare_reuse():
         audio['manifest.json'] = encoded(manifest)
         audio['completed.json'] = encoded(completed)
         seal(audio, f'input-{n}', out/f'shard-{n}.enc')
-    assemble(original, original_results, json.loads(files['baseline.json']))
+    if json.loads(files['baseline.json']).get('source') != 'pending_baseline':
+        assemble(original, original_results, json.loads(files['baseline.json']))
+    elif not any(row['text'].strip() for r in original_results for row in r['chunks']):
+        raise ValueError('All completed ASR blocks empty')
     files['manifest.json'] = encoded(manifest)
     files['timings.json'] = encoded({'prepare_seconds': time.perf_counter()-started,
                                      'asr_reuse_run_id': source_run, 'fetch_seconds': 0})
     seal(files, 'gather-input', out/'input.enc')
-    print('Verified completed ASR reused for a new isolated review experiment', flush=True)
+    print('Verified completed ASR reused; no new audio acquisition or model decoding', flush=True)
 
 
 def workers():
@@ -460,6 +486,19 @@ def gather():
     results = [json.loads(unseal(root()/'results'/f'qwen-shard-result-{slot}-{s["shard_id"]}'/'worker-result.enc',
                                f'result-{s["shard_id"]}')['result.json']) for s in manifest['shards']]
     assembled = assemble(manifest, results, baseline)  # No cloud calls before full validation.
+    if manifest.get('allow_partial_comparison'):
+        reasons = []
+        if not assembled['baseline_comparison']['same_audio_duration_verified']:
+            reasons.append('Reacquired audio duration differs from baseline; end-to-end speedup is not a controlled comparison.')
+        if reaches_acquisition_limit(manifest['audio_seconds']):
+            reasons.append('Recognized input is near the acquisition cutoff; whole-lecture completeness is unverified.')
+        if baseline.get('complete') is not True:
+            reasons.append('The baseline ASR result is incomplete.')
+        if not assembled['baseline_comparison']['same_block_timeline_verified']:
+            reasons.append('VAD block timelines differ; row-by-row accuracy comparison is unavailable.')
+        assembled['comparison_is_partial'] = bool(reasons)
+        assembled['comparison_limitations'] = reasons
+        assembled['full_lecture_complete'] = not bool(reasons)
     profile = os.environ.get('QWEN_REVIEW_PROFILE', 'production')
     if previous.exists():
         report = cached
@@ -516,10 +555,19 @@ def gather():
 
 
 def validate_baseline_match(manifest, baseline):
-    build_plan(baseline, reference=manifest['reference'], course_slot=manifest['course_slot'],
-               run_id=manifest['run_id'], audio_sha256='', mode=manifest['strategy'])
+    partial = manifest.get('allow_partial_comparison') is True
+    if partial:
+        from src.ai.qwen_transcriber import MODEL, REVISION
+        if (baseline.get('source') != 'authorized_full_runtime'
+                or baseline.get('model') != MODEL or baseline.get('revision') != REVISION):
+            raise ValueError('Partial comparison still requires the same production recognizer')
+        build_audio_plan(baseline, reference=manifest['reference'], course_slot=manifest['course_slot'],
+                         run_id=manifest['run_id'], audio_sha256='', mode=manifest['strategy'], allow_partial=True)
+    else:
+        build_plan(baseline, reference=manifest['reference'], course_slot=manifest['course_slot'],
+                   run_id=manifest['run_id'], audio_sha256='', mode=manifest['strategy'])
     if (any(str(manifest['selection'][k]) != str(baseline['selection'][k]) for k in ('course_id', 'sub_id'))
-            or abs(manifest['audio_seconds']-baseline['audio_seconds']) > 0.1
+            or (not partial and abs(manifest['audio_seconds']-baseline['audio_seconds']) > 0.1)
             or manifest['recognition_terms'] != baseline.get('recognition_terms', [])):
         raise ValueError('Independent acquisition differs from baseline lecture, duration or terminology')
 

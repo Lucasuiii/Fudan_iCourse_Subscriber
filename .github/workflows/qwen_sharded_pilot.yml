@@ -32,6 +32,10 @@ name: Qwen Single-Lecture Sharded Pilot
         description: 'Optional completed sharded experiment: reuse its ASR to test another quota; keep baseline list/order unchanged'
         type: string
         default: ''
+      allow_partial_comparison:
+        description: 'Explicit partial comparison; with reuse, finalize completed ASR-only shards without redecoding'
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -89,11 +93,13 @@ jobs:
       COURSE_SLOT: ${{ matrix.course_slot }}
       SHARD_MODE: ${{ inputs.shard_mode }}
       PREPARE_MODE: ${{ inputs.prepare_mode }}
+      ALLOW_PARTIAL_COMPARISON: ${{ inputs.allow_partial_comparison }}
       BASELINE_RUN_ID: ${{ matrix.run_id }}
       BASELINE_ARTIFACT: ${{ matrix.artifact }}
       QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
       GH_TOKEN: ${{ github.token }}
       REUSE_SHARDED_RUN_ID: ${{ inputs.reuse_sharded_run_id }}
+      REUSE_SOURCE_SLOT: ${{ matrix.reuse_source_slot }}
     steps:
     - uses: actions/checkout@v4
       with:

@@ -2,6 +2,11 @@
 import math
 
 
+def reaches_acquisition_limit(duration, limit=10800.0):
+    """A hard ffmpeg cutoff may round just below its requested duration."""
+    return not math.isfinite(duration) or duration >= limit - 0.1
+
+
 def plan_chunks(windows, duration, maximum=28.0, padding=1.0):
     """Keep VAD pauses; merge adjacent speech only within the size limit.
 
