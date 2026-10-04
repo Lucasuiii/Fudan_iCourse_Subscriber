@@ -10,9 +10,14 @@ name: Qwen Single-Lecture Sharded Pilot
   workflow_dispatch:
     inputs:
       baselines:
-        description: 'JSON list of completed baseline run_id/artifact references; maximum five courses'
+        description: 'JSON baseline references; private_latest can start ASR before numbered baselines finish'
         type: string
         required: true
+      prepare_mode:
+        description: 'baseline freezes completed blocks; private_latest prepares existing private slots with the same VAD'
+        type: choice
+        options: [baseline, private_latest]
+        default: baseline
       shard_mode:
         description: 'Start with two runners; auto experiments with three above 60 minutes of planned audio'
         type: choice
@@ -83,6 +88,7 @@ jobs:
     env:
       COURSE_SLOT: ${{ matrix.course_slot }}
       SHARD_MODE: ${{ inputs.shard_mode }}
+      PREPARE_MODE: ${{ inputs.prepare_mode }}
       BASELINE_RUN_ID: ${{ matrix.run_id }}
       BASELINE_ARTIFACT: ${{ matrix.artifact }}
       QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
@@ -97,14 +103,20 @@ jobs:
         python-version: '3.12'
     - run: |
         python -m pip install requests pycryptodome cryptography
+        if [ "$PREPARE_MODE" = private_latest ] && [ "$REUSE_SHARDED_RUN_ID" = '' ]; then
+          python -m pip install numpy sherpa-onnx
+          curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
+        fi
         if ! command -v ffmpeg >/dev/null; then
           sudo apt-get update
           sudo apt-get install -y ffmpeg
         fi
-    - name: Reacquire exact baseline lecture and pack original blocks
+    - name: Acquire authorized lecture and pack original VAD blocks
       env:
         StuId: ${{ secrets.STUID }}
         UISPsw: ${{ secrets.UISPSW }}
+        QWEN_ASR_TEST_REQUESTS: ${{ secrets.QWEN_ASR_TEST_REQUESTS }}
+        SILERO_VAD_PATH: ${{ runner.temp }}/silero_vad.onnx
       run: python -m scripts.sharded_qwen_pilot prepare
     - uses: actions/upload-artifact@v4
       with:
@@ -296,9 +308,16 @@ jobs:
       if: ${{ always() && steps.restore.outcome == 'success' }}
       with:
         name: qwen-shard-final-${{ matrix.course_slot }}
-        path: |
-          ${{ runner.temp }}/qwen-shards/out/result.enc
-          ${{ runner.temp }}/qwen-shards/out/diagnostic.enc
+        path: ${{ runner.temp }}/qwen-shards/out/result.enc
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: qwen-shard-gather-diagnostic-${{ matrix.course_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/diagnostic.enc
         if-no-files-found: ignore
         retention-days: 7
         compression-level: 0

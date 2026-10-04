@@ -19,7 +19,7 @@ import time
 import wave
 import zipfile
 
-from scripts.qwen_sharding import (MAX_COURSES, MAX_RUNNERS, parse_baselines, build_plan,
+from scripts.qwen_sharding import (MAX_COURSES, MAX_RUNNERS, parse_baselines, build_plan, build_audio_plan,
     validate_plan, validate_result, assemble, fingerprint)
 
 MAX_BUNDLE = 512 * 1024 * 1024
@@ -153,26 +153,58 @@ def prepare():
     slot = int(os.environ['COURSE_SLOT'])
     reference = {'run_id': os.environ['BASELINE_RUN_ID'], 'artifact': os.environ['BASELINE_ARTIFACT']}
     parse_baselines(json.dumps([reference]))
-    baseline_dir = root() / 'baseline'
-    command(['gh', 'run', 'download', reference['run_id'], '--repo', os.environ['GITHUB_REPOSITORY'],
-             '--name', reference['artifact'], '--dir', str(baseline_dir)])
-    baseline = legacy_report(baseline_dir / 'result.enc')
-    # Validate baseline before authenticating or fetching any private media.
-    build_plan(baseline, reference=reference, course_slot=slot,
-               run_id=os.environ['GITHUB_RUN_ID'], audio_sha256='', mode=os.environ['SHARD_MODE'])
-    selection = baseline['selection']
-    request = {'course_id': selection['course_id'], 'sub_id': selection['sub_id'], 'offset': 0, 'duration': 600}
+    mode = os.environ.get('PREPARE_MODE', 'baseline')
+    if mode not in ('baseline', 'private_latest'):
+        raise ValueError('Unknown acquisition mode')
+    if mode == 'private_latest':
+        if reference['artifact'] not in ('qwen-asr-encrypted-result-0', 'qwen-asr-encrypted-result-1'):
+            raise ValueError('Independent preparation requires an existing private course slot')
+        fetch_env = {'TEST_COURSE_SLOT': reference['artifact'][-1], 'LATEST_LECTURE': 'true'}
+    else:
+        baseline_dir = root() / 'baseline'
+        command(['gh', 'run', 'download', reference['run_id'], '--repo', os.environ['GITHUB_REPOSITORY'],
+                 '--name', reference['artifact'], '--dir', str(baseline_dir)])
+        baseline = legacy_report(baseline_dir / 'result.enc')
+        # Validate baseline before authenticating or fetching any private media.
+        build_plan(baseline, reference=reference, course_slot=slot,
+                   run_id=os.environ['GITHUB_RUN_ID'], audio_sha256='', mode=os.environ['SHARD_MODE'])
+        selection = baseline['selection']
+        request = {'course_id': selection['course_id'], 'sub_id': selection['sub_id'], 'offset': 0, 'duration': 600}
+        fetch_env = {'TEST_COURSE_SLOT': '-1', 'QWEN_ASR_TEST_REQUEST': json.dumps(request), 'LATEST_LECTURE': 'false'}
     began_fetch = time.perf_counter()
-    with environment({'TEST_COURSE_SLOT': '-1', 'QWEN_ASR_TEST_REQUEST': json.dumps(request),
-                      'FULL_LECTURE': 'true', 'LATEST_LECTURE': 'false', 'QUALITY_SAMPLE': 'false',
+    with environment({**fetch_env,
+                      'FULL_LECTURE': 'true', 'QUALITY_SAMPLE': 'false',
                       'LONG_CHUNK_SAMPLE': 'false'}):
-        benchmark.fetch()  # Exact baseline lecture; existing playback fallback chain.
+        benchmark.fetch()  # Existing private selection and playback fallback chain.
     fetch_seconds = time.perf_counter()-began_fetch
     wav = benchmark.workspace() / 'audio.wav'
     with wav.open('rb') as source:
         digest = hashlib.file_digest(source, 'sha256').hexdigest()
-    manifest = build_plan(baseline, reference=reference, course_slot=slot,
-        run_id=os.environ['GITHUB_RUN_ID'], audio_sha256=digest, mode=os.environ['SHARD_MODE'])
+    if mode == 'private_latest':
+        from src.ai.qwen_transcriber import QwenTranscriber
+        from src.ai.course_glossary import course_terms
+        evidence = json.loads((benchmark.workspace()/'evidence.json').read_bytes())
+        selection = evidence.get('selection') or {}
+        with wave.open(str(wav), 'rb') as source:
+            duration = source.getnframes()/source.getframerate()
+        raw = root()/'audio.raw'
+        command(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(wav), '-f', 'f32le',
+                 '-ac', '1', '-ar', '16000', '-y', str(raw)], timeout=300)
+        transcriber = QwenTranscriber()
+        with raw.open('rb') as stream:
+            chunks = transcriber.prepare_pcm_stream(stream.read, lambda: True, lambda: b'', lambda: 0,
+                                                    audio_path=str(raw), timeout=600)
+        planning = {'selection': selection, 'audio_seconds': duration,
+                    'full_chunks': [{'start': a, 'end': b} for a, b in chunks],
+                    'recognition_terms': course_terms(selection.get('course_title', '')),
+                    'vad_windows': transcriber.last_vad_windows}
+        manifest = build_audio_plan(planning, reference=reference, course_slot=slot,
+            run_id=os.environ['GITHUB_RUN_ID'], audio_sha256=digest, mode=os.environ['SHARD_MODE'])
+        manifest['preparation_mode'] = 'independent_vad'
+        baseline = {'source': 'pending_baseline', 'reference': reference, 'reference_evidence': evidence}
+    else:
+        manifest = build_plan(baseline, reference=reference, course_slot=slot,
+            run_id=os.environ['GITHUB_RUN_ID'], audio_sha256=digest, mode=os.environ['SHARD_MODE'])
     with wave.open(str(wav), 'rb') as source:
         if source.getnchannels() != 1 or source.getsampwidth() != 2 or source.getframerate() != 16000:
             raise ValueError('Expected mono 16kHz PCM16 acquisition')
@@ -204,7 +236,7 @@ def prepare():
     seal({'manifest.json': payload, 'baseline.json': encoded(baseline),
           'evidence.json': encoded(baseline.get('reference_evidence', {})),
           'timings.json': encoded(timings), 'lecture.flac': lecture.read_bytes()}, 'gather-input', out/'input.enc')
-    print(f"Prepared {len(manifest['blocks'])} unchanged blocks across {len(manifest['shards'])} shards; "
+    print(f"Prepared {len(manifest['blocks'])} original VAD blocks across {len(manifest['shards'])} shards; "
           f"pending audio={manifest['pending_audio_seconds']:.1f}s", flush=True)
 
 
@@ -233,6 +265,13 @@ def prepare_reuse():
             or final.get('sharding', {}).get('plan_hash') != fingerprint(original)
             or not final.get('shard_review_complete') or not final.get('test_summary')):
         raise ValueError('Reuse requires a completed matching experiment; keep baseline order and shard mode unchanged')
+    if json.loads(files['baseline.json']).get('source') == 'pending_baseline':
+        baseline = final.get('baseline_snapshot')
+        if not baseline:
+            raise ValueError('Completed independent experiment lacks its verified baseline snapshot')
+        validate_baseline_match(original, baseline)
+        files['baseline.json'] = encoded(baseline)
+        files['evidence.json'] = encoded(baseline.get('reference_evidence', {}))
     manifest = {**original, 'run_id': os.environ['GITHUB_RUN_ID'], 'asr_reuse_run_id': source_run}
     out = root()/'out'
     seal({'manifest.json': encoded(manifest)}, 'plan', out/'plan.enc')
@@ -406,17 +445,30 @@ def gather():
     manifest = json.loads(files['manifest.json'])
     baseline = json.loads(files['baseline.json'])
     validate_plan(manifest)
+    previous = root()/'previous'/'result.enc'
+    cached = legacy_report(previous) if previous.exists() else None
+    if baseline.get('source') == 'pending_baseline':
+        reference = manifest['reference']
+        if cached and cached.get('sharding', {}).get('plan_hash') == fingerprint(manifest) and cached.get('baseline_snapshot'):
+            baseline = cached['baseline_snapshot']
+        else:
+            command(['gh', 'run', 'download', reference['run_id'], '--repo', os.environ['GITHUB_REPOSITORY'],
+                     '--name', reference['artifact'], '--dir', str(root()/'baseline')])
+            baseline = legacy_report(root()/'baseline'/'result.enc')
+        validate_baseline_match(manifest, baseline)
+        files['evidence.json'] = encoded(baseline.get('reference_evidence', {}))
     results = [json.loads(unseal(root()/'results'/f'qwen-shard-result-{slot}-{s["shard_id"]}'/'worker-result.enc',
                                f'result-{s["shard_id"]}')['result.json']) for s in manifest['shards']]
     assembled = assemble(manifest, results, baseline)  # No cloud calls before full validation.
-    previous = root()/'previous'/'result.enc'
     profile = os.environ.get('QWEN_REVIEW_PROFILE', 'production')
     if previous.exists():
-        report = legacy_report(previous)
+        report = cached
         if report.get('sharding', {}).get('plan_hash') != fingerprint(manifest) or report.get('review_profile') != profile:
             raise ValueError('Cached finalization belongs to another plan or quota profile')
     else:
         report = assembled
+        if manifest.get('preparation_mode') == 'independent_vad':
+            report['baseline_snapshot'] = baseline
         report['review_profile'] = profile
         report['reference_evidence'] = json.loads(files['evidence.json'])
         report['preparation_metrics'] = json.loads(files['timings.json'])
@@ -461,6 +513,15 @@ def gather():
         finally:
             shutil.copyfile(benchmark.workspace()/'result.enc', out/'result.enc')
     print('All shards verified; isolated review and summary completed, encrypted output only', flush=True)
+
+
+def validate_baseline_match(manifest, baseline):
+    build_plan(baseline, reference=manifest['reference'], course_slot=manifest['course_slot'],
+               run_id=manifest['run_id'], audio_sha256='', mode=manifest['strategy'])
+    if (any(str(manifest['selection'][k]) != str(baseline['selection'][k]) for k in ('course_id', 'sub_id'))
+            or abs(manifest['audio_seconds']-baseline['audio_seconds']) > 0.1
+            or manifest['recognition_terms'] != baseline.get('recognition_terms', [])):
+        raise ValueError('Independent acquisition differs from baseline lecture, duration or terminology')
 
 
 def clean():

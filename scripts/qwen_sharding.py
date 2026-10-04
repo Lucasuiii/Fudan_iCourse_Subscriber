@@ -39,6 +39,13 @@ def build_plan(baseline, *, reference, course_slot, run_id, audio_sha256, mode='
             or baseline.get('model') != MODEL or baseline.get('revision') != REVISION
             or baseline.get('acquisition_limit_reached')):
         raise ValueError('A complete production-recognizer baseline is required')
+    return build_audio_plan(baseline, reference=reference, course_slot=course_slot,
+                            run_id=run_id, audio_sha256=audio_sha256, mode=mode)
+
+
+def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2'):
+    """Plan independently acquired VAD blocks without claiming ASR is complete."""
+    baseline = audio
     selection = baseline.get('selection') or {}
     if any(not str(selection.get(k, '')).isdigit() for k in ('course_id', 'sub_id')):
         raise ValueError('Baseline lacks an exact private lecture selection')
@@ -151,8 +158,11 @@ def assemble(plan, results, baseline):
     text = '\n'.join(r['text'] for r in cleaned)
     if not text.strip():
         raise ValueError('All decoded blocks empty; summary forbidden')
-    changed = [i for i, (old, new) in enumerate(zip(baseline['full_chunks'], rows))
-               if old.get('text', '') != new['text']]
+    same_timeline = (len(baseline['full_chunks']) == len(rows) and all(
+        old['start'] == new['start'] and old['end'] == new['end']
+        for old, new in zip(baseline['full_chunks'], rows)))
+    changed = ([i for i, (old, new) in enumerate(zip(baseline['full_chunks'], rows))
+                if old.get('text', '') != new['text']] if same_timeline else None)
     return {'source': 'authorized_sharded_runtime', 'model': MODEL, 'revision': REVISION,
             'complete': True, 'selection': plan['selection'], 'recognition_terms': plan['recognition_terms'],
             'audio_seconds': plan['audio_seconds'], 'pending_audio_seconds': plan['pending_audio_seconds'],
@@ -168,7 +178,9 @@ def assemble(plan, results, baseline):
             'baseline_comparison': {'reference': plan['reference'], 'baseline_asr_seconds': baseline.get('seconds'),
                 'baseline_summary_complete': bool(baseline.get('test_summary')),
                 'baseline_cloud_review': baseline.get('cloud_review'),
-                'changed_chunk_ids': changed, 'transcript_equal': text == baseline.get('transcript'),
+                'changed_chunk_ids': changed, 'same_block_timeline_verified': same_timeline,
+                'baseline_chunk_count': len(baseline['full_chunks']), 'sharded_chunk_count': len(rows),
+                'transcript_equal': text == baseline.get('transcript'),
                 'quality_accuracy_verified': False, 'same_original_audio_hash_verified': False,
-                'note': 'Same exact lecture and block timeline; old baseline did not retain an audio hash.'},
+                'note': 'Same exact lecture; block timelines checked separately. Old baseline did not retain an audio hash.'},
             'empty_chunks': [r['chunk_id'] for r in rows if not r['text'].strip()]}

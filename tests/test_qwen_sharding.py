@@ -107,6 +107,31 @@ class ShardPlanTests(unittest.TestCase):
         result['complete'] = False
         self.assertEqual(validate_result(plan, result, 0), {result['chunks'][0]['chunk_id']})
 
+    def test_changed_vad_timeline_is_not_reported_as_aligned_chunk_comparison(self):
+        data = baseline()
+        plan = plan_for(data)
+        older = deepcopy(data)
+        older['full_chunks'][0]['end'] = 1.9
+        report = assemble(plan, results_for(plan, data), older)
+        self.assertFalse(report['baseline_comparison']['same_block_timeline_verified'])
+        self.assertIsNone(report['baseline_comparison']['changed_chunk_ids'])
+
+    def test_independent_baseline_must_match_lecture_duration_and_terms(self):
+        plan = plan_for()
+        pilot.validate_baseline_match(plan, baseline())
+        for change in ('lecture', 'duration', 'terms', 'incomplete'):
+            data = baseline()
+            if change == 'lecture':
+                data['selection']['sub_id'] = '124'
+            elif change == 'duration':
+                data['audio_seconds'] = 6
+            elif change == 'terms':
+                data['recognition_terms'] = ['行列式']
+            else:
+                data['complete'] = False
+            with self.assertRaises(ValueError):
+                pilot.validate_baseline_match(plan, data)
+
     def test_baseline_and_request_boundaries(self):
         reference = {'run_id': '1', 'artifact': 'qwen-asr-encrypted-result-0'}
         self.assertEqual(parse_baselines(json.dumps([reference])), [reference])
@@ -140,7 +165,7 @@ class ShardRuntimeTests(unittest.TestCase):
         Path(os.environ['RUNNER_TEMP']).mkdir(exist_ok=True)
         return pilot.root()
 
-    def prepare_fixture(self):
+    def prepare_fixture(self, *, independent=False):
         if not shutil.which('ffmpeg'):
             self.skipTest('ffmpeg needed for lossless media roundtrip')
         import numpy as np
@@ -153,6 +178,7 @@ class ShardRuntimeTests(unittest.TestCase):
         original_command = pilot.command
         def execute(args, **kwargs):
             if args[0] == 'gh':
+                self.assertFalse(independent, 'Independent preparation must not download pending baseline')
                 destination = pilot.root()/'baseline'
                 destination.mkdir()
                 benchmark.save_encrypted(data)
@@ -160,11 +186,23 @@ class ShardRuntimeTests(unittest.TestCase):
             else:
                 original_command(args, **kwargs)
         def fetch():
-            request = json.loads(os.environ['QWEN_ASR_TEST_REQUEST'])
-            self.assertEqual(request['sub_id'], '123')
-            self.assertEqual(os.environ['LATEST_LECTURE'], 'false')
+            if independent:
+                self.assertEqual(os.environ['TEST_COURSE_SLOT'], '1')
+                self.assertEqual(os.environ['LATEST_LECTURE'], 'true')
+            else:
+                request = json.loads(os.environ['QWEN_ASR_TEST_REQUEST'])
+                self.assertEqual(request['sub_id'], '123')
+                self.assertEqual(os.environ['LATEST_LECTURE'], 'false')
             shutil.copyfile(fixture, benchmark.workspace()/'audio.wav')
-        with patch.object(pilot, 'command', side_effect=execute), patch.object(benchmark, 'fetch', side_effect=fetch):
+            (benchmark.workspace()/'evidence.json').write_text(json.dumps(
+                {**data['reference_evidence'], 'selection': data['selection']}))
+        def vad(transcriber, *args, **kwargs):
+            transcriber.last_vad_windows = [(0, 5)]
+            return [(r['start'], r['end']) for r in data['full_chunks']]
+        with patch.dict(os.environ, {'PREPARE_MODE': 'private_latest' if independent else 'baseline'}), \
+             patch.object(pilot, 'command', side_effect=execute), patch.object(benchmark, 'fetch', side_effect=fetch), \
+             patch('src.ai.qwen_transcriber.QwenTranscriber.prepare_pcm_stream', autospec=True, side_effect=vad), \
+             patch('src.ai.course_glossary.course_terms', return_value=data['recognition_terms']):
             pilot.prepare()
         prepared = pilot.root()/'out'
         manifest = json.loads(pilot.unseal(prepared/'plan.enc', 'plan')['manifest.json'])
@@ -259,12 +297,53 @@ class ShardRuntimeTests(unittest.TestCase):
         review.assert_not_called()
         summary.assert_not_called()
 
+    def test_independent_asr_starts_before_baseline_then_attaches_it_before_review(self):
+        data, manifest, prepared, _ = self.prepare_fixture(independent=True)
+        self.assertEqual(manifest['preparation_mode'], 'independent_vad')
+        self.assertEqual(json.loads(pilot.unseal(prepared/'input.enc', 'gather-input')['baseline.json'])['source'],
+                         'pending_baseline')
+        results = [self.worker_fixture(prepared, manifest, data, i)[0] for i in range(2)]
+        location = self.gather_fixture(prepared, results)
+        with patch.object(pilot, 'command', side_effect=subprocess.CalledProcessError(1, 'gh')), \
+             patch.object(benchmark, 'quality_review') as review:
+            with self.assertRaises(subprocess.CalledProcessError):
+                pilot.gather()
+        review.assert_not_called()
+        self.assertFalse((location/'out'/'result.enc').exists())
+        original_command = pilot.command
+        def execute(args, **kwargs):
+            if args[0] == 'gh':
+                destination = pilot.root()/'baseline'
+                destination.mkdir(exist_ok=True)
+                benchmark.save_encrypted(data)
+                shutil.copyfile(benchmark.workspace()/'result.enc', destination/'result.enc')
+            else:
+                original_command(args, **kwargs)
+        def review():
+            report = pilot.legacy_report(benchmark.workspace()/'result.enc')
+            self.assertEqual(report['baseline_snapshot'], data)
+            self.assertEqual(report['reference_evidence'], data['reference_evidence'])
+            report.update(quality_limits={'cloud_seconds': 600, 'max_clips': 12, 'max_suspects': 12},
+                          cloud_review={'attempted_audio_seconds': 0, 'completed_clips': 0})
+            benchmark.save_encrypted(report)
+        def summarize():
+            report = pilot.legacy_report(benchmark.workspace()/'result.enc')
+            report['test_summary'] = {'markdown': '试跑摘要', 'email_sent': False}
+            benchmark.save_encrypted(report)
+        with patch.object(pilot, 'command', side_effect=execute), \
+             patch.object(benchmark, 'quality_review', side_effect=review) as review_call, \
+             patch.object(benchmark, 'generate_summary', side_effect=summarize), \
+             patch.object(pilot, 'timing_snapshot', return_value={}):
+            pilot.gather()
+        review_call.assert_called_once()
+        self.assertTrue(pilot.legacy_report(location/'out'/'result.enc')['shard_review_complete'])
+
     def test_quota_experiment_reuses_verified_asr_without_fetch_or_model(self):
-        data, manifest, prepared, _ = self.prepare_fixture()
+        data, manifest, prepared, _ = self.prepare_fixture(independent=True)
         results = [self.worker_fixture(prepared, manifest, data, i)[0] for i in range(2)]
         raw = [json.loads(pilot.unseal(path, f'result-{i}')['result.json']) for i, path in enumerate(results)]
         report = assemble(manifest, raw, data)
-        report.update(shard_review_complete=True, test_summary={'markdown': '原试验完整摘要'})
+        report.update(shard_review_complete=True, test_summary={'markdown': '原试验完整摘要'}, baseline_snapshot=data)
         benchmark.save_encrypted(report)
         source_final = self.base/'source-final.enc'
         shutil.copyfile(benchmark.workspace()/'result.enc', source_final)
