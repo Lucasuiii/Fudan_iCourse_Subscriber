@@ -580,12 +580,12 @@ def generate_summary():
     material = summary_material(report, evidence)
     selection = report.get('selection') or {}
     client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
-                    max_retries=0, timeout=240)
+                    max_retries=0, timeout=600)
     began = time.perf_counter()
     try:
         response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
-        extra_body={'thinking':{'type':'disabled'}},
-        max_tokens=16000, messages=[{'role':'system','content':load_system_prompt()},
+        extra_body={'thinking':{'type':'enabled'}}, reasoning_effort='high',
+        max_tokens=64000, messages=[{'role':'system','content':load_system_prompt()},
         {'role':'user','content':f"课程：{selection.get('course_title','数值算法与案例分析')}\n"
                                f"课次：{selection.get('sub_title','')}\n<course_material>\n"
                                + material + '\n</course_material>'}])
@@ -595,6 +595,9 @@ def generate_summary():
         save_encrypted(report)
         raise
     complete = record_summary_response(report, response, time.perf_counter()-began)
+    report['summary_attempts'][-1].update(thinking='enabled', reasoning_effort='high', max_tokens=64000)
+    if complete:
+        report['test_summary'].update(thinking='enabled', reasoning_effort='high', max_tokens=64000)
     save_encrypted(report)
     if not complete:
         print('Summary incomplete; encrypted partial output and finish metadata saved', flush=True)
