@@ -2,9 +2,6 @@ name: Qwen ASR CPU Benchmark
 permissions:
   contents: read
   actions: read
-concurrency:
-  group: qwen-asr-benchmark
-  cancel-in-progress: false
 jobs:
   benchmark:
     runs-on: ubuntu-latest
@@ -13,7 +10,10 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        slot: ${{ fromJSON(inputs.parallel_pair && '[0,1]' || '[-1]') }}
+        slot: ${{ fromJSON(inputs.course_slots == 'pair' && '[0,1]' || inputs.course_slots == '0' && '[0]' || inputs.course_slots == '1' && '[1]' || '[-1]') }}
+    concurrency:
+      group: qwen-asr-benchmark-slot-${{ matrix.slot }}
+      cancel-in-progress: false
     env:
       HF_HUB_DISABLE_TELEMETRY: '1'
       TOKENIZERS_PARALLELISM: 'false'
@@ -131,7 +131,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ inputs.parallel_pair && format('qwen-asr-encrypted-result-{0}', matrix.slot) || 'qwen-asr-encrypted-result' }}
+        name: ${{ matrix.slot != -1 && format('qwen-asr-encrypted-result-{0}', matrix.slot) || 'qwen-asr-encrypted-result' }}
         path: ${{ runner.temp }}/qwen-benchmark/result.enc
         if-no-files-found: ignore
         retention-days: 1
@@ -141,10 +141,15 @@ jobs:
 'on':
   workflow_dispatch:
     inputs:
-      parallel_pair:
-        description: 'Test two private course slots concurrently; full production-recognizer mode only'
-        type: boolean
-        default: false
+      course_slots:
+        description: 'Private full-runtime slots: pair concurrently, or retry only 0/1; legacy uses the single-request Secret'
+        type: choice
+        options:
+        - legacy
+        - pair
+        - '0'
+        - '1'
+        default: legacy
       public_sample:
         description: Use Qwen official public sample to isolate CPU feasibility from iCourse networking
         type: boolean
