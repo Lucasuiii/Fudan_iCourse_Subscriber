@@ -15,6 +15,10 @@ on:
         description: 'One 10-minute smoke test with approximately 2-minute pause-aware chunks'
         type: boolean
         default: false
+      quality_sample:
+        description: 'On the 10-minute long-chunk test only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,6 +38,7 @@ jobs:
       MKL_NUM_THREADS: '4'
       FULL_LECTURE: ${{ inputs.full_lecture }}
       LONG_CHUNK_SAMPLE: ${{ inputs.long_chunk_sample }}
+      QUALITY_SAMPLE: ${{ inputs.quality_sample }}
     steps:
       - name: Validate isolated test mode
         env:
@@ -45,6 +50,9 @@ jobs:
           if [ "$LONG_CHUNK_SAMPLE" = true ] && { [ "$FULL_LECTURE" = true ] || [ "$PUBLIC_SAMPLE" = true ]; }; then
             exit 1
           fi
+          if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -54,6 +62,9 @@ jobs:
       - name: Install private audio acquisition dependencies
         run: |
           python -m pip install requests pycryptodome cryptography
+          if [ "$QUALITY_SAMPLE" = true ]; then
+            python -m pip install rapidocr-onnxruntime Pillow openai
+          fi
           if ! command -v ffmpeg >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
@@ -84,6 +95,13 @@ jobs:
           QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
           PUBLIC_SAMPLE: ${{ inputs.public_sample }}
         run: python -m scripts.benchmark_qwen_asr infer
+      - name: Review references and rescue bounded suspect speech without overwriting
+        if: ${{ inputs.quality_sample }}
+        env:
+          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+        run: python -m scripts.benchmark_qwen_asr review
       - name: Save encrypted test result only
         if: always()
         uses: actions/upload-artifact@v4

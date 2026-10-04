@@ -130,6 +130,47 @@ def fetch() -> None:
                             "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
             raise RuntimeError("Audio acquisition failed; encrypted diagnostic saved")
     print("Authorized slice acquisition completed; no audio artifact uploaded", flush=True)
+    if os.environ.get("QUALITY_SAMPLE") == "true":
+        fetch_evidence(client, request)
+
+
+def fetch_evidence(client, request):
+    """Optional bounded local OCR; no screenshot URLs stored in the report."""
+    from src.ai.ocr import ocr_image_text
+    from src.api.icourse import fetch_ppt_image
+    evidence = {"official_subtitles": [], "ppt": [], "unavailable": []}
+    offset, stop = request['offset'], request['offset'] + request['duration']
+    with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+        try:
+            subtitles=client.get_transcript_segments(request['sub_id'])
+            for row in subtitles or []:
+                if row['end_ms']>offset*1000 and row['start_ms']<stop*1000:
+                    evidence['official_subtitles'].append({
+                        'start':row['start_ms']/1000-offset,'end':row['end_ms']/1000-offset,
+                        'text':str(row['text'])[:100]})
+            evidence['official_subtitles']=evidence['official_subtitles'][:100]
+            if subtitles is None:
+                evidence['unavailable'].append('official_subtitles')
+        except Exception:
+            evidence['unavailable'].append('official_subtitles')
+        try:
+            pages=client.get_ppt_list(request['course_id'],request['sub_id'])
+            preceding=[p for p in pages if p['created_sec']<=offset]
+            chosen=preceding[-1:]+[p for p in pages if offset<p['created_sec']<stop]
+            for page in chosen[:6]:
+                try:
+                    image=fetch_ppt_image(client,page,max_attempts=1,timeout=30)
+                    if not image or len(image)>8*1024*1024:
+                        evidence['unavailable'].append('ppt_page')
+                        continue
+                    evidence['ppt'].append({'start':page['created_sec']-offset,
+                                             'text':ocr_image_text(image)[:1000]})
+                except Exception:
+                    evidence['unavailable'].append('ppt_page')
+        except Exception:
+            evidence['unavailable'].append('ppt')
+    (workspace()/'evidence.json').write_text(json.dumps(evidence,ensure_ascii=False),encoding='utf-8')
+    print(f"Reference materials: subtitles={len(evidence['official_subtitles'])}, OCR_pages={len(evidence['ppt'])}",flush=True)
 
 
 def save_encrypted(report: dict) -> None:
@@ -237,6 +278,7 @@ def infer_lecture() -> None:
     from huggingface_hub import snapshot_download
     from qwen_asr import Qwen3ASRModel
     from scripts.qwen_segmentation import plan_long_chunks, join_chunk_text
+    from scripts.qwen_quality import context_echo
 
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
@@ -323,7 +365,18 @@ def infer_lecture() -> None:
                    "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2}
             row["text_token_count"] = len(model.processor.tokenizer.encode(result.text, add_special_tokens=False))
             row["possible_truncation"] = row["text_token_count"] >= 2000
-            row["context_echo"] = "Hilbert矩阵、逆矩阵、条件数、delta、范数" in result.text
+            row["context_echo"] = context_echo(result.text, TERMS)
+            if os.environ.get("QUALITY_SAMPLE") == "true" and row['context_echo']:
+                row['original_text'] = row['text']
+                retry_start=time.perf_counter()
+                with torch.inference_mode():
+                    result=model.transcribe(audio=(samples,16000),context='',language='Chinese')[0]
+                row['text']=result.text
+                row['unhinted_retry_seconds']=time.perf_counter()-retry_start
+                row['context_echo']=context_echo(result.text,TERMS)
+                row['quality_state']='unresolved_context_echo' if row['context_echo'] else 'unhinted_retry'
+                if row['context_echo']:
+                    row['text']=''  # Do not promote a known prompt echo into the transcript.
             # Linux current RSS distinguishes retained allocations from the peak.
             row["rss_gib"] = int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024**3
             report["full_chunks"].append(row)
@@ -339,16 +392,47 @@ def infer_lecture() -> None:
     print("Full lecture completed; private text is encrypted only", flush=True)
 
 
+def quality_review():
+    """One review request, at most 120s cloud audio; keep variants, no DB writes."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from openai import OpenAI
+    from scripts.qwen_quality import review_quality,select_rescue_windows
+    from src.ai.doubao_asr import rescue_intervals_pcm
+    d=(workspace()/'result.enc').read_bytes()
+    key=base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'],validate=True)
+    report=json.loads(AESGCM(key).decrypt(d[5:17],d[17:],b'qwen-asr-benchmark-v1'))
+    evidence=json.loads((workspace()/'evidence.json').read_text())
+    report['reference_evidence']=evidence
+    selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
+                            'deepseek-v4-flash',report,evidence)
+    report['review_suspects']=selected
+    save_encrypted(report)
+    intervals=select_rescue_windows(report['full_chunks'],[x['id'] for x in selected],report['vad_windows'])
+    raw=workspace()/'audio.raw'
+    if intervals:
+        subprocess.run(['ffmpeg','-v','error','-i',str(workspace()/'audio.wav'),
+                        '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
+                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
+        rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
+                                                   intervals,max_seconds=120,max_clips=10)
+    else:
+        rescues,attempted,failed=[],0,False
+    report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
+                            'selection_limit':'Speech windows within suspect chunks; no exact word alignment. Originals retained.'}
+    save_encrypted(report)
+    print(f"Quality check: suspects={len(selected)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)
+
+
 def clean() -> None:
     # Only this workflow's exact private outputs, never a broad temp directory.
-    for name in ("audio.wav", "result.enc"):
+    for name in ("audio.wav", "audio.raw", "evidence.json", "result.enc"):
         (workspace() / name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) == 2 else "invalid"
     try:
-        {"fetch": fetch, "infer": infer, "clean": clean}[mode]()
+        {"fetch": fetch, "infer": infer, "review": quality_review, "clean": clean}[mode]()
     except Exception as error:
         # Exception bodies and command arguments may contain private URLs.
         print(f"Benchmark {mode} failed ({type(error).__name__}); private details withheld", flush=True)
