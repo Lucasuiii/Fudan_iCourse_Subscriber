@@ -27,9 +27,23 @@ WINDOWS = [(62.022, 76.128), (176.294, 187.328),
 TERMS = "数值算法与案例分析。术语：良态问题、病态问题、扰动、希尔伯特矩阵、Hilbert矩阵、逆矩阵、条件数、delta、范数。"
 
 
-def recognition_context():
+def recognition_context(course_title=None):
+    if course_title:
+        from src.ai.course_glossary import course_terms
+        terms = course_terms(course_title)
+        return '术语：' + '、'.join(terms) if terms else ''
     # New lecture topics are unknown; do not reuse previous lecture's hotwords.
-    return '数值算法与案例分析。' if os.environ.get('LATEST_LECTURE') == 'true' else TERMS
+    return '' if os.environ.get('LATEST_LECTURE') == 'true' else TERMS
+
+
+def review_hotwords(report, evidence):
+    """Reuse the selected course's hints, never the old numerical test terms."""
+    selection = report.get('selection') or evidence.get('selection') or {}
+    title = selection.get('course_title')
+    if title:
+        from src.ai.course_glossary import course_terms
+        return course_terms(title)
+    return [] if os.environ.get('LATEST_LECTURE') == 'true' else TERMS.split('术语：')[-1].rstrip('。').split('、')
 
 
 def latest_request(detail, request, today=None):
@@ -54,7 +68,7 @@ def latest_request(detail, request, today=None):
         raise ValueError('No dated non-future lecture available')
     lecture = max(candidates, key=lambda item: item[:3])[3]
     return {**request, 'sub_id': str(lecture['sub_id']), 'offset': 0,
-            'duration': 1800, 'selection': {'course_title': detail.get('title'),
+            'duration': 1800, 'selection': {'course_id': request.get('course_id'), 'course_title': detail.get('title'),
              'sub_title': lecture.get('sub_title'), 'date': lecture['date'],
              'sub_id': str(lecture['sub_id']), 'offset': 0, 'duration': 1800}}
 
@@ -75,6 +89,22 @@ def parse_request(raw: str) -> dict:
         raise ValueError("Test slice must be at most 600 seconds")
     return {"course_id": str(value["course_id"]), "sub_id": str(value["sub_id"]),
             "offset": offset, "duration": duration}
+
+
+def selected_test_request():
+    """Two immutable private selections for one parallel test workflow."""
+    slot = os.environ.get('TEST_COURSE_SLOT', '-1')
+    if slot == '-1':
+        return parse_request(os.environ['QWEN_ASR_TEST_REQUEST'])
+    if slot not in ('0', '1'):
+        raise ValueError('Invalid parallel test slot')
+    requests = json.loads(os.environ['QWEN_ASR_TEST_REQUESTS'])
+    if not isinstance(requests, list) or len(requests) != 2:
+        raise ValueError('Parallel test requires exactly two private requests')
+    parsed = [parse_request(json.dumps(request)) for request in requests]
+    if parsed[0]['course_id'] == parsed[1]['course_id']:
+        raise ValueError('Parallel test courses must be distinct')
+    return parsed[int(slot)]
 
 
 def sample_seconds() -> int:
@@ -128,7 +158,7 @@ def configure_auth_session(session, events):
 def fetch() -> None:
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
-    request = parse_request(os.environ["QWEN_ASR_TEST_REQUEST"])
+    request = selected_test_request()
     if os.environ.get('LONG_CHUNK_SAMPLE')=='true':
         request['duration']=sample_seconds()
     print("Acquiring one privately selected authorized audio slice", flush=True)
@@ -185,6 +215,9 @@ def fetch() -> None:
     print("Authorized slice acquisition completed; no audio artifact uploaded", flush=True)
     if os.environ.get("QUALITY_SAMPLE") == "true":
         fetch_evidence(client, request)
+    else:
+        (workspace()/'evidence.json').write_text(
+            json.dumps({'selection': request.get('selection')}, ensure_ascii=False), encoding='utf-8')
 
 
 def fetch_evidence(client, request):
@@ -317,26 +350,54 @@ def infer() -> None:
 
 
 def infer_runtime_sample():
-    """Smoke-test the production Qwen entry point on official public audio only."""
-    import requests
+    """Actual production recognizer, public smoke or isolated full classroom."""
+    import soundfile as sf
     from types import SimpleNamespace
     from src.ai.transcriber import Transcriber
-    response=requests.get('https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav',timeout=60)
-    response.raise_for_status()
-    wav=workspace()/'audio.wav';wav.write_bytes(response.content)
+    public = os.environ.get('PUBLIC_SAMPLE') == 'true'
+    if not public and os.environ.get('FULL_LECTURE') != 'true':
+        raise ValueError('Private runtime tests require the full-lecture mode')
+    wav=workspace()/'audio.wav'
+    if public:
+        import requests
+        response=requests.get('https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav',timeout=60)
+        response.raise_for_status()
+        wav.write_bytes(response.content)
+    info=sf.info(wav)
+    if info.samplerate != 16000 or info.channels != 1 or info.duration <= 0:
+        raise ValueError('Runtime audio must be nonempty mono 16kHz')
+    evidence_path=workspace()/'evidence.json'
+    evidence=json.loads(evidence_path.read_text()) if evidence_path.exists() else {}
+    selection=evidence.get('selection') or {}
     raw=workspace()/'audio.raw'
     subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(wav),'-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
     transcriber=Transcriber()
+    from src.ai.course_glossary import course_terms
+    terms=course_terms(selection.get('course_title', ''))
+    transcriber.set_terms(terms)
     began=time.perf_counter()
-    transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
-    if not transcript.strip(): raise ValueError('Production runtime smoke transcript empty')
-    report={'source':'official_public_runtime_smoke','model':MODEL,'revision':REVISION,'complete':True,
-            'transcript':transcript,'segments':segments,'full_chunks':transcriber.last_chunks,
-            'audio_seconds':transcriber.last_audio_duration,'seconds':time.perf_counter()-began,
-            'peak_rss_gib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024**2}
-    save_encrypted(report)
-    print(f"Production Qwen runtime smoke passed: audio={report['audio_seconds']:.1f}s, runtime={report['seconds']:.1f}s, peak={report['peak_rss_gib']:.2f}GiB",flush=True)
+    report={'source':'official_public_runtime_smoke' if public else 'authorized_full_runtime',
+            'model':MODEL,'revision':REVISION,'complete':False,'selection':selection,
+            'recognition_terms':terms,'reference_evidence':evidence,
+            'acquisition_limit_reached':not public and info.duration >= 10800}
+    save_encrypted(report)  # Validate encryption before expensive inference.
+    try:
+        transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
+        if not transcript.strip(): raise ValueError('Production runtime transcript empty')
+        if report['acquisition_limit_reached']:
+            raise ValueError('Audio reached the full-lecture acquisition cap')
+        report.update(transcript=transcript,segments=segments,complete=True)
+    except Exception as error:
+        report['error_type']=type(error).__name__
+        raise
+    finally:
+        report.update(full_chunks=transcriber.last_chunks,vad_windows=transcriber.last_vad_windows,
+                      audio_seconds=transcriber.last_audio_duration,seconds=time.perf_counter()-began,
+                      peak_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024**2)
+        save_encrypted(report)
+        transcriber.release_model()
+    print(f"Production Qwen runtime passed: audio={report['audio_seconds']:.1f}s, runtime={report['seconds']:.1f}s, peak={report['peak_rss_gib']:.2f}GiB",flush=True)
 
 
 def infer_lecture() -> None:
@@ -402,7 +463,7 @@ def infer_lecture() -> None:
               "complete": False, "device": "cpu", "dtype": "float32", "threads": 4}
     if (workspace() / 'evidence.json').exists():
         report['selection'] = json.loads((workspace() / 'evidence.json').read_text()).get('selection')
-    context = recognition_context()
+    context = recognition_context((report.get('selection') or {}).get('course_title'))
     report['recognition_context'] = context
     save_encrypted(report)
     del vad
@@ -517,21 +578,18 @@ def quality_review():
     report['localization']={'located':located,'unresolved':unresolved}
     save_encrypted(report)
     raw=workspace()/'audio.raw'
+    hotwords=review_hotwords(report,evidence)
     if intervals:
         subprocess.run(['ffmpeg','-v','error','-i',str(workspace()/'audio.wav'),
                         '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
         rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
                                                    intervals,max_seconds=budget,max_clips=12 if full else 10,
-                                                   hotwords=(['数值算法','舍入误差','截断误差','收敛性','误差估计',
-                                                              '条件数','迭代法','插值','线性方程组','数值积分']
-                                                             if os.environ.get('LATEST_LECTURE') == 'true' else
-                                                             ['希尔伯特矩阵','逆矩阵','条件数','扰动','奇异值',
-                                                              '指数','舍入误差','显式表达式','范数','高斯消去法']))
+                                                   hotwords=hotwords)
     else:
         rescues,attempted,failed=[],0,False
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
-                            'hotword_hints_enabled':True,
+                            'hotword_hints_enabled':bool(hotwords),
                             'selection_limit':'Whole-chunk audio forced alignment locates quoted text; not a correctness guarantee. Unresolved locations are not uploaded. Originals retained.'}
     report['rescue_comparisons']=[{'chunk_id':w['chunk_id'],'original_quote':w['text'],
         'cloud_text':' '.join(s['text'] for s in segments),

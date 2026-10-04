@@ -9,6 +9,11 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.full_lecture && 300 || inputs.sample_minutes == '30' && 90 || 60 }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        slot: ${{ fromJSON(inputs.parallel_pair && '[0,1]' || '[-1]') }}
     env:
       HF_HUB_DISABLE_TELEMETRY: '1'
       TOKENIZERS_PARALLELISM: 'false'
@@ -22,6 +27,7 @@ jobs:
       RUNTIME_SAMPLE: ${{ inputs.runtime_sample }}
       LATEST_LECTURE: ${{ inputs.latest_lecture }}
       GENERATE_SUMMARY: ${{ inputs.generate_summary }}
+      TEST_COURSE_SLOT: ${{ matrix.slot }}
     steps:
     - name: Validate isolated test mode
       env:
@@ -50,7 +56,15 @@ jobs:
         fi
 
         if [ "$RUNTIME_SAMPLE" = true ]; then
-          [ "$PUBLIC_SAMPLE" = true ] && [ "$FULL_LECTURE" != true ] && [ "$LONG_CHUNK_SAMPLE" != true ] && [ "$QUALITY_SAMPLE" != true ] && [ "$GENERATE_SUMMARY" != true ] && [ "$LATEST_LECTURE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+          [ "$LONG_CHUNK_SAMPLE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+          if [ "$PUBLIC_SAMPLE" = true ]; then
+            [ "$FULL_LECTURE" != true ] && [ "$QUALITY_SAMPLE" != true ] && [ "$GENERATE_SUMMARY" != true ] && [ "$LATEST_LECTURE" != true ] || exit 1
+          else
+            [ "$FULL_LECTURE" = true ] || exit 1
+          fi
+        fi
+        if [ "$TEST_COURSE_SLOT" != -1 ]; then
+          [ "$PUBLIC_SAMPLE" != true ] && [ "$FULL_LECTURE" = true ] && [ "$RUNTIME_SAMPLE" = true ] && [ "$LATEST_LECTURE" = true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
         fi
     - uses: actions/checkout@v4
       with:
@@ -74,6 +88,7 @@ jobs:
         StuId: ${{ secrets.STUID }}
         UISPsw: ${{ secrets.UISPSW }}
         QWEN_ASR_TEST_REQUEST: ${{ secrets.QWEN_ASR_TEST_REQUEST }}
+        QWEN_ASR_TEST_REQUESTS: ${{ secrets.QWEN_ASR_TEST_REQUESTS }}
         QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
       run: python -m scripts.benchmark_qwen_asr fetch
     - name: Install isolated CPU inference dependencies
@@ -116,7 +131,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: qwen-asr-encrypted-result
+        name: ${{ inputs.parallel_pair && format('qwen-asr-encrypted-result-{0}', matrix.slot) || 'qwen-asr-encrypted-result' }}
         path: ${{ runner.temp }}/qwen-benchmark/result.enc
         if-no-files-found: ignore
         retention-days: 1
@@ -126,12 +141,16 @@ jobs:
 'on':
   workflow_dispatch:
     inputs:
+      parallel_pair:
+        description: 'Test two private course slots concurrently; full production-recognizer mode only'
+        type: boolean
+        default: false
       public_sample:
         description: Use Qwen official public sample to isolate CPU feasibility from iCourse networking
         type: boolean
         default: false
       runtime_sample:
-        description: 'Public audio only: test the actual Qwen production entry point'
+        description: 'Actual production recognizer: public smoke or an authorized full lecture'
         type: boolean
         default: false
       full_lecture:
@@ -150,7 +169,7 @@ jobs:
         - '30'
         default: '10'
       quality_sample:
-        description: 'Long-chunk sample only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
+        description: 'One review; Doubao capped at 120s for samples or 600s/12 clips for full lectures'
         type: boolean
         default: false
       latest_lecture:

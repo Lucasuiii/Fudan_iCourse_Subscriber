@@ -26,3 +26,11 @@ Actions明确安装CPU版 `torch==2.11.0` 与 `qwen-asr==0.0.6 --no-deps`，其�
 
 基准工作流可用 `runtime_sample=true, public_sample=true`，运行官方公开音频验证新主程序入口。
 该模式不登录iCourse、不调用摘要/豆包、不写正式数据库、不发邮件。
+
+完整课堂隔离测试可设置 `runtime_sample=true, full_lecture=true`，调用同一生产
+`Transcriber`，保留原始块、VAD 窗口及失败诊断供复核；到达三小时获取上限不标为完成。
+这验证真实识别入口与隔离复核/摘要，不等同于完整 `LectureRunner`、邮件和数据库发布验证。
+`parallel_pair=true` 可让两个独立 Runner 并行，选课来自专用
+`QWEN_ASR_TEST_REQUESTS` Secret 的两个条目，日志和产物名称只显示序号。
+该模式要求 `latest_lecture=true`，每门只选最新非未来课次；若无播放地址则报错，
+不会悄悄换一堂旧课。正式 `COURSE_IDS` 和原单课测试 Secret 不变。
