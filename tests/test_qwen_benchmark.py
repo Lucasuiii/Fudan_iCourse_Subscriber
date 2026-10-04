@@ -1,12 +1,19 @@
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 
-from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session
+from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds
 from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_bounded_sample_duration(self):
+        with patch.dict('os.environ',{'SAMPLE_MINUTES':'30','LONG_CHUNK_SAMPLE':'true'}):
+            self.assertEqual(sample_seconds(),1800)
+        for extra in ({'SAMPLE_MINUTES':'30','LONG_CHUNK_SAMPLE':'false'},
+                      {'SAMPLE_MINUTES':'60','LONG_CHUNK_SAMPLE':'true'}):
+            with patch.dict('os.environ',extra),self.assertRaises(ValueError):
+                sample_seconds()
     def request(self, **extra):
         return json.dumps({"course_id": "1", "sub_id": "2", "offset": 5220, "duration": 600, **extra})
 

@@ -12,11 +12,18 @@ on:
         type: boolean
         default: false
       long_chunk_sample:
-        description: 'One 10-minute smoke test with approximately 2-minute pause-aware chunks'
+        description: 'One bounded sample with approximately 2-minute pause-aware chunks'
         type: boolean
         default: false
+      sample_minutes:
+        description: 'Authorized sample duration, starting at the private request offset'
+        type: choice
+        options:
+          - '10'
+          - '30'
+        default: '10'
       quality_sample:
-        description: 'On the 10-minute long-chunk test only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
+        description: 'Long-chunk sample only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
         type: boolean
         default: false
       reuse_run_id:
@@ -35,7 +42,7 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.full_lecture && 300 || 60 }}
+    timeout-minutes: ${{ inputs.full_lecture && 300 || inputs.sample_minutes == '30' && 90 || 60 }}
     env:
       HF_HUB_DISABLE_TELEMETRY: '1'
       TOKENIZERS_PARALLELISM: 'false'
@@ -45,6 +52,7 @@ jobs:
       LONG_CHUNK_SAMPLE: ${{ inputs.long_chunk_sample }}
       QUALITY_SAMPLE: ${{ inputs.quality_sample }}
       REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+      SAMPLE_MINUTES: ${{ inputs.sample_minutes }}
     steps:
       - name: Validate isolated test mode
         env:
@@ -57,6 +65,9 @@ jobs:
             exit 1
           fi
           if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
+            exit 1
+          fi
+          if [ "$SAMPLE_MINUTES" = 30 ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
             exit 1
           fi
           if [ -n "$REUSE_RUN_ID" ]; then

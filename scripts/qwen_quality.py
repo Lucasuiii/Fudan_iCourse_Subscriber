@@ -208,6 +208,11 @@ def review_quality(client, model, report, evidence):
     indices=range(len(refs)) if len(refs)<=100 else sorted({round(i*(len(refs)-1)/99) for i in range(100)})
     bounded_evidence={**evidence,'official_subtitles':[{**refs[i],'text':refs[i]['text'][:80]} for i in indices]}
     payload = json.dumps({'chunks': rows, 'evidence': bounded_evidence},ensure_ascii=False)
+    # Keep every ASR chunk/quote candidate; reduce optional reference context
+    # first if a longer sample would exceed the one-call text budget.
+    while len(payload)>30000 and len(bounded_evidence['official_subtitles'])>1:
+        bounded_evidence['official_subtitles']=bounded_evidence['official_subtitles'][::2]
+        payload=json.dumps({'chunks':rows,'evidence':bounded_evidence},ensure_ascii=False)
     if len(payload)>30000:
         raise ValueError('Review exceeds bounded input')
     response = client.chat.completions.create(model=model,

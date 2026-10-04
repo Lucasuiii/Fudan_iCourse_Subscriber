@@ -42,6 +42,15 @@ def parse_request(raw: str) -> dict:
             "offset": offset, "duration": duration}
 
 
+def sample_seconds() -> int:
+    value=os.environ.get('SAMPLE_MINUTES','10')
+    if value not in ('10','30'):
+        raise ValueError('Sample length must be 10 or 30 minutes')
+    if value=='30' and os.environ.get('LONG_CHUNK_SAMPLE')!='true':
+        raise ValueError('30-minute samples require the isolated long-chunk mode')
+    return int(value)*60
+
+
 def auth_phase(url: str) -> str:
     """Only allowlisted step names, never URL/token/account data in logs."""
     path = urlparse(url).path.rstrip("/")
@@ -85,6 +94,8 @@ def fetch() -> None:
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
     request = parse_request(os.environ["QWEN_ASR_TEST_REQUEST"])
+    if os.environ.get('LONG_CHUNK_SAMPLE')=='true':
+        request['duration']=sample_seconds()
     print("Acquiring one privately selected authorized audio slice", flush=True)
     failures = []
     for attempt in range(5):
@@ -124,7 +135,8 @@ def fetch() -> None:
             "-headers", headers, "-ss", str(0 if full else request["offset"]), "-i", media,
             "-t", str(10800 if full else request["duration"]), "-vn", "-ac", "1", "-ar", "16000",
             "-y", str(workspace() / "audio.wav"),
-        ], stdout=quiet, stderr=subprocess.PIPE, timeout=1200 if full else 420)
+        ], stdout=quiet, stderr=subprocess.PIPE,
+           timeout=1200 if full or request['duration']>600 else 420)
         if process.returncode:
             save_encrypted({"stage": "audio_acquisition", "returncode": process.returncode,
                             "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
@@ -291,8 +303,9 @@ def infer_lecture() -> None:
     if info.samplerate != 16000 or info.channels != 1 or not 0 < info.duration <= 10800.1:
         raise ValueError("Invalid full lecture audio")
     sample_only = os.environ.get("LONG_CHUNK_SAMPLE") == "true"
-    if sample_only and not 590 <= info.duration <= 600.1:
-        raise ValueError("Long-chunk smoke test must use the authorized 10-minute slice")
+    expected=sample_seconds() if sample_only else None
+    if sample_only and not expected-10 <= info.duration <= expected+0.1:
+        raise ValueError("Audio duration does not match the bounded sample length")
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(Path(os.environ["RUNNER_TEMP"]) / "silero_vad.onnx")
     config.silero_vad.threshold = 0.5
@@ -326,6 +339,7 @@ def infer_lecture() -> None:
     report = {"model": MODEL, "revision": REVISION,
               "source": "authorized_long_chunk_slice" if sample_only else "authorized_full_lecture",
               "chunk_target_seconds": 120, "max_new_tokens": 2048,
+              "requested_sample_seconds": expected,
               "audio_seconds": info.duration, "vad_seconds": time.perf_counter() - began,
               "acquisition_limit_reached": info.duration >= 10800,
               "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
