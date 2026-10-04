@@ -4,8 +4,8 @@
 课程列表沿用私密的 `COURSE_IDS`，矩阵输出只显示序号，不显示课程标识。
 `max-parallel: 5`，`fail-fast: false`：最多同时五门，每门内部课次顺序处理。
 
-各课程 job 使用现有正式识别引擎，目前仍是 SenseVoice + 有界豆包复核；
-不意味着 Qwen 全量识别已经接入正式主程序。`automatic_terms` 可选择启用分支中的
+各课程 job 使用本分支的 Qwen3-ASR-1.7B 全量识别与有界豆包复核；
+SenseVoice 已从本分支运行链移除，尚未替换 main 的线上引擎。`automatic_terms` 可选择启用分支中的
 自动词库，默认关闭。
 
 worker 不发送邮件，也不推送 data 分支；关闭重复课程目录爬取。

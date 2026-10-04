@@ -1,13 +1,13 @@
 """Select only clearly weak local-ASR speech windows for cloud rescue.
 
-SenseVoice does not expose calibrated confidence.  An empty or near-empty
+Qwen does not expose calibrated confidence here. An empty or near-empty
 result on a VAD-confirmed speech window is a conservative, observable proxy;
 silent stretches are never sent to the cloud merely because the transcript is
 sparse.  The budget is per lecture, not per retry or account.
 """
 
 MAX_CLOUD_SECONDS = 10 * 60
-MAX_CLOUD_CLIPS = 10
+MAX_CLOUD_CLIPS = 12
 MIN_EMPTY_SPEECH_SECONDS = 5
 MIN_WEAK_SPEECH_SECONDS = 10
 

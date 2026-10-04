@@ -169,25 +169,9 @@ VIDEO_DIR = os.path.join(DATA_DIR, "videos")
 AUDIO_DIR = os.path.join(DATA_DIR, "audio")  # ffmpeg-decoded f32le scratch buffers
 DB_PATH = os.environ.get("DB_PATH", os.path.join(DATA_DIR, "icourse.db"))
 
-# Sherpa-onnx ASR model directory.  Default: SenseVoice (zh+en+ja+ko+yue, int8).
-# ASR_MODEL_DIR is the new name; SENSEVOICE_MODEL_DIR is the legacy env var
-# kept as a fallback so existing CI cache keys keep working.
-ASR_MODEL_DIR = os.environ.get(
-    "ASR_MODEL_DIR",
-    os.environ.get(
-        "SENSEVOICE_MODEL_DIR",
-        "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-    ),
-)
-SENSEVOICE_MODEL_DIR = ASR_MODEL_DIR  # alias for any straggler imports
-SILERO_VAD_PATH = os.environ.get("SILERO_VAD_PATH", "silero_vad.onnx")
-
-# ASR backend selector — Transcriber dispatches on this.  When changing,
-# ASR_MODEL_DIR must point at a matching sherpa-onnx model bundle:
-#   sensevoice — sherpa-onnx-sense-voice-* (multi-lang CTC, single model)
-#   firered    — sherpa-onnx-fire-red-asr2-ctc-* (CTC, single model.onnx)
-#   zipformer  — sherpa-onnx-zipformer-* (transducer, encoder/decoder/joiner)
-ASR_BACKEND = os.environ.get("ASR_BACKEND", "sensevoice").strip().lower()
+# Qwen 1.7B is the sole local recognizer; sherpa-onnx is VAD only.
+SILERO_VAD_PATH = os.environ.get('SILERO_VAD_PATH', 'silero_vad.onnx')
+ASR_BACKEND = 'qwen'
 # Inference thread count.  4 fully saturates a 4-vCPU GitHub runner.
 ASR_NUM_THREADS = int(os.environ.get("ASR_NUM_THREADS", "4"))
 
@@ -208,7 +192,7 @@ VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
 
-# Local SenseVoice is primary.  When set, Seed-ASR 2.0 only rescues bounded
+# Local Qwen is primary.  When set, Seed-ASR 2.0 only rescues bounded
 # VAD-confirmed speech windows with empty or near-empty local recognition.
 DOUBAO_ASR_API_KEY = os.environ.get("DOUBAO_ASR_API_KEY", "").strip()
 

@@ -43,15 +43,9 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         vad = SimpleNamespace(done=False, front=speech)
         vad.empty = lambda: vad.done
         vad.pop = lambda: setattr(vad, "done", True)
-        transcriber._vad = vad
-        transcriber._recognizer = MagicMock()
-        transcriber._recognizer.create_stream.return_value.result.text = ""
-        segments = []
-        transcriber._drain_segments(segments)
-        self.assertEqual(segments, [])
-        self.assertEqual(transcriber.last_speech_windows, [{
-            "start_ms": 1_000, "end_ms": 11_000, "text": "",
-        }])
+        windows=[]
+        transcriber._drain_vad(vad,windows)
+        self.assertEqual(windows,[(1.0,11.0)])
 
     def test_local_asr_returns_substantial_audio_despite_media_mismatch(self):
         with patch.dict(sys.modules, {
@@ -231,7 +225,7 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
             runner._refine_unclear_transcript(local[0]["text"], local, [],
                                               course_title="高等代数Ⅰ")
         self.assertEqual(rescue.call_args.kwargs,
-                         {"max_seconds": 30, "max_clips": 2})
+                     {"max_seconds": 30, "max_clips": 4})
         self.assertEqual(runner._cloud_seconds, 590)
         self.assertEqual(summarizer.find_unclear_windows.call_args.kwargs,
                          {"course_title": "高等代数Ⅰ"})

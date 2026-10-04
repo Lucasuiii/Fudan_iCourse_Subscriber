@@ -242,6 +242,9 @@ def save_encrypted(report: dict) -> None:
 
 
 def infer() -> None:
+    if os.environ.get('RUNTIME_SAMPLE') == 'true':
+        infer_runtime_sample()
+        return
     if os.environ.get("FULL_LECTURE") == "true" or os.environ.get("LONG_CHUNK_SAMPLE") == "true":
         infer_lecture()
         return
@@ -269,20 +272,6 @@ def infer() -> None:
     report["source"] = "official_public_sample" if public_sample else "authorized_classroom_slice"
     save_encrypted(report)  # Check encryption before expensive inference.
     print(f"CPU threads=4; available RAM={os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024**3:.2f} GiB", flush=True)
-    sense_dir = Path(os.environ["RUNNER_TEMP"]) / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-    baseline = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=str(sense_dir / "model.int8.onnx"), tokens=str(sense_dir / "tokens.txt"),
-        num_threads=4, use_itn=True, debug=False)
-    for index, (start, end) in enumerate(windows):
-        began = time.perf_counter()
-        stream = baseline.create_stream()
-        stream.accept_waveform(sr, audio[round(start * sr):round(end * sr)])
-        baseline.decode_stream(stream)
-        report["clips"].append({"backend": "SenseVoiceSmall-int8", "start": start,
-                                "end": end, "text": stream.result.text,
-                                "seconds": time.perf_counter() - began})
-    del baseline
-    print(f"SenseVoice baseline finished on {len(windows)} matching clip(s)", flush=True)
     began = time.perf_counter()
     model_path = snapshot_download(MODEL, revision=REVISION,
         allow_patterns=["*.json", "*.safetensors", "*.txt"])
@@ -325,6 +314,29 @@ def infer() -> None:
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
     save_encrypted(report)
     print(f"Benchmark completed: selected RTF={ratio:.3f}, peak RSS={report['peak_rss_gib']:.2f} GiB", flush=True)
+
+
+def infer_runtime_sample():
+    """Smoke-test the production Qwen entry point on official public audio only."""
+    import requests
+    from types import SimpleNamespace
+    from src.ai.transcriber import Transcriber
+    response=requests.get('https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav',timeout=60)
+    response.raise_for_status()
+    wav=workspace()/'audio.wav';wav.write_bytes(response.content)
+    raw=workspace()/'audio.raw'
+    subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(wav),'-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
+    transcriber=Transcriber()
+    began=time.perf_counter()
+    transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
+    if not transcript.strip(): raise ValueError('Production runtime smoke transcript empty')
+    report={'source':'official_public_runtime_smoke','model':MODEL,'revision':REVISION,'complete':True,
+            'transcript':transcript,'segments':segments,'full_chunks':transcriber.last_chunks,
+            'audio_seconds':transcriber.last_audio_duration,'seconds':time.perf_counter()-began,
+            'peak_rss_gib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024**2}
+    save_encrypted(report)
+    print(f"Production Qwen runtime smoke passed: audio={report['audio_seconds']:.1f}s, runtime={report['seconds']:.1f}s, peak={report['peak_rss_gib']:.2f}GiB",flush=True)
 
 
 def infer_lecture() -> None:

@@ -16,7 +16,10 @@ def align_suspects(report,selected,path,checkpoint, *, budget=120):
     from huggingface_hub import snapshot_download
     from qwen_asr import Qwen3ForcedAligner
     torch.set_num_threads(4)
-    torch.set_num_interop_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # Qwen runtime may already have initialized the shared CPU pool.
     began=time.perf_counter()
     model_path=snapshot_download(MODEL,revision=REVISION,
                                  allow_patterns=['*.json','*.safetensors','*.txt'])

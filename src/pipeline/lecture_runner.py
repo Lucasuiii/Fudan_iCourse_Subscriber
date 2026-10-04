@@ -42,6 +42,10 @@ from __future__ import annotations
 
 import time
 import os
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
@@ -94,6 +98,7 @@ class LectureRunner:
         self._automatic_glossary = None
         self._historical_terms = []
         self._cloud_term_sources = []
+        self._qwen_review_material = {}
 
     # ── Public entry point ──────────────────────────────────────────────
 
@@ -106,12 +111,15 @@ class LectureRunner:
         lecture in the batch.
         """
         sub_id = str(lecture["sub_id"])
+        self._transcriber.reset_lecture_state()
         if os.environ.get('AUTO_COURSE_TERMS','').lower() == 'true':
             from src.ai.automatic_glossary import AutomaticGlossary
             from src.ai.course_glossary import course_terms
             self._automatic_glossary = AutomaticGlossary(self._db,course_id)
             automatic = self._automatic_glossary.terms(exclude_sub_id=sub_id)
             self._historical_terms = list(dict.fromkeys(automatic+course_terms(course_title)))[:30]
+        from src.ai.course_glossary import course_terms
+        self._transcriber.set_terms(self._historical_terms or course_terms(course_title))
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
@@ -465,6 +473,9 @@ class LectureRunner:
                 or self._transcript_source not in ("local_asr", "hybrid_asr")
                 or len(transcript.strip()) < 200):
             return transcript, segments
+        chunks=getattr(self._transcriber,'last_chunks',None)
+        if isinstance(chunks,list) and chunks:
+            return self._refine_qwen(transcript,segments,ppt_pages,remaining,clips_left)
         options = {'terms':self._historical_terms} if self._automatic_glossary else {}
         suspects = self._summarizer.find_unclear_windows(
             self._transcriber.last_speech_windows, ppt_pages, self._cloud_windows,
@@ -491,6 +502,40 @@ class LectureRunner:
         )
         return " ".join(segment["text"] for segment in merged), merged
 
+    def _refine_qwen(self, transcript, segments, ppt_pages, remaining, clips_left):
+        """Exact quotes + whole-block alignment; uncertain variants stay separate."""
+        from scripts.qwen_quality import review_quality
+        from scripts.qwen_audio_alignment import align_suspects
+        try:
+            report={'full_chunks':self._transcriber.last_chunks,
+                    'vad_windows':self._transcriber.last_vad_windows}
+            provider=self._summarizer.providers[0]
+            selected=review_quality(self._summarizer._clients[provider['name']],provider['models'][0],
+                report,{'ppt':ppt_pages},max_suspects=min(12,clips_left),input_budget=96000)
+            if not selected: return transcript,segments
+            with tempfile.TemporaryDirectory(prefix='icourse-qwen-align-') as tmp:
+                wav=Path(tmp)/'speech.wav'
+                subprocess.run(['ffmpeg','-nostdin','-v','error','-f','f32le','-ar','16000','-ac','1',
+                    '-i',self._asr_audio_path,'-y',str(wav)],stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,check=True,timeout=120)
+                intervals,located,unresolved,_=align_suspects(report,selected,wav,lambda _:None,budget=remaining)
+            rescues,attempted,failed=doubao_asr.rescue_intervals_pcm(self._asr_audio_path,
+                config.DOUBAO_ASR_API_KEY,intervals,max_seconds=remaining,max_clips=clips_left,
+                hotwords=self._historical_terms or self._transcriber._terms)
+            self._cloud_seconds+=attempted;self._cloud_failed=failed
+            variants=[]
+            for interval,result in rescues:
+                if not any(s['start_ms']<interval['quote_end_ms'] and interval['quote_start_ms']<s['end_ms'] for s in result):
+                    continue
+                cloud=' '.join(s['text'] for s in result)
+                self._cloud_term_sources.append(cloud)
+                variants.append({'original_quote':interval['text'],'cloud_text':cloud})
+            self._qwen_review_material={'variants':variants,'unresolved':unresolved}
+            self._reporter.info(f'    [Qwen review] located={len(located)}, unresolved={len(unresolved)}, cloud={attempted:.1f}s')
+        except Exception as error:
+            self._reporter.info(f'    [WARN] Qwen review unavailable: {type(error).__name__}; preserving local text')
+        return transcript,segments
+
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
         try:
@@ -498,6 +543,9 @@ class LectureRunner:
             prompt_text, mode = bucketer.assemble(
                 transcript, transcript_segments, kept_pages,
             )
+            if self._qwen_review_material:
+                prompt_text += ('\n\n局部云端复核版本（不保证正确，不得无条件替换原文；未解决疑点不得编造）：\n'
+                                +json.dumps(self._qwen_review_material,ensure_ascii=False))
             self._reporter.info(
                 f"    [Time] Generating summary at "
                 f"{time.strftime('%H:%M:%S')}"
