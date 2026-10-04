@@ -7,6 +7,24 @@ from src.ai import doubao_asr
 
 
 class DoubaoASRTests(unittest.TestCase):
+    def test_pilot_quota_is_explicit_and_production_caps_stay_unchanged(self):
+        for profile, seconds_cap, clips_cap in [('production', 600, 12), ('pilot15', 900, 18)]:
+            for seconds in (1, 60):
+                intervals = [{'start_ms': i*60000, 'end_ms': i*60000+seconds*1000, 'text': ''}
+                             for i in range(25)]
+                with patch.object(doubao_asr, '_encode_chunk', return_value=b'audio'), \
+                     patch.object(doubao_asr, '_recognize_chunk', return_value=[{'text': '矩阵'}]):
+                    results, spent, failed = doubao_asr.rescue_intervals_pcm(
+                        'fake.pcm', 'test-key', intervals, session=MagicMock(),
+                        max_seconds=10000, max_clips=100, budget_profile=profile)
+                self.assertEqual(len(results), min(clips_cap, seconds_cap//seconds))
+                self.assertLessEqual(spent, seconds_cap)
+                self.assertFalse(failed)
+        from src.ai.segment_rescue import cloud_budget_limits
+        self.assertEqual(cloud_budget_limits(), (600, 12))
+        with self.assertRaises(ValueError):
+            cloud_budget_limits('unbounded')
+
     def test_optional_hotword_bounds(self):
         self.assertIsNone(doubao_asr.hotword_corpus(None))
         result=doubao_asr.hotword_corpus(['逆矩阵','逆矩阵',None,'','bad\nword','x'*31,'条件数'])

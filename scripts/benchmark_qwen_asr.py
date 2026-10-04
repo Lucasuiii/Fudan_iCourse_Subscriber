@@ -616,12 +616,17 @@ def quality_review():
     # without paying for another full local transcription or review request.
     selected=report.get('review_suspects') if os.environ.get('REUSE_RUN_ID') else None
     full = os.environ.get('FULL_LECTURE') == 'true'
-    budget = 600 if full else 120
-    report['quality_limits'] = {'cloud_seconds':budget, 'max_suspects':12 if full else 4}
+    from src.ai.segment_rescue import cloud_budget_limits
+    profile = os.environ.get('QWEN_REVIEW_PROFILE', 'production')
+    seconds_cap, clips_cap = cloud_budget_limits(profile)
+    budget = seconds_cap if full else 120
+    report['quality_limits'] = {'cloud_seconds':budget, 'max_suspects':clips_cap if full else 4,
+                                'max_clips':clips_cap if full else 10, 'profile':profile}
     if selected is None:
         selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
                                 'deepseek-v4-flash',report,evidence,
-                                max_suspects=12 if full else 4, input_budget=96000 if full else 30000)
+                                max_suspects=clips_cap if full else 4, input_budget=96000 if full else 30000,
+                                budget_profile=profile)
     report['review_suspects']=selected
     save_encrypted(report)
     intervals,located,unresolved,metrics=align_suspects(report,selected,workspace()/'audio.wav',save_encrypted,budget=budget)
@@ -635,11 +640,18 @@ def quality_review():
                         '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
         rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
-                                                   intervals,max_seconds=budget,max_clips=12 if full else 10,
+                                                   intervals,max_seconds=budget,max_clips=clips_cap if full else 10,
+                                                   budget_profile=profile,
                                                    hotwords=hotwords)
     else:
         rescues,attempted,failed=[],0,False
+    completed_seconds = sum((w['end_ms']-w['start_ms'])/1000 for w, _ in rescues)
+    attempted_clips = len(rescues) + int(failed and attempted > completed_seconds+1e-6)
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
+                            'completed_clips':len(rescues),
+                            'attempted_clips':attempted_clips,
+                            'seconds_cap_reached':attempted >= budget,
+                            'clips_cap_reached':attempted_clips >= (clips_cap if full else 10),
                             'hotword_hints_enabled':bool(hotwords),
                             'selection_limit':'Whole-chunk audio forced alignment locates quoted text; not a correctness guarantee. Unresolved locations are not uploaded. Originals retained.'}
     report['rescue_comparisons']=[{'chunk_id':w['chunk_id'],'original_quote':w['text'],

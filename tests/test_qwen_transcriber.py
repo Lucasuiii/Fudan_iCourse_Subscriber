@@ -8,6 +8,23 @@ from src.ai.qwen_transcriber import QwenTranscriber, MODEL, REVISION
 
 
 class QwenRuntimeTests(unittest.TestCase):
+    def test_original_block_failure_retains_vad_coverage_and_does_not_load_after_deadline(self):
+        import numpy as np
+        transcriber = QwenTranscriber()
+        transcriber._init = MagicMock()
+        transcriber._recognize = MagicMock(side_effect=[{'text': '矩阵'}, RuntimeError('failed block')])
+        transcriber.last_vad_windows = [(0, 2)]
+        blocks = [{'chunk_id': 7, 'start': 0, 'end': 1}, {'chunk_id': 9, 'start': 1, 'end': 2}]
+        with self.assertRaises(RuntimeError):
+            transcriber.recognize_blocks(blocks, lambda _: np.zeros(16000, dtype=np.float32))
+        self.assertEqual(transcriber.last_chunks[0]['chunk_id'], 7)
+        self.assertEqual(transcriber.last_speech_windows,
+                         [{'start_ms': 0, 'end_ms': 1000, 'text': '矩阵', 'chunk_id': 7}])
+        transcriber._init.reset_mock()
+        with self.assertRaises(TimeoutError):
+            transcriber.recognize_blocks(blocks, lambda _: [], timeout=0)
+        transcriber._init.assert_not_called()
+
     def consume(self, transcriber, data, read_fn=None, chunks=None):
         """Exercise the PCM loop without loading model weights or native VAD."""
         vad = SimpleNamespace(empty=lambda: True, accept_waveform=lambda _: None,

@@ -8,6 +8,17 @@ sparse.  The budget is per lecture, not per retry or account.
 
 MAX_CLOUD_SECONDS = 10 * 60
 MAX_CLOUD_CLIPS = 12
+
+
+def cloud_budget_limits(profile='production'):
+    """Explicit isolated experiment; production defaults stay unchanged."""
+    if profile == 'production':
+        return MAX_CLOUD_SECONDS, MAX_CLOUD_CLIPS
+    if profile == 'pilot15':
+        return 15 * 60, 18
+    raise ValueError('Unknown cloud budget profile')
+
+
 MIN_EMPTY_SPEECH_SECONDS = 5
 MIN_WEAK_SPEECH_SECONDS = 10
 

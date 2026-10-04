@@ -95,7 +95,7 @@ class QwenTranscriber:
             windows.append((segment.start/RATE,(segment.start+len(segment.samples))/RATE))
             vad.pop()
 
-    def _consume_pcm_stream(self, read_fn, is_eof_fn, stderr_provider, return_code_fn,
+    def prepare_pcm_stream(self, read_fn, is_eof_fn, stderr_provider, return_code_fn,
                             timeout=18000, wait_on_empty_sec=0.1, label='tail', audio_path=None):
         import numpy as np
         import sherpa_onnx
@@ -144,32 +144,57 @@ class QwenTranscriber:
         match=re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)',stderr)
         if match: self._media_duration=int(match[1])*3600+int(match[2])*60+float(match[3])
         self.last_vad_windows=[(a,min(b,self._last_duration)) for a,b in self.last_vad_windows if a<self._last_duration]
-        chunks=plan_long_chunks(self.last_vad_windows,self._last_duration)
-        if not chunks: return '',[]
-        self._init()
+        return plan_long_chunks(self.last_vad_windows,self._last_duration)
+
+    def recognize_blocks(self, blocks, load_samples, *, checkpoint=None, timeout=18000):
+        """Decode immutable original blocks; leave global ordering/dedupe to caller."""
+        self.last_chunks=[]
+        self._last_speech_windows=[]
+        began=time.monotonic()
         try:
-            with open(audio_path,'rb') as audio:
-                for i,(start,end) in enumerate(chunks):
-                    if time.monotonic()-began>timeout: raise TimeoutError('Qwen lecture timeout')
-                    audio.seek(round(start*RATE)*4)
-                    count=round(end*RATE)-round(start*RATE)
-                    samples=np.frombuffer(audio.read(count*4),dtype=np.float32).copy()
-                    if len(samples)!=count: raise RuntimeError('Incomplete Qwen audio block')
-                    row=self._recognize(samples)
-                    row.update(start=start,end=end)
-                    self.last_chunks.append(row)
-                    # Speech coverage is actual VAD, NOT the padded chunk extent.
-                    for a,b in self.last_vad_windows:
-                        a,b=max(a,start),min(b,end)
-                        if b>a:
-                            self._last_speech_windows.append({'start_ms':round(a*1000),'end_ms':round(b*1000),
-                                'text':row['text'], 'chunk_id':i})
-                    print(f'[Qwen] Block {i+1}/{len(chunks)} completed.',flush=True)
-                    del samples;gc.collect()
+            if timeout <= 0:
+                raise TimeoutError('Qwen shard timeout')
+            self._init()
+            for i, block in enumerate(blocks):
+                if time.monotonic()-began>timeout:
+                    raise TimeoutError('Qwen shard timeout')
+                samples=load_samples(block)
+                expected=round(block['end']*RATE)-round(block['start']*RATE)
+                if len(samples)!=expected:
+                    raise RuntimeError('Incomplete Qwen audio block')
+                started=time.monotonic()
+                row=self._recognize(samples)
+                row.update(start=block['start'],end=block['end'],
+                           chunk_id=block['chunk_id'],decode_seconds=time.monotonic()-started)
+                self.last_chunks.append(row)
+                for a,b in self.last_vad_windows:
+                    a,b=max(a,row['start']),min(b,row['end'])
+                    if b>a:
+                        self._last_speech_windows.append({'start_ms':round(a*1000),'end_ms':round(b*1000),
+                            'text':row['text'],'chunk_id':row['chunk_id']})
+                if checkpoint:
+                    checkpoint(self.last_chunks)
+                print(f'[Qwen] Block {i+1}/{len(blocks)} completed.',flush=True)
+                del samples;gc.collect()
         finally:
-            self.release_model()  # leave RAM for OCR / the separate forced aligner
-        # Timed segments also feed summaries and cloud/official merges. Keep
-        # their body deduplicated while retaining raw chunks for alignment.
+            self.release_model()
+        return self.last_chunks
+
+    def _consume_pcm_stream(self, read_fn, is_eof_fn, stderr_provider, return_code_fn,
+                            timeout=18000, wait_on_empty_sec=0.1, label='tail', audio_path=None):
+        import numpy as np
+        began=time.monotonic()
+        chunks=self.prepare_pcm_stream(read_fn,is_eof_fn,stderr_provider,return_code_fn,
+            timeout=timeout,wait_on_empty_sec=wait_on_empty_sec,label=label,audio_path=audio_path)
+        if not chunks:
+            return '',[]
+        blocks=[{'chunk_id':i,'start':a,'end':b} for i,(a,b) in enumerate(chunks)]
+        with open(audio_path,'rb') as audio:
+            def load(block):
+                audio.seek(round(block['start']*RATE)*4)
+                count=round(block['end']*RATE)-round(block['start']*RATE)
+                return np.frombuffer(audio.read(count*4),dtype=np.float32).copy()
+            self.recognize_blocks(blocks,load,timeout=max(0,timeout-(time.monotonic()-began)))
         rows=deduplicated_chunk_rows(self.last_chunks)
         segments=[{'start_ms':round(r['start']*1000),'end_ms':round(r['end']*1000),'text':r['text']}
                   for r in rows]

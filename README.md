@@ -4,6 +4,7 @@
 > 当前为 `codex/qwen-production-pilot` 试运行分支，尚未合并 main。
 > 本地识别统一为 Qwen3-ASR-1.7B；完整课堂端到端验证尚未完成。
 > 运行约束见 [Qwen 运行说明](docs/qwen-only-runtime.md)；main 的线上定时任务不变。
+> 新增 [单堂课跨 Runner 隔离试验](docs/qwen-sharded-pilot.md)：默认两路，课程上限 5、批次活动 Runner 上限 15；尚未接入定时订阅。
 
 > [!IMPORTANT]
 > 本 Fork 对个人信息保护做了加固，并支持私密课次白名单、按课程分别发信和

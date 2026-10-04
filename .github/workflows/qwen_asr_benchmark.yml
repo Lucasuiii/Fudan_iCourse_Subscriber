@@ -2,6 +2,9 @@ name: Qwen ASR CPU Benchmark
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: icourse-data-${{ github.repository }}
+  cancel-in-progress: false
 jobs:
   benchmark:
     runs-on: ubuntu-latest
