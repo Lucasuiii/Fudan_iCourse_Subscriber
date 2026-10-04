@@ -148,8 +148,8 @@ def fetch_evidence(client, request):
                 if row['end_ms']>offset*1000 and row['start_ms']<stop*1000:
                     evidence['official_subtitles'].append({
                         'start':row['start_ms']/1000-offset,'end':row['end_ms']/1000-offset,
-                        'text':str(row['text'])[:100]})
-            evidence['official_subtitles']=evidence['official_subtitles'][:100]
+                        'text':str(row['text'])[:500]})
+            evidence['official_subtitles']=evidence['official_subtitles'][:600]
             if subtitles is None:
                 evidence['unavailable'].append('official_subtitles')
         except Exception:
@@ -400,7 +400,7 @@ def quality_review():
     """One review request, at most 120s cloud audio; keep variants, no DB writes."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from openai import OpenAI
-    from scripts.qwen_quality import review_quality,select_rescue_windows
+    from scripts.qwen_quality import review_quality,locate_suspects
     from src.ai.doubao_asr import rescue_intervals_pcm
     d=(workspace()/'result.enc').read_bytes()
     key=base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'],validate=True)
@@ -411,7 +411,10 @@ def quality_review():
                             'deepseek-v4-flash',report,evidence)
     report['review_suspects']=selected
     save_encrypted(report)
-    intervals=select_rescue_windows(report['full_chunks'],[x['id'] for x in selected],report['vad_windows'])
+    intervals,located,unresolved=locate_suspects(report['full_chunks'],selected,
+                                               evidence.get('official_subtitles',[]),report['vad_windows'])
+    report['localization']={'located':located,'unresolved':unresolved}
+    save_encrypted(report)
     raw=workspace()/'audio.raw'
     if intervals:
         subprocess.run(['ffmpeg','-v','error','-i',str(workspace()/'audio.wav'),
@@ -425,9 +428,9 @@ def quality_review():
         rescues,attempted,failed=[],0,False
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
                             'hotword_hints_enabled':True,
-                            'selection_limit':'Speech windows within suspect chunks; no exact word alignment. Originals retained.'}
+                            'selection_limit':'Unique text matched to official subtitle segment times, not word alignment. Unresolved locations are not uploaded. Originals retained.'}
     save_encrypted(report)
-    print(f"Quality check: suspects={len(selected)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)
+    print(f"Quality check: suspects={len(selected)}, located={len(located)}, unresolved={len(unresolved)}, cloud_audio={attempted:.1f}s, cloud_failed={failed}",flush=True)
 
 
 def clean() -> None:

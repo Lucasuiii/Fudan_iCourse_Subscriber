@@ -2,7 +2,7 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality,usable_ppt
+from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality,usable_ppt,locate_suspects
 
 
 class QualityTests(unittest.TestCase):
@@ -42,11 +42,52 @@ class QualityTests(unittest.TestCase):
         client.chat.completions.create.return_value=SimpleNamespace(choices=[SimpleNamespace(
             message=SimpleNamespace(content=json.dumps({'suspects':[
                 {'id':True,'reason':'bad'},{'id':99,'reason':'bad'},
-                {'id':0,'reason':'术语不通顺'},{'id':0,'reason':'duplicate'}]})))])
-        r={'full_chunks':[{'start':0,'end':120,'text':'原字幕'}]}
-        self.assertEqual(review_quality(client,'model',r,{}),[{'id':0,'reason':'术语不通顺'}])
-        self.assertEqual(r['full_chunks'][0]['text'],'原字幕')
+                {'id':0,'reason':'虚构引用','quote':'这个引用并不存在于字幕'},
+                {'id':0,'reason':'术语不通顺','quote':'这个水路误差需要分析'},
+                {'id':0,'reason':'duplicate'}]})))])
+        # Valid entry must be within the four-item response cap.
+        r={'full_chunks':[{'start':0,'end':120,'text':'这个水路误差需要分析'}]}
+        self.assertEqual(review_quality(client,'model',r,{}),[{'id':0,'reason':'术语不通顺','quote':'这个水路误差需要分析'}])
+        self.assertEqual(r['full_chunks'][0]['text'],'这个水路误差需要分析')
         client.chat.completions.create.assert_called_once()
+
+    def test_quote_anchor_selects_end_not_middle(self):
+        quote='我们讨论这个舍入误差的条件'
+        chunks=[{'start':0,'end':120,'text':'开始讲课。'+quote}]
+        suspects=[{'id':0,'quote':quote,'reason':'疑点'}]
+        refs=[{'start':100,'end':108,'text':quote}]
+        intervals,located,unresolved=locate_suspects(chunks,suspects,refs,[(99,110)])
+        self.assertEqual(len(located),1)
+        self.assertEqual(unresolved,[])
+        self.assertEqual(intervals[0]['start_ms'],97000)
+        self.assertEqual(intervals[0]['end_ms'],111000)
+
+    def test_missing_repeated_and_ambiguous_anchor_skip_upload(self):
+        quote='我们讨论这个舍入误差的条件'
+        chunk={'start':0,'end':120,'text':quote}
+        suspects=[{'id':0,'quote':quote}]
+        refs=[{'start':10,'end':18,'text':quote},{'start':90,'end':98,'text':quote}]
+        for chunks,subtitles,vad in (([chunk],[],[(0,120)]),
+                                    ([{**chunk,'text':quote+quote}],refs,[(0,120)]),
+                                    ([chunk],refs,[(0,120)]),
+                                    ([chunk],refs[:1],[])):
+            intervals,_,unresolved=locate_suspects(chunks,suspects,subtitles,vad)
+            self.assertEqual(intervals,[])
+            self.assertEqual(len(unresolved),1)
+
+    def test_mild_transcription_difference_can_anchor(self):
+        chunks=[{'start':0,'end':120,'text':'这里讨论这个水路误差怎么分析'}]
+        suspects=[{'id':0,'quote':chunks[0]['text']}]
+        refs=[{'start':30,'end':40,'text':'这里讨论这个舍入误差怎么分析'}]
+        intervals,_,_=locate_suspects(chunks,suspects,refs,[(30,40)])
+        self.assertEqual(len(intervals),1)
+
+    def test_budget_does_not_cut_out_suspect(self):
+        quote='这里讨论这个舍入误差怎么分析'
+        intervals,_,unresolved=locate_suspects([{'start':0,'end':120,'text':quote}],
+                         [{'id':0,'quote':quote}],[{'start':30,'end':40,'text':quote}],[(30,40)],budget=5)
+        self.assertEqual(intervals,[])
+        self.assertEqual(unresolved[0]['state'],'anchor_exceeds_budget_share')
 
 
 if __name__=='__main__':

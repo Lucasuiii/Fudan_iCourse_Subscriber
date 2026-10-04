@@ -3,6 +3,7 @@ import json
 import math
 import re
 import unicodedata
+from difflib import SequenceMatcher
 
 
 def normalize(text):
@@ -61,6 +62,72 @@ def usable_ppt(text, relative_start):
     return sum(marker in text for marker in markers)<3
 
 
+def locate_suspects(chunks, suspects, subtitles, vad_windows, *, budget=120):
+    """Conservative subtitle-segment anchors, NOT word-level alignment.
+
+    Require a unique quote in Qwen, strong textual agreement in timed official
+    subtitles, a clear margin over a different location, and VAD speech.
+    Uncertain anchors never fall back to the chunk midpoint.
+    """
+    located, unresolved = [], []
+    for item in suspects:
+        chunk=chunks[item['id']]
+        quote=normalize(item.get('quote',''))
+        if len(quote)<8 or normalize(chunk['text']).count(quote)!=1:
+            unresolved.append({**item,'state':'invalid_or_repeated_quote'})
+            continue
+        refs=[s for s in subtitles if isinstance(s.get('text'),str)
+              and isinstance(s.get('start'),(int,float)) and isinstance(s.get('end'),(int,float))
+              and math.isfinite(s['start']) and math.isfinite(s['end'])
+              and chunk['start']<=s['start']<s['end']<=chunk['end']]
+        refs.sort(key=lambda s:s['start'])
+        candidates=[]
+        for i in range(len(refs)):
+            for count in range(1,4):
+                block=refs[i:i+count]
+                if len(block)!=count or block[-1]['end']-block[0]['start']>50:
+                    continue
+                if any(b['start']-a['end']>3 for a,b in zip(block,block[1:])):
+                    continue
+                text=normalize(''.join(s['text'] for s in block))
+                if not text:
+                    continue
+                score=1.0 if quote in text else SequenceMatcher(None,quote,text,autojunk=False).ratio()
+                candidates.append((score,block[0]['start'],block[-1]['end']))
+        candidates.sort(reverse=True)
+        if not candidates or candidates[0][0]<0.78:
+            unresolved.append({**item,'state':'no_strong_subtitle_match'})
+            continue
+        score,start,end=candidates[0]
+        competitor=next((s for s,a,b in candidates[1:] if b<=start or a>=end),0)
+        if score-competitor<0.12:
+            unresolved.append({**item,'state':'ambiguous_subtitle_match'})
+            continue
+        if not any(a<end and start<b for a,b in vad_windows):
+            unresolved.append({**item,'state':'anchor_without_detected_speech'})
+            continue
+        located.append({**item,'start':start,'end':end,'match_score':score,
+                        'state':'official_subtitle_segment_anchor'})
+    share=min(60,max(0,budget)/len(located)) if located else 0
+    intervals=[]
+    accepted=[]
+    for item in located:
+        chunk=chunks[item['id']]
+        if item['end']-item['start']>share:
+            unresolved.append({**item,'state':'anchor_exceeds_budget_share'})
+            continue
+        padding=min(3,(share-(item['end']-item['start']))/2)
+        a=math.ceil(max(chunk['start'],item['start']-padding)*1000)
+        b=math.floor(min(chunk['end'],item['end']+padding)*1000)
+        if b<=a or any(a<x['end_ms'] and x['start_ms']<b for x in intervals):
+            unresolved.append({**item,'state':'overlapping_or_empty_anchor'})
+            continue
+        intervals.append({'chunk_id':item['id'],'start_ms':a,'end_ms':b,'text':'',
+                          'localization':'official_subtitle_segment_anchor'})
+        accepted.append(item)
+    return intervals,accepted,unresolved
+
+
 def review_quality(client, model, report, evidence):
     rows = [{'id': i, 'text': x['text'][:1800], 'start': x['start'], 'end': x['end']}
             for i,x in enumerate(report['full_chunks'])]
@@ -69,10 +136,15 @@ def review_quality(client, model, report, evidence):
         '不能假定它们正确，内容不同本身不足以判错。只指出有具体文字依据的同音术语误识别、'
         '缺失或不通顺的关键句、公式口述混乱和提示词复述。不要推断原话，不生成改写或更正。'
         'reason只引用异常原文并解释为何可疑，不得猜测任何候选替换词、标准公式或教师原意。'
-        '只输出JSON {"suspects":[{"id":现有整数id,"reason":"具体疑点"}]}，'
+        'quote必须逐字引用对应chunks.text中连续且唯一的一段原文，包含疑点和附近上下文，'
+        '长度8到100字符。不得纠正引用、拼接不连续文字、编造时间。'
+        '只输出JSON {"suspects":[{"id":现有整数id,"quote":"连续原文引用","reason":"具体疑点"}]}，'
         '按优先级最多选4段，没有可靠疑点则空列表。id只能来自chunks。'
     )
-    payload = json.dumps({'chunks': rows, 'evidence': evidence},ensure_ascii=False)
+    refs=evidence.get('official_subtitles',[])
+    indices=range(len(refs)) if len(refs)<=100 else sorted({round(i*(len(refs)-1)/99) for i in range(100)})
+    bounded_evidence={**evidence,'official_subtitles':[{**refs[i],'text':refs[i]['text'][:80]} for i in indices]}
+    payload = json.dumps({'chunks': rows, 'evidence': bounded_evidence},ensure_ascii=False)
     if len(payload)>30000:
         raise ValueError('Review exceeds bounded input')
     response = client.chat.completions.create(model=model,
@@ -84,6 +156,9 @@ def review_quality(client, model, report, evidence):
     for item in result.get('suspects',[])[:4]:
         if (isinstance(item,dict) and type(item.get('id')) is int
             and 0<=item['id']<len(rows) and isinstance(item.get('reason'),str)
-            and item['reason'].strip() and all(x['id']!=item['id'] for x in selected)):
-            selected.append({'id':item['id'],'reason':item['reason'][:300]})
+            and item['reason'].strip() and isinstance(item.get('quote'),str)
+            and 8<=len(item['quote'])<=100
+            and rows[item['id']]['text'].count(item['quote'])==1
+            and all(x['id']!=item['id'] for x in selected)):
+            selected.append({'id':item['id'],'quote':item['quote'],'reason':item['reason'][:300]})
     return selected
