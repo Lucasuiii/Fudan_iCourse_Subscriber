@@ -195,6 +195,8 @@ def fetch() -> None:
             request['offset'], request['duration'] = 0, 10800
             if request.get('selection'):
                 request['selection'].update(offset=0, duration=10800)
+        save_encrypted({'stage': 'playback_resolution', 'request': request,
+                        'selection': request.get('selection')})
         url = client.get_video_url(request["course_id"], request["sub_id"])
         if not url:
             raise RuntimeError("No playback available")
