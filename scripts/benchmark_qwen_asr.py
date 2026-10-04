@@ -47,10 +47,7 @@ def review_hotwords(report, evidence):
 
 
 def latest_request(detail, request, today=None):
-    """Latest listed non-future lecture, NOT gated on playback_status.
-
-    If its playback cannot be resolved, fail rather than silently test older audio.
-    """
+    """Latest listed non-future lecture, NOT gated on playback_status."""
     today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
     candidates = []
     for lecture in detail.get('lectures', []):
@@ -71,6 +68,27 @@ def latest_request(detail, request, today=None):
             'duration': 1800, 'selection': {'course_id': request.get('course_id'), 'course_title': detail.get('title'),
              'sub_title': lecture.get('sub_title'), 'date': lecture['date'],
              'sub_id': str(lecture['sub_id']), 'offset': 0, 'duration': 1800}}
+
+
+def resolve_latest_playback(client, request, today=None):
+    """Find the newest real recording using the existing playback fallbacks."""
+    detail = client.get_course_detail(request['course_id'])
+    remaining = list(detail.get('lectures', []))
+    skipped = []
+    while remaining:
+        try:
+            selected = latest_request({**detail, 'lectures': remaining}, request, today)
+        except ValueError:
+            break
+        selected['selection']['skipped_unavailable'] = list(skipped)
+        save_encrypted({'stage': 'playback_resolution', 'request': selected,
+                        'selection': selected['selection']})
+        url = client.get_video_url(selected['course_id'], selected['sub_id'])
+        if url:
+            return selected, url
+        skipped.append({k: selected['selection'][k] for k in ('date', 'sub_title', 'sub_id')})
+        remaining = [lecture for lecture in remaining if str(lecture.get('sub_id')) != selected['sub_id']]
+    raise RuntimeError('No playback available in any non-future lecture')
 
 
 def workspace() -> Path:
@@ -189,15 +207,16 @@ def fetch() -> None:
     print("Authentication complete; resolving selected playback", flush=True)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
         client = ICourseClient(vpn)
+        url = None
         if os.environ.get('LATEST_LECTURE') == 'true':
-            request = latest_request(client.get_course_detail(request['course_id']), request)
+            request, url = resolve_latest_playback(client, request)
         if os.environ.get('FULL_LECTURE') == 'true':
             request['offset'], request['duration'] = 0, 10800
             if request.get('selection'):
                 request['selection'].update(offset=0, duration=10800)
         save_encrypted({'stage': 'playback_resolution', 'request': request,
                         'selection': request.get('selection')})
-        url = client.get_video_url(request["course_id"], request["sub_id"])
+        url = url or client.get_video_url(request["course_id"], request["sub_id"])
         if not url:
             raise RuntimeError("No playback available")
         media, headers = client.get_stream_params(url)

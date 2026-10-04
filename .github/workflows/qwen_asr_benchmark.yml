@@ -173,7 +173,7 @@ jobs:
         type: boolean
         default: false
       latest_lecture:
-        description: Select the private course latest non-future lecture for an isolated test
+        description: Select the private course latest playable non-future recording for an isolated test
         type: boolean
         default: false
       generate_summary:

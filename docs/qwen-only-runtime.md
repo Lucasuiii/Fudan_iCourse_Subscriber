@@ -32,5 +32,6 @@ Actions明确安装CPU版 `torch==2.11.0` 与 `qwen-asr==0.0.6 --no-deps`，其�
 这验证真实识别入口与隔离复核/摘要，不等同于完整 `LectureRunner`、邮件和数据库发布验证。
 `parallel_pair=true` 可让两个独立 Runner 并行，选课来自专用
 `QWEN_ASR_TEST_REQUESTS` Secret 的两个条目，日志和产物名称只显示序号。
-该模式要求 `latest_lecture=true`，每门只选最新非未来课次；若无播放地址则报错，
-不会悄悄换一堂旧课。正式 `COURSE_IDS` 和原单课测试 Secret 不变。
+该模式要求 `latest_lecture=true`，按日期逐次解析既有播放回退链，选最新可播放的非未来录播；
+不依赖 `has_playback` 标记，被跳过的无地址课次及实际选课日期保留在加密产物中。
+所有非未来课次都无地址才报错。正式 `COURSE_IDS` 和原单课测试 Secret 不变。

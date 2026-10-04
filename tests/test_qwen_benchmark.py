@@ -9,6 +9,25 @@ from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_latest_recording_skips_empty_schedule_and_keeps_review_gate_fallback(self):
+        from scripts.benchmark_qwen_asr import resolve_latest_playback
+        client = Mock()
+        client.get_course_detail.return_value = {'title': '高等代数Ⅰ', 'lectures': [
+            {'date': '2026-09-30', 'sub_id': '1', 'sub_title': '第1-2节', 'has_playback': False},
+            {'date': '2026-10-01', 'sub_id': '2', 'sub_title': '第1-2节', 'has_playback': False},
+            {'date': '2026-10-06', 'sub_id': '3', 'sub_title': '第1-2节', 'has_playback': True}]}
+        client.get_video_url.side_effect = [None, 'private playback']
+        with patch('scripts.benchmark_qwen_asr.save_encrypted'):
+            request, url = resolve_latest_playback(client, {'course_id': '38404'}, '2026-10-04')
+        self.assertEqual(request['sub_id'], '1')
+        self.assertEqual(url, 'private playback')
+        self.assertEqual(request['selection']['skipped_unavailable'][0]['sub_id'], '2')
+        self.assertEqual(client.get_video_url.call_args_list, [
+            unittest.mock.call('38404', '2'), unittest.mock.call('38404', '1')])
+        client.get_video_url.side_effect = [None, None]
+        with patch('scripts.benchmark_qwen_asr.save_encrypted'), self.assertRaises(RuntimeError):
+            resolve_latest_playback(client, {'course_id': '38404'}, '2026-10-04')
+
     def test_final_failure_is_encrypted_and_preserves_prior_checkpoint(self):
         import base64
         import tempfile
