@@ -143,7 +143,7 @@ def save_encrypted(report: dict) -> None:
 
 
 def infer() -> None:
-    if os.environ.get("FULL_LECTURE") == "true":
+    if os.environ.get("FULL_LECTURE") == "true" or os.environ.get("LONG_CHUNK_SAMPLE") == "true":
         infer_lecture()
         return
     import soundfile as sf
@@ -236,7 +236,7 @@ def infer_lecture() -> None:
     import sherpa_onnx
     from huggingface_hub import snapshot_download
     from qwen_asr import Qwen3ASRModel
-    from scripts.qwen_segmentation import plan_chunks, join_chunk_text
+    from scripts.qwen_segmentation import plan_long_chunks, join_chunk_text
 
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
@@ -244,6 +244,9 @@ def infer_lecture() -> None:
     info = sf.info(path)
     if info.samplerate != 16000 or info.channels != 1 or not 0 < info.duration <= 10800.1:
         raise ValueError("Invalid full lecture audio")
+    sample_only = os.environ.get("LONG_CHUNK_SAMPLE") == "true"
+    if sample_only and not 590 <= info.duration <= 600.1:
+        raise ValueError("Long-chunk smoke test must use the authorized 10-minute slice")
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(Path(os.environ["RUNNER_TEMP"]) / "silero_vad.onnx")
     config.silero_vad.threshold = 0.5
@@ -268,13 +271,15 @@ def infer_lecture() -> None:
         drain()
     vad.flush()
     drain()
-    chunks = plan_chunks(windows, info.duration)
+    chunks = plan_long_chunks(windows, info.duration)
     # Compute union duration, not summed overlapping windows.
     union_end, included = 0.0, 0.0
     for start, end in chunks:
         included += max(0, end - max(start, union_end))
         union_end = max(union_end, end)
-    report = {"model": MODEL, "revision": REVISION, "source": "authorized_full_lecture",
+    report = {"model": MODEL, "revision": REVISION,
+              "source": "authorized_long_chunk_slice" if sample_only else "authorized_full_lecture",
+              "chunk_target_seconds": 120, "max_new_tokens": 2048,
               "audio_seconds": info.duration, "vad_seconds": time.perf_counter() - began,
               "acquisition_limit_reached": info.duration >= 10800,
               "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
@@ -294,20 +299,20 @@ def infer_lecture() -> None:
                                   allow_patterns=["*.json", "*.safetensors", "*.txt"])
     model = Qwen3ASRModel.from_pretrained(model_path, dtype=torch.float32,
         device_map="cpu", attn_implementation="eager", max_inference_batch_size=1,
-        max_new_tokens=512)
+        max_new_tokens=2048)
     report["load_including_download_seconds"] = time.perf_counter() - began
     with sf.SoundFile(path) as source:
         for index, (start, end) in enumerate(chunks):
             source.seek(round(start * 16000))
             samples = source.read(round(end * 16000) - round(start * 16000), dtype="float32")
             began = time.perf_counter()
-            for attempt in range(2):
+            for attempt in range(1 if sample_only else 2):
                 try:
                     with torch.inference_mode():
                         result = model.transcribe(audio=(samples, 16000), context=TERMS, language="Chinese")[0]
                     break
                 except Exception:
-                    if attempt == 1:
+                    if sample_only or attempt == 1:
                         report["failed_chunk"] = index
                         save_encrypted(report)
                         raise
@@ -316,6 +321,9 @@ def infer_lecture() -> None:
                    "seconds": time.perf_counter() - began,
                    "attempts": attempt + 1,
                    "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2}
+            row["text_token_count"] = len(model.processor.tokenizer.encode(result.text, add_special_tokens=False))
+            row["possible_truncation"] = row["text_token_count"] >= 2000
+            row["context_echo"] = "Hilbert矩阵、逆矩阵、条件数、delta、范数" in result.text
             # Linux current RSS distinguishes retained allocations from the peak.
             row["rss_gib"] = int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024**3
             report["full_chunks"].append(row)

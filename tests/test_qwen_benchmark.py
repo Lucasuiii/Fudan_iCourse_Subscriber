@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session
-from scripts.qwen_segmentation import plan_chunks, join_chunk_text
+from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
 
 
 class QwenBenchmarkTests(unittest.TestCase):
@@ -47,6 +47,26 @@ class QwenBenchmarkTests(unittest.TestCase):
         rows = [{"start": 0, "end": 30, "text": "矩阵"},
                 {"start": 28, "end": 60, "text": "矩阵很重要"}]
         self.assertEqual(join_chunk_text(rows), "矩阵\n矩阵很重要")
+
+    def test_long_chunks_keep_short_pauses(self):
+        windows = [(i, i+3) for i in range(0, 600, 5)]
+        chunks = plan_long_chunks(windows, 600)
+        self.assertLessEqual(len(chunks), 7)
+        self.assertTrue(all(b-a <= 122 for a,b in chunks))
+        self.assertEqual(chunks[0][0], 0)
+        self.assertTrue(all(a[1] >= b[0] for a,b in zip(chunks,chunks[1:])))
+
+    def test_long_chunks_skip_long_silence_not_quiet_speech(self):
+        self.assertEqual(plan_long_chunks([], 600), [])
+        self.assertEqual(plan_long_chunks([(10,20),(50,55)], 600), [(9,21),(49,56)])
+        self.assertEqual(plan_long_chunks([(10,20),(25,35)], 600), [(9,36)])
+
+    def test_long_chunks_continuous_speech_and_invalid_input(self):
+        chunks = plan_long_chunks([(0,600)], 600)
+        self.assertEqual(len(chunks),5)
+        self.assertEqual(chunks[-1][1],600)
+        with self.assertRaises(ValueError):
+            plan_long_chunks([(0,601)],600)
 
     def test_auth_phase_never_exposes_query_or_unknown_path(self):
         self.assertEqual(auth_phase('https://example.org/idp/authn/authExecute?token=private'), 'credential_exchange')
