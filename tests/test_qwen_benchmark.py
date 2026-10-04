@@ -1,12 +1,27 @@
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock,patch
 
-from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context
+from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context,record_summary_response
 from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_incomplete_summary_preserves_diagnostic_not_success(self):
+        report={}
+        choice=SimpleNamespace(finish_reason='length',message=SimpleNamespace(content='未完成正文',reasoning_content='思考'))
+        response=SimpleNamespace(choices=[choice],usage=None)
+        self.assertFalse(record_summary_response(report,response,3))
+        self.assertEqual(report['summary_attempts'][0]['markdown'],'未完成正文')
+        self.assertEqual(report['summary_attempts'][0]['finish_reason'],'length')
+        self.assertNotIn('test_summary',report)
+        choice.finish_reason='stop'
+        self.assertTrue(record_summary_response(report,response,4))
+        self.assertFalse(report['test_summary']['email_sent'])
+        choice.message.content=' '
+        self.assertFalse(record_summary_response({},response,4))
+        self.assertFalse(record_summary_response({},SimpleNamespace(choices=[],usage=None),1))
     def test_latest_selection_includes_reviewing_but_not_future(self):
         detail={'title':'数值算法','lectures':[
             {'date':'2026-09-22','sub_id':'1','sub_title':'2026-09-22第1-2节','has_playback':True},

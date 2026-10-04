@@ -1,0 +1,52 @@
+name: Qwen Test Summary Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Run containing the encrypted completed ASR/quality result'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate source ID
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: '[[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install summary dependencies only
+        run: python -m pip install cryptography openai requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: qwen-asr-encrypted-result
+          path: ${{ runner.temp }}/qwen-benchmark
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Generate summary from existing encrypted result
+        env:
+          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python -m scripts.benchmark_qwen_asr summary
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qwen-asr-encrypted-result
+          path: ${{ runner.temp }}/qwen-benchmark/result.enc
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Clean private result
+        if: always()
+        run: python -m scripts.benchmark_qwen_asr clean

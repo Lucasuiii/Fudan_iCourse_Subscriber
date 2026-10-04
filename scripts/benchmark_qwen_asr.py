@@ -551,6 +551,22 @@ def summary_material(report, evidence):
     return material
 
 
+def record_summary_response(report, response, elapsed):
+    """Save partial output/finish metadata BEFORE validating completeness."""
+    choice = response.choices[0] if response.choices else None
+    content = choice.message.content if choice else None
+    diagnostic = {'finish_reason':choice.finish_reason if choice else None,
+                  'markdown':content or '', 'seconds':elapsed,
+                  'usage':response.usage.model_dump() if response.usage else None,
+                  'reasoning_chars':len(getattr(choice.message,'reasoning_content',None) or '') if choice else 0}
+    report.setdefault('summary_attempts', []).append(diagnostic)
+    complete = bool(choice and choice.finish_reason == 'stop' and content and content.strip())
+    if complete:
+        report['test_summary'] = {**diagnostic, 'model':'deepseek-v4-flash',
+                                  'production_written':False, 'email_sent':False}
+    return complete
+
+
 def generate_summary():
     """One explicit summary request; encrypted output only, no production pipeline."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -559,24 +575,30 @@ def generate_summary():
     data = (workspace() / 'result.enc').read_bytes()
     key = base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'], validate=True)
     report = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
-    evidence = json.loads((workspace() / 'evidence.json').read_text())
+    evidence_path = workspace() / 'evidence.json'
+    evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else report.get('reference_evidence', {})
     material = summary_material(report, evidence)
     selection = report.get('selection') or {}
     client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
                     max_retries=0, timeout=240)
     began = time.perf_counter()
-    response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
-        max_tokens=12000, messages=[{'role':'system','content':load_system_prompt()},
+    try:
+        response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
+        extra_body={'thinking':{'type':'disabled'}},
+        max_tokens=16000, messages=[{'role':'system','content':load_system_prompt()},
         {'role':'user','content':f"课程：{selection.get('course_title','数值算法与案例分析')}\n"
                                f"课次：{selection.get('sub_title','')}\n<course_material>\n"
                                + material + '\n</course_material>'}])
-    if not response.choices or response.choices[0].finish_reason != 'stop' or not response.choices[0].message.content:
-        raise ValueError('Incomplete summary response')
-    report['test_summary'] = {'markdown':response.choices[0].message.content,
-                             'model':'deepseek-v4-flash', 'seconds':time.perf_counter()-began,
-                             'usage':response.usage.model_dump() if response.usage else None,
-                             'production_written':False, 'email_sent':False}
+    except Exception as error:
+        report.setdefault('summary_attempts', []).append({'error_type':type(error).__name__,
+            'seconds':time.perf_counter()-began, 'private_error':str(error)[-2000:]})
+        save_encrypted(report)
+        raise
+    complete = record_summary_response(report, response, time.perf_counter()-began)
     save_encrypted(report)
+    if not complete:
+        print('Summary incomplete; encrypted partial output and finish metadata saved', flush=True)
+        raise ValueError('Incomplete summary response')
     print('Isolated summary completed; text encrypted, no database or email writes', flush=True)
 
 
