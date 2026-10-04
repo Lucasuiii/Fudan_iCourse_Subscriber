@@ -2,10 +2,40 @@ import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality,usable_ppt,locate_suspects
+from scripts.qwen_quality import context_echo,select_rescue_windows,review_quality,usable_ppt,locate_suspects,low_information,bounded_retry
 
 
 class QualityTests(unittest.TestCase):
+    def test_only_fillers_suppressed(self):
+        for text in ('', ' 。 ', '嗯。', '啊！', '呵呵。', '嗯，啊，哎'):
+            self.assertTrue(low_information(text))
+        for text in ('矩阵', '我们。', '零', 'A', '嗯，这个矩阵', '啊乘上B'):
+            self.assertFalse(low_information(text))
+
+    def test_retry_deadline_and_restore(self):
+        class Backend:
+            def generate(self, **kwargs):
+                return kwargs
+        backend = Backend()
+        model = SimpleNamespace(model=backend, max_new_tokens=2048)
+        now = [10.0]
+        with bounded_retry(model, list, clock=lambda: now[0]) as state:
+            self.assertEqual(model.max_new_tokens, 256)
+            old = lambda *a, **kw: False
+            criteria = backend.generate(stopping_criteria=[old])['stopping_criteria']
+            self.assertIs(criteria[0], old)
+            self.assertFalse(criteria[1](None, None))
+            now[0] = 70
+            self.assertTrue(criteria[1](None, None))
+            self.assertTrue(state['timed_out'])
+        self.assertEqual(model.max_new_tokens, 2048)
+        self.assertNotIn('generate', backend.__dict__)
+        with self.assertRaises(RuntimeError):
+            with bounded_retry(model, list):
+                raise RuntimeError('test')
+        self.assertEqual(model.max_new_tokens, 2048)
+        self.assertNotIn('generate', backend.__dict__)
+
     def test_echo_is_not_single_term(self):
         context='数值算法。术语：良态问题、病态问题、扰动、Hilbert矩阵、逆矩阵、条件数、delta、范数。'
         self.assertTrue(context_echo(context,context))

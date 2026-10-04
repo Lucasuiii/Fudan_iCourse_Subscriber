@@ -3,6 +3,8 @@ import json
 import math
 import re
 import unicodedata
+import time
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 
 
@@ -17,6 +19,46 @@ def context_echo(text, context):
     return bool(value and (value == reference or
                 (len(terms) >= 5 and sum(t in value for t in terms) >= 5
                  and len(value) <= len(reference) * 1.5)))
+
+
+def low_information(text):
+    """Only empty/filler-only output, never arbitrary short meaningful speech."""
+    value = normalize(text)
+    return not value or all(c in '嗯呃啊哦噢哎唉呵哈哼' for c in value)
+
+
+@contextmanager
+def bounded_retry(model, criteria_list, *, seconds=60, tokens=256, clock=time.perf_counter):
+    """Cooperative decoding deadline, checked after each generation step.
+
+    Not a process-kill timeout: a single native forward pass may overrun it.
+    Preserve the original generation method and token budget even on errors.
+    """
+    deadline = clock() + seconds
+    state = {'timed_out': False}
+    original = model.model.generate
+    original_tokens = model.max_new_tokens
+    had_override = 'generate' in model.model.__dict__
+
+    def stop(input_ids, scores, **kwargs):
+        state['timed_out'] = state['timed_out'] or clock() >= deadline
+        return state['timed_out']
+
+    def generate(*args, **kwargs):
+        existing = list(kwargs.pop('stopping_criteria', None) or [])
+        kwargs['stopping_criteria'] = criteria_list(existing + [stop])
+        return original(*args, **kwargs)
+
+    model.model.generate = generate
+    model.max_new_tokens = tokens
+    try:
+        yield state
+    finally:
+        model.max_new_tokens = original_tokens
+        if had_override:
+            model.model.generate = original
+        else:
+            del model.model.generate
 
 
 def select_rescue_windows(chunks, selected_ids, vad_windows, *, budget=120):

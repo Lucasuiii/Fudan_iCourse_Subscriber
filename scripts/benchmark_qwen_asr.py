@@ -294,7 +294,8 @@ def infer_lecture() -> None:
     from huggingface_hub import snapshot_download
     from qwen_asr import Qwen3ASRModel
     from scripts.qwen_segmentation import plan_long_chunks, join_chunk_text
-    from scripts.qwen_quality import context_echo
+    from scripts.qwen_quality import context_echo, low_information, bounded_retry
+    from transformers import StoppingCriteriaList
 
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
@@ -381,20 +382,31 @@ def infer_lecture() -> None:
                    "seconds": time.perf_counter() - began,
                    "attempts": attempt + 1,
                    "peak_rss_gib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2}
-            row["text_token_count"] = len(model.processor.tokenizer.encode(result.text, add_special_tokens=False))
-            row["possible_truncation"] = row["text_token_count"] >= 2000
+            row['initial_seconds'] = row['seconds']
+            token_limit = 2048
             row["context_echo"] = context_echo(result.text, TERMS)
             if os.environ.get("QUALITY_SAMPLE") == "true" and row['context_echo']:
                 row['original_text'] = row['text']
                 retry_start=time.perf_counter()
-                with torch.inference_mode():
+                with bounded_retry(model, StoppingCriteriaList) as retry, torch.inference_mode():
                     result=model.transcribe(audio=(samples,16000),context='',language='Chinese')[0]
+                token_limit = 256
                 row['text']=result.text
                 row['unhinted_retry_seconds']=time.perf_counter()-retry_start
+                row['retry_timed_out'] = retry['timed_out'] or row['unhinted_retry_seconds'] >= 60
                 row['context_echo']=context_echo(result.text,TERMS)
                 row['quality_state']='unresolved_context_echo' if row['context_echo'] else 'unhinted_retry'
-                if row['context_echo']:
-                    row['text']=''  # Do not promote a known prompt echo into the transcript.
+            row['text_token_count'] = len(model.processor.tokenizer.encode(result.text, add_special_tokens=False))
+            row['possible_truncation'] = row['text_token_count'] >= token_limit - 8
+            row['low_information'] = low_information(row['text'])
+            # Keep rejected observations encrypted, but exclude them from review/summary.
+            if row.get('retry_timed_out') or row['context_echo'] or row['low_information'] or (token_limit == 256 and row['possible_truncation']):
+                row['rejected_text'] = row['text']
+                row['quality_state'] = ('retry_timeout' if row.get('retry_timed_out') else
+                                        'unresolved_context_echo' if row['context_echo'] else
+                                        'low_information' if row['low_information'] else 'retry_token_limit')
+                row['text'] = ''
+            row['seconds'] = time.perf_counter() - began
             # Linux current RSS distinguishes retained allocations from the peak.
             row["rss_gib"] = int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024**3
             report["full_chunks"].append(row)
