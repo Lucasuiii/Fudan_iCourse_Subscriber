@@ -173,6 +173,20 @@ def configure_auth_session(session, events):
     session.request = request
 
 
+def failed_media_probe(client, media):
+    """Bounded private diagnostic; close even when a server ignores Range."""
+    try:
+        with client.vpn.session.get(media, headers={'Range': 'bytes=0-4095'},
+                                    stream=True, timeout=30) as response:
+            first = next(response.iter_content(chunk_size=4096), b'')[:4096]
+            return {'status': response.status_code,
+                    'content_type': response.headers.get('Content-Type', ''),
+                    'private_final_url': response.url,
+                    'private_prefix_b64': base64.b64encode(first).decode()}
+    except Exception as error:
+        return {'error_type': type(error).__name__, 'private_error': str(error)[-2000:]}
+
+
 def fetch() -> None:
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
@@ -231,6 +245,8 @@ def fetch() -> None:
            timeout=1200 if full or request['duration']>600 else 420)
         if process.returncode:
             save_encrypted({"stage": "audio_acquisition", "returncode": process.returncode,
+                            "selection": request.get('selection'),
+                            "media_probe": failed_media_probe(client, media),
                             "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
             raise RuntimeError("Audio acquisition failed; encrypted diagnostic saved")
     print("Authorized slice acquisition completed; no audio artifact uploaded", flush=True)

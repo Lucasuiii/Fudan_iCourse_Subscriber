@@ -9,6 +9,22 @@ from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_failed_media_probe_is_bounded_and_closes_response(self):
+        import base64
+        from unittest.mock import MagicMock
+        from scripts.benchmark_qwen_asr import failed_media_probe
+        client = MagicMock()
+        response = client.vpn.session.get.return_value.__enter__.return_value
+        response.status_code = 200
+        response.headers = {'Content-Type': 'text/html'}
+        response.url = 'private url'
+        response.iter_content.return_value = iter([b'x' * 9000, b'unread'])
+        result = failed_media_probe(client, 'private url')
+        self.assertEqual(len(base64.b64decode(result['private_prefix_b64'])), 4096)
+        client.vpn.session.get.return_value.__exit__.assert_called_once()
+        client.vpn.session.get.assert_called_once_with('private url',
+            headers={'Range': 'bytes=0-4095'}, stream=True, timeout=30)
+
     def test_latest_recording_skips_empty_schedule_and_keeps_review_gate_fallback(self):
         from scripts.benchmark_qwen_asr import resolve_latest_playback
         client = Mock()
