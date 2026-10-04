@@ -7,6 +7,10 @@ on:
         description: 'Run containing the encrypted completed ASR/quality result'
         required: true
         type: string
+      automatic_terms:
+        description: 'Extract evidence-bounded keywords in the same summary request'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,6 +43,7 @@ jobs:
         env:
           QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
         run: python -m scripts.benchmark_qwen_asr summary
       - uses: actions/upload-artifact@v4
         if: always()

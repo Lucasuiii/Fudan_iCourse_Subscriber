@@ -41,6 +41,7 @@ threads pick up refreshed cookies through the shared ``ICourseClient``.
 from __future__ import annotations
 
 import time
+import os
 from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
@@ -90,6 +91,9 @@ class LectureRunner:
         self._cloud_windows = set()
         self._cloud_failed = False
         self._asr_audio_path = None
+        self._automatic_glossary = None
+        self._historical_terms = []
+        self._cloud_term_sources = []
 
     # ── Public entry point ──────────────────────────────────────────────
 
@@ -102,6 +106,12 @@ class LectureRunner:
         lecture in the batch.
         """
         sub_id = str(lecture["sub_id"])
+        if os.environ.get('AUTO_COURSE_TERMS','').lower() == 'true':
+            from src.ai.automatic_glossary import AutomaticGlossary
+            from src.ai.course_glossary import course_terms
+            self._automatic_glossary = AutomaticGlossary(self._db,course_id)
+            automatic = self._automatic_glossary.terms(exclude_sub_id=sub_id)
+            self._historical_terms = list(dict.fromkeys(automatic+course_terms(course_title)))[:30]
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
@@ -453,16 +463,19 @@ class LectureRunner:
                 or self._transcript_source not in ("local_asr", "hybrid_asr")
                 or len(transcript.strip()) < 200):
             return transcript, segments
+        options = {'terms':self._historical_terms} if self._automatic_glossary else {}
         suspects = self._summarizer.find_unclear_windows(
             self._transcriber.last_speech_windows, ppt_pages, self._cloud_windows,
-            course_title=course_title,
+            course_title=course_title, **options,
         )
         if not suspects:
             return transcript, segments
         rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
             self._asr_audio_path, config.DOUBAO_ASR_API_KEY, suspects,
             max_seconds=remaining, max_clips=clips_left,
+            **({'hotwords':self._historical_terms} if self._automatic_glossary else {}),
         )
+        self._cloud_term_sources.extend(s['text'] for _,result in rescues for s in result)
         self._cloud_seconds += attempted
         self._cloud_failed = failed
         merged = merge_rescued_segments(segments or [], rescues)
@@ -488,13 +501,23 @@ class LectureRunner:
                 f"{time.strftime('%H:%M:%S')}"
                 f" — mode={mode}, prompt={len(prompt_text)} chars"
             )
-            summary, model_used = self._summarizer.summarize(
-                course_title, prompt_text,
-            )
+            keywords = []
+            if self._automatic_glossary:
+                sources={'asr':[transcript], 'ppt':[p['text'] for p in kept_pages if p.get('text')],
+                         'cloud':self._cloud_term_sources}
+                summary, model_used, keywords = self._summarizer.summarize_with_keywords(
+                    course_title,prompt_text,sources,self._historical_terms)
+            else:
+                summary, model_used = self._summarizer.summarize(course_title, prompt_text)
             self._reporter.info(
                 f"    [OK] Summary by {model_used}: {len(summary)} chars"
             )
             self._db.update_summary(sub_id, summary, model_used)
+            if self._automatic_glossary:
+                try:
+                    self._automatic_glossary.save(sub_id,keywords)
+                except Exception as error:
+                    self._reporter.info(f'    [WARN] Keyword metadata not saved: {type(error).__name__}')
             return summary
         except Exception as e:
             self._reporter.info(

@@ -579,21 +579,43 @@ def generate_summary():
     evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else report.get('reference_evidence', {})
     material = summary_material(report, evidence)
     selection = report.get('selection') or {}
+    automatic = os.environ.get('AUTO_COURSE_TERMS') == 'true'
+    system = load_system_prompt()
+    user = f"课程：{selection.get('course_title','数值算法与案例分析')}\n课次：{selection.get('sub_title','')}\n<course_material>\n" + material + '\n</course_material>'
+    sources = {}
+    if automatic:
+        from src.ai.automatic_glossary import INSTRUCTION, validated_keywords
+        sources = {'asr':[report['transcript']],
+                   'ppt':[p['text'] for p in evidence.get('ppt',[]) if p.get('text')],
+                   'cloud':[c['cloud_text'] for c in report.get('rescue_comparisons',[]) if c.get('cloud_text')]}
+        system += '\n\n' + INSTRUCTION
+        user = json.dumps({'course':selection.get('course_title'),'material':material,
+                           'evidence_sources':sources},ensure_ascii=False)
     client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
                     max_retries=0, timeout=600)
     began = time.perf_counter()
     try:
         response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
         extra_body={'thinking':{'type':'enabled'}}, reasoning_effort='high',
-        max_tokens=64000, messages=[{'role':'system','content':load_system_prompt()},
-        {'role':'user','content':f"课程：{selection.get('course_title','数值算法与案例分析')}\n"
-                               f"课次：{selection.get('sub_title','')}\n<course_material>\n"
-                               + material + '\n</course_material>'}])
+        max_tokens=64000, messages=[{'role':'system','content':system},{'role':'user','content':user}],
+        **({'response_format':{'type':'json_object'}} if automatic else {}))
     except Exception as error:
         report.setdefault('summary_attempts', []).append({'error_type':type(error).__name__,
             'seconds':time.perf_counter()-began, 'private_error':str(error)[-2000:]})
         save_encrypted(report)
         raise
+    if automatic and response.choices:
+        report['keyword_response'] = response.choices[0].message.content
+        report['keyword_response_diagnostic'] = {
+            'finish_reason':response.choices[0].finish_reason,
+            'seconds':time.perf_counter()-began,
+            'usage':response.usage.model_dump() if response.usage else None}
+        save_encrypted(report)
+        data=json.loads(response.choices[0].message.content)
+        if not isinstance(data,dict) or not isinstance(data.get('summary'),str):
+            raise ValueError('Invalid summary/keyword envelope')
+        response.choices[0].message.content = data['summary']
+        report['automatic_keywords'] = validated_keywords(data.get('keywords',[]),sources,data['summary'])
     complete = record_summary_response(report, response, time.perf_counter()-began)
     report['summary_attempts'][-1].update(thinking='enabled', reasoning_effort='high', max_tokens=64000)
     if complete:

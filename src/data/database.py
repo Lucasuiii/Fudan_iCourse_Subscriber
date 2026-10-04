@@ -81,6 +81,12 @@ class Database:
             ).fetchone()
         return row["value"] if row else None
 
+    def read_meta_prefix(self, prefix: str) -> list[str]:
+        with self._lock:
+            rows=self.conn.execute('SELECT value FROM meta WHERE substr(key,1,?)=? ORDER BY key',
+                                   (len(prefix),prefix)).fetchall()
+        return [row['value'] for row in rows]
+
     def upsert_course(self, course_id: str, title: str, teacher: str):
         with self._lock, self.conn:
             self.conn.execute(

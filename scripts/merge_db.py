@@ -9,6 +9,7 @@ lecture tombstone wins over stale transcript, summary, and PPT data.
 import os
 import sqlite3
 import sys
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -190,6 +191,22 @@ def merge(local_path: str, remote_path: str):
                       AND l.deleted_at IS NOT NULL
                 )
             """)
+
+            # Automatic glossary is encrypted metadata, per lecture to avoid
+            # concurrent courses overwriting each other's vocabulary.
+            if conn.execute("SELECT 1 FROM local.sqlite_master WHERE type='table' AND name='meta'").fetchone():
+                for key,value in conn.execute("SELECT key,value FROM local.meta WHERE key GLOB 'auto_glossary:*'").fetchall():
+                    try:
+                        item=json.loads(value)
+                        stamp=item['updated_at']
+                        if not isinstance(stamp,str) or not stamp:
+                            continue
+                        old=conn.execute('SELECT value FROM main.meta WHERE key=?',(key,)).fetchone()
+                        previous=json.loads(old[0]).get('updated_at','') if old else ''
+                        if stamp>previous:
+                            conn.execute('INSERT OR REPLACE INTO main.meta(key,value) VALUES (?,?)',(key,value))
+                    except (ValueError,TypeError,KeyError,AttributeError):
+                        continue
 
             # 6) all_courses (catalog): upsert local rows into remote.  We take
             #    the side with the newer ``last_seen_at`` so a stale local crawl
