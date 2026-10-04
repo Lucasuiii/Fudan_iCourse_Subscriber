@@ -20,7 +20,6 @@ jobs:
       REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
       SAMPLE_MINUTES: ${{ inputs.sample_minutes }}
       RUNTIME_SAMPLE: ${{ inputs.runtime_sample }}
-      SILERO_VAD_PATH: ${{ runner.temp }}/silero_vad.onnx
       LATEST_LECTURE: ${{ inputs.latest_lecture }}
       GENERATE_SUMMARY: ${{ inputs.generate_summary }}
     steps:
@@ -88,6 +87,7 @@ jobs:
     - name: Run Qwen 1.7B on CPU and encrypt the comparison
       if: ${{ inputs.reuse_run_id == '' }}
       env:
+        SILERO_VAD_PATH: ${{ runner.temp }}/silero_vad.onnx
         QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
         PUBLIC_SAMPLE: ${{ inputs.public_sample }}
       run: python -m scripts.benchmark_qwen_asr infer
