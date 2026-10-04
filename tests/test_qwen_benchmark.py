@@ -9,6 +9,27 @@ from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_final_failure_is_encrypted_and_preserves_prior_checkpoint(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from scripts.benchmark_qwen_asr import save_encrypted, record_failure
+        key = b'x' * 32
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('scripts.benchmark_qwen_asr.workspace', return_value=Path(tmp)), \
+             patch.dict('os.environ', {'QWEN_ASR_TEST_KEY': base64.b64encode(key).decode()}):
+            for checkpoint in (None, {'attempts': [1]}):
+                (Path(tmp) / 'result.enc').unlink(missing_ok=True)
+                if checkpoint:
+                    save_encrypted(checkpoint)
+                record_failure('fetch', RuntimeError('private playback reason'))
+                data = (Path(tmp) / 'result.enc').read_bytes()
+                self.assertNotIn(b'private playback reason', data)
+                result = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
+                self.assertEqual(result['test_failure']['private_error'], 'private playback reason')
+                self.assertEqual(result.get('attempts'), checkpoint.get('attempts') if checkpoint else None)
+
     def test_parallel_requests_remain_isolated_and_single_mode_is_unchanged(self):
         requests = [{'course_id': '10', 'sub_id': '0', 'offset': 0, 'duration': 600},
                     {'course_id': '20', 'sub_id': '0', 'offset': 0, 'duration': 600}]

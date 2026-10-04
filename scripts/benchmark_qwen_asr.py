@@ -274,6 +274,20 @@ def save_encrypted(report: dict) -> None:
     (workspace() / "result.enc").write_bytes(b"QASR1" + nonce + AESGCM(key).encrypt(nonce, raw, b"qwen-asr-benchmark-v1"))
 
 
+def record_failure(mode, error):
+    """Keep the final failure encrypted, alongside any earlier checkpoints."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    path = workspace() / 'result.enc'
+    report = {}
+    if path.exists():
+        data = path.read_bytes()
+        key = base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'], validate=True)
+        report = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
+    report['test_failure'] = {'mode': mode, 'error_type': type(error).__name__,
+                              'private_error': str(error)[-2000:]}
+    save_encrypted(report)
+
+
 def infer() -> None:
     if os.environ.get('RUNTIME_SAMPLE') == 'true':
         infer_runtime_sample()
@@ -711,5 +725,10 @@ if __name__ == "__main__":
         {"fetch": fetch, "infer": infer, "review": quality_review, "summary": generate_summary, "clean": clean}[mode]()
     except Exception as error:
         # Exception bodies and command arguments may contain private URLs.
+        if mode != 'clean':
+            try:
+                record_failure(mode, error)
+            except Exception:
+                print('Final encrypted diagnostic unavailable', flush=True)
         print(f"Benchmark {mode} failed ({type(error).__name__}); private details withheld", flush=True)
         raise SystemExit(1)
