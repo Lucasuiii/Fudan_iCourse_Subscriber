@@ -2,6 +2,7 @@ import os
 import re
 
 from src.runtime.session_rules import (
+    parse_course_session_exclusions,
     parse_course_session_rules,
     parse_session_override_dates,
 )
@@ -219,6 +220,9 @@ COURSE_IDS = [
 # Courses omitted from the rules keep all playable lectures.
 COURSE_SESSION_RULES = parse_course_session_rules(
     os.environ.get("COURSE_SESSION_RULES", "")
+)
+COURSE_SESSION_EXCLUSIONS = parse_course_session_exclusions(
+    os.environ.get('COURSE_SESSION_EXCLUSIONS', '')
 )
 COURSE_SESSION_OVERRIDE_DATES = parse_session_override_dates(
     os.environ.get("COURSE_SESSION_OVERRIDE_DATES", "")

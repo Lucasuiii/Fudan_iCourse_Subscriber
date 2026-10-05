@@ -4,11 +4,38 @@ from src.runtime.session_rules import (
     SessionRulesError,
     lecture_is_selected,
     parse_course_session_rules,
+    parse_course_session_exclusions,
     parse_session_override_dates,
 )
 
 
 class SessionRulesTests(unittest.TestCase):
+    def test_monday_afternoon_exclusion_preserves_other_sessions_and_courses(self):
+        exclusions = parse_course_session_exclusions('123=周一第6-10节')
+        for day, period, expected in [('2026-09-28','9-10',False), ('2026-09-28','6-8',False),
+                                     ('2026-09-28','1-2',True), ('2026-09-28','11-13',True),
+                                     ('2026-09-29','9-10',True)]:
+            with self.subTest(day=day, period=period):
+                self.assertEqual(lecture_is_selected('123',{'date':day,'sub_title':f'第{period}节'}, {},
+                                                     exclusions=exclusions),expected)
+        self.assertTrue(lecture_is_selected('456',{}, {},exclusions=exclusions))
+
+    def test_exclusions_take_precedence_over_allowlist_date_overrides(self):
+        exclusions = parse_course_session_exclusions('123=周一第6-10节')
+        self.assertFalse(lecture_is_selected('123',{'date':'2026-09-28','sub_title':'第9-10节'},
+            parse_course_session_rules('123=周二第9-10节'),parse_session_override_dates('2026-09-28'),
+            exclusions=exclusions))
+        self.assertFalse(lecture_is_selected('123',{'date':'2026-09-28','sub_title':'第5-6节'}, {},
+                                            exclusions=exclusions))
+
+    def test_exclusion_invalid_lecture_fails_closed_and_parser_hides_values(self):
+        exclusions = parse_course_session_exclusions('123=周一第6-10节')
+        for lecture in ({}, {'date':'2026-02-30','sub_title':'第9-10节'}, {'date':'2026-09-28','sub_title':'第10-9节'}):
+            self.assertFalse(lecture_is_selected('123',lecture,{},exclusions=exclusions))
+        with self.assertRaises(SessionRulesError) as caught:parse_course_session_exclusions('private=invalid')
+        self.assertIn('COURSE_SESSION_EXCLUSIONS',str(caught.exception))
+        self.assertNotIn('private',str(caught.exception))
+
     def test_blank_rules_allow_every_course(self):
         rules = parse_course_session_rules("")
         self.assertTrue(lecture_is_selected("123", {}, rules))

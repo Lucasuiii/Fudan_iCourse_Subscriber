@@ -152,6 +152,9 @@ jobs:
       with:
         python-version: '3.12'
     - run: python -m pip install PyYAML cryptography pycryptodome requests openai pillow numpy soundfile
+    - run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Original shard invariants and independent course scheduling

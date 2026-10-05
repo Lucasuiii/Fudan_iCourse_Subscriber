@@ -15,6 +15,10 @@ name: iCourse Parallel Pilot
         description: Reverse rank among actual playable recordings (1 latest, 2 penultimate)
         type: number
         default: 1
+      validation_before_date:
+        description: Select only recordings strictly before this date (YYYY-MM-DD)
+        type: string
+        default: ''
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
@@ -43,6 +47,9 @@ name: iCourse Parallel Pilot
       validation_lecture_rank:
         type: number
         default: 1
+      validation_before_date:
+        type: string
+        default: ''
       automatic_terms:
         type: boolean
         default: false
@@ -87,6 +94,8 @@ name: iCourse Parallel Pilot
         required: false
       COURSE_SESSION_RULES:
         required: false
+      COURSE_SESSION_EXCLUSIONS:
+        required: false
       COURSE_SESSION_OVERRIDE_DATES:
         required: false
       SMTP_EMAIL:
@@ -130,11 +139,13 @@ jobs:
       UISPsw: ${{ secrets.UISPSW }}
       COURSE_IDS: ${{ secrets.COURSE_IDS }}
       COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
       COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
       VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
+      VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}
     outputs:
@@ -214,6 +225,7 @@ jobs:
       UISPsw: ${{ secrets.UISPSW }}
       COURSE_IDS: ${{ secrets.COURSE_IDS }}
       COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
       COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}

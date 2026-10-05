@@ -111,6 +111,38 @@ class PreparedLectureTests(unittest.TestCase):
 
 
 class ClassroomSelectionTests(unittest.TestCase):
+    def test_cutoff_selects_older_recording_and_rejects_invalid_dates(self):
+        db=MagicMock();db.get_lecture.return_value=None
+        client=MagicMock();client.get_course_detail.return_value={'title':'高代','lectures':[
+            {'sub_id':'7','date':'2026-09-29'}, {'sub_id':'6','date':'2026-09-28'},
+            {'sub_id':'5','date':'2026-09-22'}]}
+        client.get_video_url.return_value='private-url'
+        task,_=pipeline.latest_validation_task(client,db,'38404',before_date='2026-09-28')
+        self.assertEqual(task[2]['sub_id'],'5')
+        self.assertEqual(task[2]['_validation']['before_date'],'2026-09-28')
+        client.get_video_url.assert_called_once_with('38404','5')
+        for cutoff in ('2026-02-30','2026-9-28','bad'):
+            with patch.dict(os.environ,{'VALIDATION_BEFORE_DATE':cutoff}):
+                with self.assertRaises(ValueError):pipeline.validation_before_date()
+        with patch.dict(os.environ,{'VALIDATION_BEFORE_DATE':'2026-09-28','VALIDATION_COURSE_ID':''}):
+            with self.assertRaises(ValueError):pipeline.validation_course()
+
+    def test_excluded_exercise_session_is_not_probed_or_counted_in_rank(self):
+        from src.runtime.session_rules import parse_course_session_exclusions
+        db=MagicMock();db.get_lecture.return_value=None
+        client=MagicMock();client.get_course_detail.return_value={'title':'高代','lectures':[
+            {'sub_id':'7','date':'2026-09-29','sub_title':'第1-2节'},
+            {'sub_id':'6','date':'2026-09-28','sub_title':'第9-10节'},
+            {'sub_id':'6','date':'2026-09-28','sub_title':'第9-10节'},
+            {'sub_id':'5','date':'2026-09-22','sub_title':'第1-2节'},
+            {'sub_id':'4','date':'2026-09-21','sub_title':'第9-10节'}]}
+        client.get_video_url.return_value='private-url'
+        with patch('src.runtime.config.COURSE_SESSION_EXCLUSIONS',parse_course_session_exclusions('38404=周一第6-10节')):
+            task,_=pipeline.latest_validation_task(client,db,'38404',today='2026-10-05',rank=2)
+        self.assertEqual(task[2]['sub_id'],'5')
+        self.assertEqual(task[2]['_validation']['skipped_excluded'],2)
+        self.assertEqual([c.args for c in client.get_video_url.call_args_list],[('38404','7'),('38404','5')])
+
     def test_penultimate_actual_recording_skips_empty_holidays_and_duplicates(self):
         db = MagicMock(); db.get_lecture.return_value = None
         client = MagicMock(); client.get_course_detail.return_value = {'title': '高代', 'lectures': [

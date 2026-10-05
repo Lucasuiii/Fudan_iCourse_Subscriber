@@ -74,11 +74,14 @@ def _in_run_scope(course_id: str, lecture: dict) -> bool:
     """Keep date reruns isolated from routine allowlists and unsent recovery."""
     if os.environ.get('PARALLEL_COURSE_SCOPE') == 'true' and str(course_id) not in config.COURSE_IDS:
         return False
+    if not lecture_is_selected(course_id, lecture, {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
+        return False
     if config.RERUN_TARGET_IDS:
         return str(lecture["sub_id"]) in config.RERUN_TARGET_IDS
     return lecture_is_selected(
         course_id, lecture, config.COURSE_SESSION_RULES,
         config.COURSE_SESSION_OVERRIDE_DATES,
+        exclusions=config.COURSE_SESSION_EXCLUSIONS,
     )
 
 
@@ -285,7 +288,8 @@ def _selected_attention_lectures(
     return [
         row for row in rows
         if lecture_is_selected(
-            row["course_id"], row, config.COURSE_SESSION_RULES
+            row["course_id"], row, config.COURSE_SESSION_RULES,
+            exclusions=config.COURSE_SESSION_EXCLUSIONS,
         )
     ]
 

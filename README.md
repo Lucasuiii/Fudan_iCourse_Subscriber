@@ -61,6 +61,7 @@
 | `UISPSW` | ✅ | UIS 统一身份认证密码 | `your_password` |
 | `COURSE_IDS` | ✅ | 要监控的课程 ID，多个用英文逗号分隔 | `35472,30251` |
 | `COURSE_SESSION_RULES` | ⬜ | 私密课次白名单；未列出的课程处理全部课次 | `35472=周一第1-2节|周三第6-8节` |
+| `COURSE_SESSION_EXCLUSIONS` | ⬜ | 私密固定课时排除；重叠课时不识别，日期例外不恢复被排除课时 | `35472=周一第6-10节` |
 | `COURSE_SESSION_OVERRIDE_DATES` | ⬜ | 调课/补课日期例外；这些日期临时绕过课次白名单 | `2026-09-20` |
 | `DB_ENCRYPTION_KEY` | ✅ | 独立数据库密钥；用 `openssl rand -hex 32` 生成 | `64位随机十六进制字符串` |
 | `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |

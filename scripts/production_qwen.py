@@ -127,7 +127,7 @@ def validate_checkpoint_age(saved, run, slot, *, prior_only=False):
 def validation_course():
     course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
     rank = validation_rank()
-    if not course and rank != 1:
+    if not course and (rank != 1 or validation_before_date()):
         raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
         if not course.isascii() or not course.isdigit():
@@ -146,7 +146,17 @@ def validation_rank():
     return int(raw)
 
 
-def latest_validation_task(client, db, course, *, today=None, rank=1):
+def validation_before_date():
+    raw = os.environ.get('VALIDATION_BEFORE_DATE', '').strip()
+    if raw:
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+            raise ValueError('Invalid validation cutoff date')
+        try: datetime.strptime(raw, '%Y-%m-%d')
+        except ValueError: raise ValueError('Invalid validation cutoff date') from None
+    return raw
+
+
+def latest_validation_task(client, db, course, *, today=None, rank=1, before_date=''):
     """Probe actual playback, including entries with stale playback_status.
 
     No benchmark acquisition limit or cached summary is used. Deleted lectures
@@ -154,9 +164,16 @@ def latest_validation_task(client, db, course, *, today=None, rank=1):
     """
     if type(rank) is not int or not 1 <= rank <= 10:
         raise ValueError('Invalid reverse recording rank')
+    if before_date:
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', before_date):
+            raise ValueError('Invalid validation cutoff date')
+        try: datetime.strptime(before_date, '%Y-%m-%d')
+        except ValueError: raise ValueError('Invalid validation cutoff date') from None
     today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
     detail = client.get_course_detail(course)
-    candidates = []
+    from src.runtime import config
+    from src.runtime.session_rules import lecture_is_selected
+    candidates = []; excluded_sub_ids = set()
     for lecture in detail.get('lectures', []):
         date = str(lecture.get('date', ''))
         if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date): continue
@@ -164,7 +181,11 @@ def latest_validation_task(client, db, course, *, today=None, rank=1):
         except ValueError: continue
         sub_id = str(lecture.get('sub_id', ''))
         if date > today or not sub_id.isascii() or not sub_id.isdigit(): continue
+        if before_date and date >= before_date: continue
         if (db.get_lecture(sub_id) or {}).get('deleted_at'): continue
+        if not lecture_is_selected(course, lecture, {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
+            excluded_sub_ids.add(sub_id)
+            continue
         period = re.search(r'第\s*(\d+)', str(lecture.get('sub_title', '')))
         candidates.append((date, int(period.group(1)) if period else -1, int(sub_id), lecture))
     seen, skipped, playable = set(), 0, 0
@@ -181,6 +202,10 @@ def latest_validation_task(client, db, course, *, today=None, rank=1):
             selected = dict(lecture, sub_id=sub_id,
                             _validation={'date': lecture['date'], 'skipped_unavailable': skipped,
                                          'playable_rank': rank})
+            if excluded_sub_ids:
+                selected['_validation']['skipped_excluded'] = len(excluded_sub_ids)
+            if before_date:
+                selected['_validation']['before_date'] = before_date
             return (course, detail['title'], selected), detail.get('teacher', '')
         skipped += 1
     raise ValueError('Requested playable non-future lecture rank unavailable')
@@ -203,7 +228,8 @@ def plan():
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
             if course:
-                task, teacher = latest_validation_task(client, db, course, rank=validation_rank())
+                task, teacher = latest_validation_task(client, db, course, rank=validation_rank(),
+                                                       before_date=validation_before_date())
                 history = snapshot(db, root()/'history.db')
                 # A separate scratch database forces this authorized lecture
                 # through ASR even when production already has a summary.
@@ -229,7 +255,9 @@ def plan():
         raise ValueError('Invalid or duplicate lecture queue')
     if course:
         if (len(tasks) != 1 or str(tasks[0][0]) != course or not tasks[0][2].get('_validation')
-                or tasks[0][2]['_validation'].get('playable_rank', 1) != validation_rank()):
+                or tasks[0][2]['_validation'].get('playable_rank', 1) != validation_rank()
+                or tasks[0][2]['_validation'].get('before_date', '') != validation_before_date()
+                or (validation_before_date() and str(tasks[0][2].get('date', '')) >= validation_before_date())):
             raise ValueError('Validation queue does not match the requested course')
         out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
