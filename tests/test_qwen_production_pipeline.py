@@ -592,6 +592,8 @@ class EncryptedStageTests(unittest.TestCase):
         text=json.dumps(job)
         self.assertNotIn('production_qwen prepare',text);self.assertNotIn('qwen_transcriber',text)
         self.assertNotIn('sharded_qwen_pilot worker',text)
+        uploads=[s['with']['name'] for s in job['steps'] if s.get('uses')=='actions/upload-artifact@v4']
+        self.assertEqual(uploads,['qwen-media-private-inspection-${{ github.run_attempt }}'])
 
     def test_late_audio_packet_diagnostic_is_bounded_and_never_decodes_payload(self):
         from scripts.production_media_inspection import probe_late_packets
