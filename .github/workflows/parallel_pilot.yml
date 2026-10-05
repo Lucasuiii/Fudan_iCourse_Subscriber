@@ -8,9 +8,13 @@ name: iCourse Parallel Pilot
   workflow_dispatch:
     inputs:
       validation_course_id:
-        description: Only validate this course's latest playable lecture (requires no publication or email)
+        description: Validate one playable lecture from this course (requires no publication or email)
         type: string
         default: ''
+      validation_lecture_rank:
+        description: Reverse rank among actual playable recordings (1 latest, 2 penultimate)
+        type: number
+        default: 1
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
@@ -36,6 +40,9 @@ name: iCourse Parallel Pilot
       validation_course_id:
         type: string
         default: ''
+      validation_lecture_rank:
+        type: number
+        default: 1
       automatic_terms:
         type: boolean
         default: false
@@ -127,6 +134,7 @@ jobs:
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
+      VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}
     outputs:

@@ -125,6 +125,9 @@ def validate_checkpoint_age(saved, run, slot, *, prior_only=False):
 
 def validation_course():
     course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
+    rank = validation_rank()
+    if not course and rank != 1:
+        raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
         if not course.isascii() or not course.isdigit():
             raise ValueError('Invalid validation course')
@@ -135,12 +138,21 @@ def validation_course():
     return course
 
 
-def latest_validation_task(client, db, course, *, today=None):
+def validation_rank():
+    raw = os.environ.get('VALIDATION_LECTURE_RANK', '1').strip()
+    if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 10:
+        raise ValueError('Invalid reverse recording rank')
+    return int(raw)
+
+
+def latest_validation_task(client, db, course, *, today=None, rank=1):
     """Probe actual playback, including entries with stale playback_status.
 
     No benchmark acquisition limit or cached summary is used. Deleted lectures
     remain excluded; an empty holiday schedule is a normal unavailable entry.
     """
+    if type(rank) is not int or not 1 <= rank <= 10:
+        raise ValueError('Invalid reverse recording rank')
     today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
     detail = client.get_course_detail(course)
     candidates = []
@@ -154,7 +166,7 @@ def latest_validation_task(client, db, course, *, today=None):
         if (db.get_lecture(sub_id) or {}).get('deleted_at'): continue
         period = re.search(r'第\s*(\d+)', str(lecture.get('sub_title', '')))
         candidates.append((date, int(period.group(1)) if period else -1, int(sub_id), lecture))
-    seen, skipped = set(), 0
+    seen, skipped, playable = set(), 0, 0
     for _, _, _, lecture in sorted(candidates, key=lambda item: item[:3], reverse=True):
         sub_id = str(lecture['sub_id'])
         if sub_id in seen: continue
@@ -162,11 +174,15 @@ def latest_validation_task(client, db, course, *, today=None):
         # Use the same API resolution/fallbacks as AudioDownloader. Do not
         # freeze an expiring private URL in the queue or print it in Actions.
         if client.get_video_url(course, sub_id):
+            playable += 1
+            if playable != rank:
+                continue
             selected = dict(lecture, sub_id=sub_id,
-                            _validation={'date': lecture['date'], 'skipped_unavailable': skipped})
+                            _validation={'date': lecture['date'], 'skipped_unavailable': skipped,
+                                         'playable_rank': rank})
             return (course, detail['title'], selected), detail.get('teacher', '')
         skipped += 1
-    raise ValueError('No playable non-future lecture for validation')
+    raise ValueError('Requested playable non-future lecture rank unavailable')
 
 
 def plan():
@@ -186,7 +202,7 @@ def plan():
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
             if course:
-                task, teacher = latest_validation_task(client, db, course)
+                task, teacher = latest_validation_task(client, db, course, rank=validation_rank())
                 history = snapshot(db, root()/'history.db')
                 # A separate scratch database forces this authorized lecture
                 # through ASR even when production already has a summary.
@@ -211,7 +227,8 @@ def plan():
     if len(tasks) > MAX_TASKS or len(set(identities)) != len(identities):
         raise ValueError('Invalid or duplicate lecture queue')
     if course:
-        if len(tasks) != 1 or str(tasks[0][0]) != course or not tasks[0][2].get('_validation'):
+        if (len(tasks) != 1 or str(tasks[0][0]) != course or not tasks[0][2].get('_validation')
+                or tasks[0][2]['_validation'].get('playable_rank', 1) != validation_rank()):
             raise ValueError('Validation queue does not match the requested course')
         out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
@@ -593,7 +610,16 @@ def gather():
         encode(payload, 'state', out('state.enc'))
         if lecture.get('_validation'):
             plan = spec.get('plan', {})
+            from src.ai.automatic_glossary import AutomaticGlossary
+            stages = AutomaticGlossary(db, course).stages()
             audit = dict(lecture['_validation'], mode=spec['mode'],
+                asr_execution=plan.get('execution', 'fixed_shards'),
+                automatic_terms=os.environ.get('AUTO_COURSE_TERMS') == 'true',
+                frozen_terms_count=len(plan.get('recognition_terms', [])),
+                frozen_terms_sha256=fingerprint(plan.get('recognition_terms', [])),
+                glossary_saved=bool(db.read_meta('auto_glossary:'+str(course)+':'+sub_id)),
+                glossary_candidates=sum(g['stage'] == 'candidate' for g in stages),
+                glossary_confirmed=sum(g['stage'] == 'confirmed' for g in stages),
                 planned_shards=len(plan.get('shards', [])), planned_blocks=len(plan.get('blocks', [])),
                 audio_seconds=plan.get('audio_seconds'), media_seconds=spec.get('media_seconds'),
                 transcript_chars=len(row.get('transcript') or ''), summary_chars=len(row.get('summary') or ''),
@@ -610,6 +636,8 @@ def gather():
                 homework_visual_reference_status=review.get('homework', {}).get('visual', {}).get('reference_status'),
                 homework_vision_calls=len(review.get('homework', {}).get('vision_calls', [])),
                 homework_vision_call_statuses=[c['status'] for c in review.get('homework', {}).get('vision_calls', [])],
+                homework_vision_frame_count=sum(len(c.get('images', [])) for c in review.get('homework', {}).get('vision_calls', [])),
+                homework_vision_image_count=sum(c.get('image_count', 0) for c in review.get('homework', {}).get('vision_calls', [])),
                 asr_complete=bool(material and material.get('complete')))
             out('validation-result.json').write_bytes(shards.encoded(audit))
     db.checkpoint = checkpoint

@@ -111,6 +111,47 @@ class PreparedLectureTests(unittest.TestCase):
 
 
 class ClassroomSelectionTests(unittest.TestCase):
+    def test_penultimate_actual_recording_skips_empty_holidays_and_duplicates(self):
+        db = MagicMock(); db.get_lecture.return_value = None
+        client = MagicMock(); client.get_course_detail.return_value = {'title': '高代', 'lectures': [
+            {'sub_id': '9', 'date': '2026-10-06'},
+            {'sub_id': '8', 'date': '2026-10-05'},
+            {'sub_id': '7', 'date': '2026-09-29'},
+            {'sub_id': '7', 'date': '2026-09-29'},
+            {'sub_id': '6', 'date': '2026-09-27'},
+            {'sub_id': '5', 'date': '2026-09-22'}]}
+        client.get_video_url.side_effect = [None, 'latest-private-url', None, 'penultimate-private-url']
+        task, _ = pipeline.latest_validation_task(client, db, '38404', today='2026-10-05', rank=2)
+        self.assertEqual(task[2]['sub_id'], '5')
+        self.assertEqual(task[2]['_validation'], {'date': '2026-09-22', 'skipped_unavailable': 2, 'playable_rank': 2})
+        self.assertEqual([c.args for c in client.get_video_url.call_args_list],
+                         [('38404', '8'), ('38404', '7'), ('38404', '6'), ('38404', '5')])
+
+    def test_rank_does_not_fall_back_to_latest_if_only_one_recording_exists(self):
+        db = MagicMock(); db.get_lecture.return_value = None
+        client = MagicMock(); client.get_course_detail.return_value = {'title': '高代',
+            'lectures': [{'sub_id': '1', 'date': '2026-09-29'}]}
+        client.get_video_url.return_value = 'private-url'
+        with self.assertRaises(ValueError):
+            pipeline.latest_validation_task(client, db, '38404', today='2026-10-05', rank=2)
+
+    def test_rank_requires_isolated_validation_and_bounded_integer(self):
+        for raw in ('0', '11', '2.0', '-1', 'oops'):
+            with patch.dict(os.environ, {'VALIDATION_LECTURE_RANK': raw}):
+                with self.assertRaises(ValueError): pipeline.validation_rank()
+        with patch.dict(os.environ, {'VALIDATION_LECTURE_RANK': '2', 'VALIDATION_COURSE_ID': ''}):
+            with self.assertRaises(ValueError): pipeline.validation_course()
+
+    def test_rerun_cannot_change_the_selected_recording_rank(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'RUNNER_TEMP': tmp, 'VALIDATION_COURSE_ID': '38404', 'VALIDATION_LECTURE_RANK': '2',
+            'PUBLISH_RESULTS': 'false', 'SEND_EMAIL': 'false', 'COURSE_IDS': '38404'}), \
+             patch.object(pipeline, 'artifact', return_value=True), \
+             patch.object(pipeline, 'decode', return_value={'queue.json': json.dumps([
+                 ['38404', '高代', {'sub_id': '1', '_validation': {'date': '2026-09-29', 'playable_rank': 1}}]
+             ]).encode()}):
+            with self.assertRaises(ValueError): pipeline.plan()
+
     def test_latest_real_playback_skips_holidays_future_and_deleted_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = database(Path(tmp)/'history.db', summary='历史摘要')
