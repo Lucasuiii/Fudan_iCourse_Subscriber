@@ -155,7 +155,7 @@ def inspect():
         stage = 'webvpn_login'
         vpn.login()
         stage = 'icourse_authentication'
-        vpn.authenticate_icourse()
+        vpn.authenticate_icourse(strict=True)
         stage = 'playback_selection'
         client = ICourseClient(vpn)
         # Resolve exactly the stored lecture using the existing fallback chain.
@@ -181,8 +181,12 @@ def inspect():
         # login response bodies or cookies. Fixed stage names locate failures.
         payload.update(inspection_status='failed', failure_stage=stage,
                        failure_type=type(error).__name__)
+        from src.api.webvpn import AuthenticationError
+        if isinstance(error,AuthenticationError): payload['authentication_reason'] = error.reason
         raise
     finally:
+        if vpn is not None and type(getattr(vpn,'auth_diagnostics',None)) is list:
+            payload['authentication_diagnostics'] = vpn.auth_diagnostics
         try:
             if vpn is not None: vpn.session.close()
         finally:

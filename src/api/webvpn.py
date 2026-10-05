@@ -20,6 +20,32 @@ import base64
 from src.runtime import config
 
 
+class AuthenticationError(RuntimeError):
+    """Fixed reason code; no credential, response body or ticket in diagnostics."""
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def auth_observation(stage, response, data=None, **flags):
+    """Whitelisted transport/flow evidence, never provider text or URLs."""
+    row = {'stage':stage, 'http_status':response.status_code,
+           'redirect_count':len(response.history or [])}
+    # Page hints alone do not prove that a challenge is required.
+    text = response.text[:100_000].lower()
+    row['captcha_page_hint'] = any(s in text for s in ('captcha', '验证码'))
+    row['mfa_page_hint'] = any(s in text for s in ('二次验证', '动态口令', '短信验证码'))
+    if isinstance(data, dict):
+        value = str(data.get('code', ''))
+        if re.fullmatch(r'-?\d{1,6}',value): row['response_code'] = int(value)
+        for key in ('needVerifyCode', 'needCaptcha', 'needMfa', 'needOtp'):
+            if type(data.get(key)) is bool: row[key] = data[key]
+    allowed = {'context_found', 'password_method_found', 'public_key_found',
+               'login_token_found', 'ticket_found', 'verified'}
+    row.update({k:v for k,v in flags.items() if k in allowed and type(v) is bool})
+    return row
+
+
 def encrypt_host(hostname: str) -> str:
     """Encrypt hostname using AES-128-CFB for WebVPN URL encoding.
 
@@ -119,6 +145,11 @@ class WebVPNSession:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
         self.logged_in = False
+        self.auth_diagnostics = []
+
+    def _record_icourse_auth(self, stage, response, data=None, **flags):
+        self.auth_diagnostics.append(auth_observation(stage,response,data,**flags))
+        self.auth_diagnostics = self.auth_diagnostics[-32:]
 
     def login(self, student_id: str = None, password: str = None) -> bool:
         """Execute the full 7-step IDP authentication flow.
@@ -167,7 +198,7 @@ class WebVPNSession:
         return True
 
     def authenticate_icourse(
-        self, student_id: str = None, password: str = None
+        self, student_id: str = None, password: str = None, *, strict: bool = False
     ) -> bool:
         """Authenticate to iCourse via CAS/IDP through WebVPN.
 
@@ -189,8 +220,9 @@ class WebVPNSession:
         warmup = self.session.get(
             config.WEBVPN_BASE + "/", allow_redirects=False, timeout=5,
         )
+        self._record_icourse_auth('portal_warmup',warmup)
         if warmup.status_code != 200:
-            raise RuntimeError("WebVPN session cold — re-login needed")
+            raise AuthenticationError('cold_session')
 
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
 
@@ -219,10 +251,9 @@ class WebVPNSession:
             if m:
                 lck = m.group(1)
         if not lck:
-            raise RuntimeError(
-                f"Failed to extract lck from CAS redirect chain "
-                f"(final URL: {resp.url[:120]})"
-            )
+            self._record_icourse_auth('cas_context',resp,context_found=False)
+            raise AuthenticationError('cas_context_missing')
+        self._record_icourse_auth('cas_context',resp,context_found=True)
 
         entity_id = config.ICOURSE_BASE
         print("    lck: OK")
@@ -240,6 +271,7 @@ class WebVPNSession:
             },
             timeout=60,
         )
+        self._record_icourse_auth('auth_methods_http',resp)
         data = resp.json()
         auth_method_list = data.get("data", [])
         request_type = data.get("requestType", "chain_type")
@@ -250,7 +282,9 @@ class WebVPNSession:
                 auth_chain_code = method.get("authChainCode", "")
                 break
         if not auth_chain_code:
-            raise RuntimeError("No authChainCode found in response")
+            self._record_icourse_auth('auth_methods',resp,data,password_method_found=False)
+            raise AuthenticationError('password_method_missing')
+        self._record_icourse_auth('auth_methods',resp,data,password_method_found=True)
         print("    authChainCode: OK")
 
         # Step 3: Get RSA public key (through WebVPN)
@@ -261,10 +295,13 @@ class WebVPNSession:
             headers={"Referer": f"{idp_vpn_base}/ac/"},
             timeout=60,
         )
+        self._record_icourse_auth('public_key_http',resp)
         data = resp.json()
         pub_key_b64 = data.get("data", "")
         if not pub_key_b64:
-            raise RuntimeError("Failed to get public key via WebVPN")
+            self._record_icourse_auth('public_key',resp,data,public_key_found=False)
+            raise AuthenticationError('public_key_missing')
+        self._record_icourse_auth('public_key',resp,data,public_key_found=True)
         print("    Got RSA public key")
 
         # Step 4: Encrypt password
@@ -296,16 +333,17 @@ class WebVPNSession:
             },
             timeout=60,
         )
+        self._record_icourse_auth('auth_execute_http',resp)
         data = resp.json()
+        self._record_icourse_auth('auth_execute',resp,data,
+                                 login_token_found=bool(data.get('loginToken')))
 
         if str(data.get("code")) != "200":
-            raise RuntimeError(
-                f"iCourse CAS auth failed (code={data.get('code')})"
-            )
+            raise AuthenticationError('authentication_rejected')
 
         login_token = data.get("loginToken", "")
         if not login_token:
-            raise RuntimeError("No loginToken in iCourse CAS response")
+            raise AuthenticationError('login_token_missing')
         print("    loginToken: OK")
 
         # Step 6: Get CAS ticket (through WebVPN)
@@ -332,9 +370,9 @@ class WebVPNSession:
                 r'(https?://[^\s"\'<>]*ticket=[^\s"\'<>]*)', html
             )
         if not ticket_match:
-            raise RuntimeError(
-                f"Failed to extract iCourse ticket URL (response length: {len(html)})"
-            )
+            self._record_icourse_auth('cas_ticket',resp,ticket_found=False)
+            raise AuthenticationError('cas_ticket_missing')
+        self._record_icourse_auth('cas_ticket',resp,ticket_found=True)
 
         ticket_url = html_mod.unescape(ticket_match.group(1))
         print("    Ticket extracted.")
@@ -347,6 +385,7 @@ class WebVPNSession:
         resp = self.session.get(
             ticket_url, allow_redirects=True, timeout=90
         )
+        self._record_icourse_auth('ticket_follow',resp)
         print(f"    Status: {resp.status_code}")
 
         # Verify by making a test API call
@@ -354,16 +393,20 @@ class WebVPNSession:
             f"{config.ICOURSE_BASE}/userapi/v1/infosimple"
         )
         resp = self.session.get(test_url, timeout=60)
+        self._record_icourse_auth('api_verification_http',resp)
         if resp.status_code == 200:
             try:
                 user_data = resp.json()
-                if user_data.get("code") in (0, 200):
+                verified = str(user_data.get('code')) in ('0','200')
+                self._record_icourse_auth('api_verification',resp,user_data,verified=verified)
+                if verified:
                     print("    Verified: login OK")
                     print("[*] iCourse authentication successful!")
                     return True
             except Exception:
                 pass
 
+        if strict: raise AuthenticationError('api_verification_failed')
         print("    Could not verify iCourse auth via API, proceeding...")
         return True
 
@@ -411,6 +454,7 @@ class WebVPNSession:
 
         # Extract lck parameter
         lck_match = re.search(r"[?&]lck=([^&]+)", location)
+        self._record_icourse_auth('webvpn_context',resp,context_found=bool(lck_match))
         if not lck_match:
             raise RuntimeError(
                 f"Failed to extract lck from redirect (status={resp.status_code})"
@@ -436,8 +480,8 @@ class WebVPNSession:
             },
             timeout=60,
         )
+        self._record_icourse_auth('webvpn_auth_methods_http',resp)
         data = resp.json()
-
         # data["data"] is a list of auth methods; pick the userAndPwd one
         # authChainCode for userAndPwd is in the list items;
         # requestType is at the top level
@@ -450,6 +494,7 @@ class WebVPNSession:
                 auth_chain_code = method.get("authChainCode", "")
                 break
 
+        self._record_icourse_auth('webvpn_auth_methods',resp,data,password_method_found=bool(auth_chain_code))
         if not auth_chain_code:
             raise RuntimeError("Failed to get authChainCode")
 
@@ -468,6 +513,7 @@ class WebVPNSession:
         )
         data = resp.json()
         pub_key_b64 = data.get("data", "")
+        self._record_icourse_auth('webvpn_public_key',resp,data,public_key_found=bool(pub_key_b64))
         if not pub_key_b64:
             raise RuntimeError("Failed to get public key")
 
@@ -521,12 +567,12 @@ class WebVPNSession:
             timeout=60,
         )
         data = resp.json()
-
+        self._record_icourse_auth('webvpn_auth_execute',resp,data,
+                                 login_token_found=bool(data.get('loginToken')))
         if str(data.get("code")) != "200":
             raise RuntimeError(
                 f"Authentication failed (code={data.get('code')})"
             )
-
         # loginToken is at top level, not nested under "data"
         login_token = data.get("loginToken", "")
         if not login_token:
@@ -561,6 +607,7 @@ class WebVPNSession:
                 r'(https?://[^\s"\'<>]*ticket=[^\s"\'<>]*)', html
             )
 
+        self._record_icourse_auth('webvpn_ticket',resp,ticket_found=bool(ticket_match))
         if not ticket_match:
             raise RuntimeError(
                 f"Failed to extract ticket URL (response length: {len(html)})"
@@ -579,6 +626,7 @@ class WebVPNSession:
                 resp = self.session.get(
                     ticket_url, allow_redirects=True, timeout=20
                 )
+                self._record_icourse_auth('webvpn_ticket_follow',resp)
                 if resp.status_code == 200:
                     print("    Session established.")
                     return
