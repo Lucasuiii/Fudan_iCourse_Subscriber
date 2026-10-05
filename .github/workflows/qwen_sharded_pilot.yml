@@ -4,6 +4,8 @@ name: Qwen Single-Lecture Sharded Pilot
     branches: [codex/qwen-production-pilot]
     paths:
     - .github/workflows/qwen_sharded_pilot.yml
+    - .github/workflows/qwen_sharded_course.yml
+    - tests/test_qwen_workflow_schedule.py
     - scripts/qwen_sharding.py
     - scripts/sharded_qwen_pilot.py
     - tests/test_qwen_sharding.py
@@ -63,7 +65,9 @@ jobs:
     - name: Validate synthetic plans only, without credentials or course access
       env:
         PYTHONPATH: tests
-      run: python -m unittest test_qwen_sharding.ShardPlanTests
+      run: |
+        python -m pip install PyYAML==6.0.3
+        python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule
   plan:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
@@ -178,7 +182,7 @@ jobs:
     needs: [plan, prepare]
     runs-on: ubuntu-latest
     outputs:
-      workers: ${{ steps.plan.outputs.workers }}
+      courses: ${{ steps.plan.outputs.courses }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -198,135 +202,22 @@ jobs:
       run: python -m scripts.sharded_qwen_pilot workers
     - if: always()
       run: python -m scripts.sharded_qwen_pilot clean
-  asr:
+  course:
     needs: plan_workers
-    name: asr (${{ matrix.course_slot }}, ${{ matrix.shard_id }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
+    name: course (${{ matrix.course_slot }})
     strategy:
       fail-fast: false
-      max-parallel: 15
-      matrix: ${{ fromJSON(needs.plan_workers.outputs.workers) }}
-    env:
-      COURSE_SLOT: ${{ matrix.course_slot }}
-      SHARD_ID: ${{ matrix.shard_id }}
-      QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - run: |
-        python -m pip install cryptography soundfile
-        if [ "$REUSE_SHARDED_RUN_ID" = '' ]; then
-          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install qwen-asr==0.0.6 --no-deps
-          python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa qwen-omni-utils sox
-        fi
-      env:
-        REUSE_SHARDED_RUN_ID: ${{ inputs.reuse_sharded_run_id }}
-    - uses: actions/cache@v4
-      if: ${{ inputs.reuse_sharded_run_id == '' }}
-      with:
-        path: ~/.cache/huggingface/hub
-        key: qwen-shard-asr-7278e1e-cpu-v1
-    - uses: actions/download-artifact@v4
-      with:
-        name: qwen-shard-audio-${{ matrix.course_slot }}-${{ matrix.shard_id }}
-        path: ${{ runner.temp }}/qwen-shards/inbox
-    - name: Restore only confirmed prior shard checkpoint
-      id: restore
-      env:
-        GH_TOKEN: ${{ github.token }}
-        RESTORE_ARTIFACT: qwen-shard-result-${{ matrix.course_slot }}-${{ matrix.shard_id }}
-      run: python -m scripts.sharded_qwen_pilot restore
-    - run: python -m scripts.sharded_qwen_pilot worker
-    - uses: actions/upload-artifact@v4
-      if: ${{ always() && steps.restore.outcome == 'success' }}
-      with:
-        name: qwen-shard-result-${{ matrix.course_slot }}-${{ matrix.shard_id }}
-        path: |
-          ${{ runner.temp }}/qwen-shards/out/worker-result.enc
-          ${{ runner.temp }}/qwen-shards/out/diagnostic.enc
-        if-no-files-found: ignore
-        retention-days: 7
-        compression-level: 0
-        overwrite: true
-    - if: always()
-      run: python -m scripts.sharded_qwen_pilot clean
-  gather:
-    needs: [plan, prepare, plan_workers, asr]
-    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.plan_workers.result == 'success' }}
-    name: gather (${{ matrix.course_slot }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
+      # Each active course uses <=3 ASR runners OR one gather runner.
+      # Calling a reusable workflow allocates no waiting parent runner: 5 x 3 <= 15.
       max-parallel: 5
-      matrix: ${{ fromJSON(needs.plan.outputs.courses) }}
-    env:
-      COURSE_SLOT: ${{ matrix.course_slot }}
+      matrix: ${{ fromJSON(needs.plan_workers.outputs.courses) }}
+    uses: ./.github/workflows/qwen_sharded_course.yml
+    with:
+      course_slot: ${{ matrix.course_slot }}
+      workers: ${{ toJSON(matrix.workers) }}
+      review_profile: ${{ inputs.review_profile }}
+      reuse_sharded_run_id: ${{ inputs.reuse_sharded_run_id }}
+    secrets:
       QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-      QWEN_REVIEW_PROFILE: ${{ inputs.review_profile }}
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - run: |
-        python -m pip install requests cryptography openai
-        python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install qwen-asr==0.0.6 --no-deps
-        python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa soundfile qwen-omni-utils sox
-        if ! command -v ffmpeg >/dev/null; then
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-        fi
-    - uses: actions/cache@v4
-      with:
-        path: ~/.cache/huggingface/hub
-        key: qwen-shard-aligner-c7cbfc20-cpu-v1
-    - uses: actions/download-artifact@v4
-      with:
-        name: qwen-shard-input-${{ matrix.course_slot }}
-        path: ${{ runner.temp }}/qwen-shards/inbox
-    - uses: actions/download-artifact@v4
-      with:
-        pattern: qwen-shard-result-${{ matrix.course_slot }}-*
-        path: ${{ runner.temp }}/qwen-shards/results
-    - name: Restore prior finalization without resetting cloud quota
-      id: restore
-      env:
-        GH_TOKEN: ${{ github.token }}
-        RESTORE_ARTIFACT: qwen-shard-final-${{ matrix.course_slot }}
-      run: python -m scripts.sharded_qwen_pilot restore
-    - name: Validate all blocks, review once, summarize without publishing
-      env:
-        GH_TOKEN: ${{ github.token }}
-        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
-      run: python -m scripts.sharded_qwen_pilot gather
-    - uses: actions/upload-artifact@v4
-      if: ${{ always() && steps.restore.outcome == 'success' }}
-      with:
-        name: qwen-shard-final-${{ matrix.course_slot }}
-        path: ${{ runner.temp }}/qwen-shards/out/result.enc
-        if-no-files-found: ignore
-        retention-days: 7
-        compression-level: 0
-        overwrite: true
-    - uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: qwen-shard-gather-diagnostic-${{ matrix.course_slot }}
-        path: ${{ runner.temp }}/qwen-shards/out/diagnostic.enc
-        if-no-files-found: ignore
-        retention-days: 7
-        compression-level: 0
-        overwrite: true
-    - if: always()
-      run: python -m scripts.sharded_qwen_pilot clean
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}

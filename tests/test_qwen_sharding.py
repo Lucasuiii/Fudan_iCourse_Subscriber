@@ -486,10 +486,26 @@ class ShardRuntimeTests(unittest.TestCase):
             pilot.seal({'manifest.json': pilot.encoded(manifest)}, 'plan',
                        pilot.root()/'plans'/f'qwen-shard-plan-{i}'/'plan.enc', i)
         pilot.workers()
-        matrix = json.loads(Path(os.environ['GITHUB_OUTPUT']).read_text().split('=', 1)[1])['include']
+        output = dict(line.split('=', 1) for line in Path(os.environ['GITHUB_OUTPUT']).read_text().splitlines())
+        matrix = json.loads(output['workers'])['include']
+        course_matrix = json.loads(output['courses'])['include']
         self.assertEqual(len(matrix), 15)
         self.assertEqual({(r['course_slot'], r['shard_id']) for r in matrix},
                          {(i, j) for i in range(5) for j in range(3)})
+        self.assertEqual([c['course_slot'] for c in course_matrix], list(range(5)))
+        self.assertEqual([w for c in course_matrix for w in c['workers']['include']], matrix)
+        for c in course_matrix:
+            self.assertTrue(all(w['course_slot'] == c['course_slot'] for w in c['workers']['include']))
+        for field, value in [('course_slot', 4), ('run_id', '999'),
+                             ('reference', {'run_id': '999', 'artifact': refs[0]['artifact']})]:
+            wrong = deepcopy(manifests[0])
+            wrong[field] = value
+            pilot.seal({'manifest.json': pilot.encoded(wrong)}, 'plan',
+                       pilot.root()/'plans'/'qwen-shard-plan-0'/'plan.enc', 0)
+            with self.assertRaises(ValueError):
+                pilot.workers()
+        pilot.seal({'manifest.json': pilot.encoded(manifests[0])}, 'plan',
+                   pilot.root()/'plans'/'qwen-shard-plan-0'/'plan.enc', 0)
         manifests[1]['selection'] = manifests[0]['selection']
         pilot.seal({'manifest.json': pilot.encoded(manifests[1])}, 'plan',
                    pilot.root()/'plans'/'qwen-shard-plan-1'/'plan.enc', 1)

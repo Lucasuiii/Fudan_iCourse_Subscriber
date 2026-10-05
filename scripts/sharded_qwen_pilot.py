@@ -330,19 +330,26 @@ def prepare_reuse():
 def workers():
     refs = parse_baselines(os.environ['BASELINES'])
     matrix = []
+    course_matrix = []
     courses = set()
     for slot in range(len(refs)):
         manifest = json.loads(unseal(root()/'plans'/f'qwen-shard-plan-{slot}'/'plan.enc', 'plan', slot)['manifest.json'])
         validate_plan(manifest)
+        if (manifest['course_slot'] != slot or manifest['run_id'] != os.environ['GITHUB_RUN_ID']
+                or manifest['reference'] != {k: refs[slot][k] for k in ('run_id', 'artifact')}):
+            raise ValueError('Course plan belongs to another slot, run or baseline')
         identity = (manifest['selection']['course_id'], manifest['selection']['sub_id'])
         if identity in courses:
             raise ValueError('Duplicate lecture in batch')
         courses.add(identity)
-        matrix.extend({'course_slot': slot, 'shard_id': shard['shard_id']} for shard in manifest['shards'])
+        local_workers = [{'course_slot': slot, 'shard_id': shard['shard_id']} for shard in manifest['shards']]
+        matrix.extend(local_workers)
+        course_matrix.append({'course_slot': slot, 'workers': {'include': local_workers}})
     if len(matrix) > MAX_RUNNERS:
         raise ValueError('Batch exceeds total runner cap')
-    outputs(workers={'include': matrix})
-    print(f'Planned {len(matrix)} ASR workers; no nested course worker pools', flush=True)
+    outputs(workers={'include': matrix}, courses={'include': course_matrix})
+    print(f'Planned {len(matrix)} ASR workers in {len(course_matrix)} independent course pipelines; '
+          f'global runner cap={MAX_RUNNERS}', flush=True)
 
 
 def worker():
