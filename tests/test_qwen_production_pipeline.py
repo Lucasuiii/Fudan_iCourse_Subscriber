@@ -392,6 +392,51 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_isolated_no_content_trial_fails_and_retains_checkpoint(self):
+        Runner = _load_runner_class(); plan, results = fixture()
+        plan['audio_seconds'] = 1800
+        for result in results:
+            result['plan_hash'] = fingerprint(plan)
+            for row in result['chunks']: row['text'] = ''
+        material = assemble_material(plan, results, media_seconds=1800)
+        for isolated in (True, False):
+            with self.subTest(isolated=isolated), tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                    'RUNNER_TEMP': tmp, 'GITHUB_RUN_ID': '99', 'COURSE_SLOT': '0',
+                    'DB_ENCRYPTION_KEY': 'k'*32, 'GITHUB_ACTIONS': 'false',
+                    'QWEN_PRODUCTION_TASK': 'true', 'AUTO_COURSE_TERMS': 'false'}):
+                root = pipeline.root(); (root/'inbox').mkdir()
+                db = database(root/'fixture.db'); payload = snapshot(db, root/'snapshot.db'); db.conn.close()
+                lecture = {'sub_id': '1'}
+                if isolated: lecture['_validation'] = {'date': '2026-10-04', 'playable_rank': 2}
+                spec = {'course_id': '10', 'course_title': '概率论', 'lecture': lecture,
+                        'mode': 'cached', 'material': material, 'review': {'complete': True}}
+                pipeline.encode({'specification.json': pipeline.shards.encoded(spec), 'database.db': payload},
+                                'prepared', root/'inbox'/'prepared.enc')
+                llm = MagicMock()
+                with patch.dict('sys.modules', {'src.pipeline.lecture_runner': SimpleNamespace(LectureRunner=Runner)}), \
+                     patch.object(pipeline, 'artifact', return_value=False), \
+                     patch('src.ai.summarizer.Summarizer', return_value=llm), \
+                     patch('src.runtime.config.DOUBAO_ASR_API_KEY', ''), \
+                     patch.object(pipeline.shards, 'command') as commands:
+                    if isolated:
+                        with self.assertRaisesRegex(ValueError, 'Isolated validation produced no transcript or summary'):
+                            pipeline.gather()
+                    else:
+                        pipeline.gather()
+                commands.assert_not_called(); llm.summarize.assert_not_called()
+                saved = pipeline.decode(root/'out'/'state.enc', 'state')
+                self.assertEqual(json.loads(saved['review.json']), {'complete': True})
+                (root/'saved.db').write_bytes(saved['database.db']); db = Database(str(root/'saved.db'))
+                row = db.get_lecture('1')
+                self.assertTrue(row['processed_at']); self.assertFalse(row['summary']); self.assertFalse(row['emailed_at'])
+                self.assertEqual(row['error_count'], int(isolated))
+                if isolated:
+                    self.assertEqual(row['error_stage'], 'sharded_finalize')
+                    audit = json.loads((root/'out'/'validation-result.json').read_bytes())
+                    self.assertEqual(audit['transcript_chars'], 0); self.assertEqual(audit['summary_chars'], 0)
+                    self.assertEqual(audit['error_count'], 1)
+                db.conn.close()
+
     def test_encrypted_finalization_retries_summary_without_decoding_or_resetting_quota(self):
         Runner=_load_runner_class();plan,results=fixture();material=assemble_material(plan,results,media_seconds=600)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,{

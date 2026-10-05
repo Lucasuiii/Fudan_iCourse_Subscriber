@@ -57,6 +57,7 @@ def failure_code(error):
         'Recovery artifact is expired or ambiguous': 'recovery_expired',
         'Required recovery artifact is absent': 'recovery_missing',
         'Production audio is incomplete': 'incomplete_audio',
+        'Isolated validation produced no transcript or summary': 'validation_empty_output',
         'All planned ASR shards must finish before finalization': 'incomplete_shards',
         'Shard incomplete; summary forbidden': 'incomplete_shards',
         'Publication conflict retry budget exhausted; encrypted delta retained': 'publication_conflicts',
@@ -682,6 +683,13 @@ def gather():
             if not row.get('processed_at'):
                 raise RuntimeError('LectureRunner retained a retryable processing failure')
         checkpoint()
+        # A legitimate no-content recording may be terminal in production,
+        # but it cannot validate ASR and summary integration. Retain its audit
+        # and encrypted checkpoint while making the isolated trial fail.
+        if lecture.get('_validation') and (
+                not (row.get('transcript') or '').strip()
+                or not (row.get('summary') or '').strip()):
+            raise ValueError('Isolated validation produced no transcript or summary')
     except Exception as error:
         row = db.get_lecture(sub_id)
         # Phase-specific errors already committed by LectureRunner/prepare are
