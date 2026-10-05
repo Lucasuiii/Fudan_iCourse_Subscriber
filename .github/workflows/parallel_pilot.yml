@@ -1,5 +1,10 @@
 name: iCourse Parallel Pilot
 'on':
+  push:
+    branches:
+    - codex/qwen-production-pilot
+    paths:
+    - .github/workflows/parallel_pilot.yml
   workflow_dispatch:
     inputs:
       validation_course_id:
@@ -76,11 +81,20 @@ permissions:
   actions: read
   contents: write
 concurrency:
-  group: ${{ inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
+  group: ${{ github.event_name == 'push' && format('icourse-registration-{0}', github.run_id)
+    || inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
     || format('icourse-data-{0}', github.repository) }}
   cancel-in-progress: false
 jobs:
+  register:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+    - run: echo 'Manual pilot entry registered; no classroom processing on push'
   plan:
+    if: ${{ github.event_name != 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -137,7 +151,7 @@ jobs:
       if: ${{ always() }}
   lecture:
     needs: plan
-    if: ${{ needs.plan.outputs.count != '0' }}
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
     strategy:
       fail-fast: false
       max-parallel: 5

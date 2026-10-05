@@ -149,6 +149,13 @@ class ClassroomSelectionTests(unittest.TestCase):
                                      'PUBLISH_RESULTS':'false','SEND_EMAIL':'false'}):
             self.assertEqual(pipeline.validation_course(), '38404')
 
+    def test_workflow_registration_never_processes_classrooms_on_push(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/parallel_pilot.yml').read_text())
+        self.assertIn("github.event_name != 'push'",workflow['jobs']['plan']['if'])
+        self.assertIn("needs.plan.result == 'success'",workflow['jobs']['lecture']['if'])
+        self.assertEqual(workflow['jobs']['register']['permissions'],{})
+        self.assertEqual(workflow['on']['push']['paths'],['.github/workflows/parallel_pilot.yml'])
+
     def test_validation_queue_forces_fresh_asr_and_retains_original_history(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'99','COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,
