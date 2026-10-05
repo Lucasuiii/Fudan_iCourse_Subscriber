@@ -1,6 +1,7 @@
 """LLM-based course lecture summarization with a versioned prompt file."""
 
 import time
+import json
 from pathlib import Path
 
 from openai import OpenAI
@@ -133,7 +134,7 @@ class Summarizer:
 
     def find_unclear_windows(self, windows: list[dict], ppt_pages: list[dict],
                              excluded: set[tuple[int, int]],
-                             *, course_title: str = "") -> list[dict]:
+                             *, course_title: str = "", terms: list[str] | None = None) -> list[dict]:
         """One optional review call, using the existing first provider/model."""
         provider = self.providers[0]
         try:
@@ -141,9 +142,40 @@ class Summarizer:
                 self._clients[provider["name"]], provider["models"][0],
                 windows, ppt_pages, excluded,
                 disable_thinking=provider["name"] == "deepseek",
-                terms=course_terms(course_title),
+                terms=terms if terms is not None else course_terms(course_title),
             )
         except Exception as exc:
             print(f"[ASR review] Unavailable ({type(exc).__name__}); "
                   "keeping local transcription.")
             return []
+
+    def summarize_with_keywords(self, title, content, sources, terms):
+        """One summary request also returns separately validated keyword metadata."""
+        from src.ai.automatic_glossary import INSTRUCTION, validated_keywords
+        errors=[]
+        for provider in self.providers:
+            client=self._clients[provider['name']]
+            for model in provider['models']:
+                try:
+                    options = ({'extra_body':{'thinking':{'type':'enabled'}},
+                                'reasoning_effort':'high','max_tokens':64000}
+                               if provider['name']=='deepseek' else {})
+                    response=client.chat.completions.create(model=model,
+                        messages=[{'role':'system','content':self.system_prompt+'\n\n'+INSTRUCTION},
+                                  {'role':'user','content':json.dumps({'course':title,'material':content,
+                                    'evidence_sources':{'asr':'material中的ASR/转写原文',
+                                      'ppt':'material中的PPT/OCR原文','cloud':sources.get('cloud',[])},
+                                    'historical_terms':terms[:30]},ensure_ascii=False)}],
+                        response_format={'type':'json_object'},timeout=600,**options)
+                    if not response.choices or response.choices[0].finish_reason!='stop':
+                        raise ValueError('Incomplete structured summary')
+                    data=json.loads(response.choices[0].message.content)
+                    summary=data.get('summary')
+                    if not isinstance(summary,str) or not summary.strip():
+                        raise ValueError('Empty structured summary')
+                    keywords=validated_keywords(data.get('keywords',[]),sources,summary)
+                    summary=enrich_summary(summary,api_key=config.TAVILY_API_KEY,client=client,model=model)
+                    return summary, f"{provider['name']}/{model}", keywords
+                except Exception as error:
+                    errors.append(type(error).__name__)
+        raise RuntimeError('Structured summary failed: '+','.join(errors))

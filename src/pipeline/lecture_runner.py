@@ -1,8 +1,8 @@
 """Per-lecture state machine: prefetch → ASR → OCR drain → summarize → release.
 
 One ``LectureRunner`` instance drives one lecture from "started" to either
-"summary saved" or "deliberately skipped".  The class is single-use — make a
-new instance per lecture so error state can't leak across runs.
+"summary saved" or "deliberately skipped". Instances may be reused; all
+lecture-specific evidence and budgets are reset before each run.
 
 Phases (named like the original ``main.process_lecture`` for diff-friendly
 log greps):
@@ -41,6 +41,11 @@ threads pick up refreshed cookies through the shared ``ICourseClient``.
 from __future__ import annotations
 
 import time
+import os
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
@@ -83,6 +88,10 @@ class LectureRunner:
         self._summarizer = summarizer
         self._reporter = reporter
         self._ppt = PPTPipeline(db, scheduler, reporter)
+        self._reset_lecture_state()
+
+    def _reset_lecture_state(self):
+        """Keep evidence, terminology and cloud budgets within one lecture."""
         self._transcript_source = "unknown"
         self._asr_actual_duration = 0.0
         self._asr_expected_duration = 0.0
@@ -90,11 +99,17 @@ class LectureRunner:
         self._cloud_windows = set()
         self._cloud_failed = False
         self._asr_audio_path = None
+        self._automatic_glossary = None
+        self._historical_terms = []
+        self._cloud_term_sources = []
+        self._qwen_review_material = {}
 
     # ── Public entry point ──────────────────────────────────────────────
 
     def run(self, course_id: str, course_title: str, lecture: dict,
-            next_info: Optional[tuple[str, str]] = None) -> Optional[str]:
+            next_info: Optional[tuple[str, str]] = None, *,
+            prepared_asr: dict | None = None, review_state: dict | None = None,
+            checkpoint=None, prepared_ppt: bool = False) -> Optional[str]:
         """Process one lecture.  Returns the summary text or None.
 
         ``next_info``: ``(course_id, sub_id)`` of the next lecture, used to
@@ -102,19 +117,42 @@ class LectureRunner:
         lecture in the batch.
         """
         sub_id = str(lecture["sub_id"])
+        self._reset_lecture_state()
+        self._homework_course_id = str(course_id)
+        self._homework_sub_id = sub_id
+        self._prepared_asr = prepared_asr
+        self._review_state = review_state
+        self._checkpoint = checkpoint
+        if prepared_asr is not None:
+            from src.pipeline.prepared_lecture import validate_material
+            validate_material(prepared_asr, course_id, sub_id)
+        if review_state is not None:
+            from src.ai.qwen_review_ledger import validate_ledger
+            validate_ledger(review_state)
+            self._qwen_review_material = review_state.get('material', {})
+            self._cloud_term_sources = [v['cloud_text'] for v in self._qwen_review_material.get('variants', [])]
+            self._cloud_seconds = review_state.get('seconds', 0)
+            self._cloud_failed = review_state.get('failed', False)
+            self._cloud_windows = {(a['interval']['start_ms'], a['interval']['end_ms'])
+                                   for a in review_state.get('attempts', [])}
+        self._transcriber.reset_lecture_state()
+        if os.environ.get('AUTO_COURSE_TERMS','').lower() == 'true':
+            from src.ai.automatic_glossary import AutomaticGlossary
+            from src.ai.course_glossary import course_terms
+            self._automatic_glossary = AutomaticGlossary(self._db,course_id)
+            automatic = self._automatic_glossary.terms(exclude_sub_id=sub_id)
+            self._historical_terms = list(dict.fromkeys(automatic+course_terms(course_title)))[:30]
+        from src.ai.course_glossary import course_terms
+        self._transcriber.set_terms(self._historical_terms or course_terms(course_title))
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
-        self._transcript_source = "unknown"
-        self._asr_actual_duration = 0.0
-        self._asr_expected_duration = 0.0
-        self._cloud_seconds = 0.0
-        self._cloud_windows = set()
-        self._cloud_failed = False
-        self._asr_audio_path = None
         self._reporter.lecture_start(course_title, sub_title, date)
 
         existing = self._db.get_lecture(sub_id)
+        if existing and existing.get('deleted_at'):
+            self._schedule_next(next_info)
+            return None
         # ── Phase A — short-circuit if a summary already exists ─────────
         if self._has_summary(existing):
             self._reporter.lecture_skip_v2_done(
@@ -132,9 +170,13 @@ class LectureRunner:
         # ── Phase B — submit PPT pipeline (fetch + dedup, no OCR yet) ──
         # OCR is deferred (defer_ocr=True) so ASR in Phase D gets exclusive
         # CPU.  OCR will be submitted in Phase E (handle.drain()).
-        ppt_handle = self._ppt.submit(
-            self._client, course_id, sub_id, defer_ocr=True,
-        )
+        if prepared_asr is not None or prepared_ppt:
+            from types import SimpleNamespace
+            ppt_handle = SimpleNamespace(drain=lambda: SimpleNamespace(failed=0))
+        else:
+            ppt_handle = self._ppt.submit(
+                self._client, course_id, sub_id, defer_ocr=True,
+            )
 
         # ── Phase C — schedule next lecture's prefetch ─────────────────
         # Done BEFORE ASR so the next audio download can start filling its
@@ -308,9 +350,19 @@ class LectureRunner:
                         sub_id: str) -> tuple[Optional[str], Optional[list]]:
         """Return (transcript, segments) or (None, None) on skip.
 
-        Cloud ASR takes priority; a failure uses local ASR on the same audio.
+        Local ASR takes priority; cloud rescue only reviews selected windows.
         Official subtitles are never used as the main transcript.
         """
+        prepared = getattr(self, '_prepared_asr', None)
+        if prepared is not None:
+            self._transcript_source = 'local_asr'
+            self._asr_actual_duration = prepared['audio_seconds']
+            self._asr_expected_duration = prepared.get('media_seconds') or 0.0
+            self._asr_audio_path = prepared.get('audio_path')
+            self._transcriber.last_chunks = prepared['full_chunks']
+            self._transcriber.last_vad_windows = prepared['vad_windows']
+            self._transcriber.set_terms(prepared['recognition_terms'])
+            return prepared['transcript'], prepared['segments']
         if existing and existing.get("transcript"):
             self._transcript_source = "cached"
             self._reporter.info(
@@ -380,7 +432,9 @@ class LectureRunner:
                 if weak:
                     rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
                         handle.path, config.DOUBAO_ASR_API_KEY, weak,
+                        **({'hotwords':self._historical_terms} if self._automatic_glossary else {}),
                     )
+                    self._cloud_term_sources.extend(s['text'] for _,result in rescues for s in result)
                     self._cloud_seconds = attempted
                     self._cloud_failed = failed
                     self._cloud_windows.update(
@@ -448,21 +502,30 @@ class LectureRunner:
         """Let the LLM propose existing speech windows within remaining quota."""
         remaining = MAX_CLOUD_SECONDS - self._cloud_seconds
         clips_left = MAX_CLOUD_CLIPS - len(self._cloud_windows)
+        if (getattr(self, '_prepared_asr', None) is not None
+                and getattr(self, '_review_state', None) is not None):
+            return self._refine_qwen(transcript, segments, ppt_pages, remaining, clips_left)
         if (not config.DOUBAO_ASR_API_KEY or self._cloud_failed
                 or not self._asr_audio_path or remaining <= 0 or clips_left <= 0
                 or self._transcript_source not in ("local_asr", "hybrid_asr")
                 or len(transcript.strip()) < 200):
             return transcript, segments
+        chunks=getattr(self._transcriber,'last_chunks',None)
+        if isinstance(chunks,list) and chunks:
+            return self._refine_qwen(transcript,segments,ppt_pages,remaining,clips_left)
+        options = {'terms':self._historical_terms} if self._automatic_glossary else {}
         suspects = self._summarizer.find_unclear_windows(
             self._transcriber.last_speech_windows, ppt_pages, self._cloud_windows,
-            course_title=course_title,
+            course_title=course_title, **options,
         )
         if not suspects:
             return transcript, segments
         rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
             self._asr_audio_path, config.DOUBAO_ASR_API_KEY, suspects,
             max_seconds=remaining, max_clips=clips_left,
+            **({'hotwords':self._historical_terms} if self._automatic_glossary else {}),
         )
+        self._cloud_term_sources.extend(s['text'] for _,result in rescues for s in result)
         self._cloud_seconds += attempted
         self._cloud_failed = failed
         merged = merge_rescued_segments(segments or [], rescues)
@@ -476,6 +539,69 @@ class LectureRunner:
         )
         return " ".join(segment["text"] for segment in merged), merged
 
+    def _refine_qwen(self, transcript, segments, ppt_pages, remaining, clips_left):
+        """Exact quotes + whole-block alignment; uncertain variants stay separate."""
+        from scripts.qwen_quality import review_quality
+        from scripts.qwen_audio_alignment import align_suspects
+        if getattr(self, '_review_state', None) is not None:
+            from src.ai.qwen_review_ledger import review_prepared
+            material = review_prepared(self._prepared_asr, ppt_pages, self._summarizer,
+                                       self._review_state, self._checkpoint, homework_ocr=self._homework_visual)
+            self._qwen_review_material = material
+            self._cloud_term_sources = [v['cloud_text'] for v in material.get('variants', [])]
+            self._cloud_seconds = self._review_state.get('seconds', 0)
+            self._cloud_failed = self._review_state.get('failed', False)
+            weak = material.get('weak_rescues', [])
+            if weak:
+                segments = merge_rescued_segments(segments or [], weak)
+                transcript = ' '.join(s['text'] for s in segments)
+                self._transcript_source = 'hybrid_asr'
+                self._prepared_asr['transcript'] = transcript
+                self._prepared_asr['segments'] = segments
+                self._cloud_term_sources.extend(s['text'] for _, result in weak for s in result)
+            return transcript, segments
+        try:
+            report={'full_chunks':self._transcriber.last_chunks,
+                    'vad_windows':self._transcriber.last_vad_windows}
+            provider=self._summarizer.providers[0]
+            selected=review_quality(self._summarizer._clients[provider['name']],provider['models'][0],
+                report,{'ppt':ppt_pages},max_suspects=min(MAX_CLOUD_CLIPS,clips_left),input_budget=96000)
+            if not selected: return transcript,segments
+            with tempfile.TemporaryDirectory(prefix='icourse-qwen-align-') as tmp:
+                wav=Path(tmp)/'speech.wav'
+                subprocess.run(['ffmpeg','-nostdin','-v','error','-f','f32le','-ar','16000','-ac','1',
+                    '-i',self._asr_audio_path,'-y',str(wav)],stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,check=True,timeout=120)
+                intervals,located,unresolved,_=align_suspects(report,selected,wav,lambda _:None,budget=remaining)
+            rescues,attempted,failed=doubao_asr.rescue_intervals_pcm(self._asr_audio_path,
+                config.DOUBAO_ASR_API_KEY,intervals,max_seconds=remaining,max_clips=clips_left,
+                hotwords=self._historical_terms or self._transcriber._terms)
+            self._cloud_seconds+=attempted;self._cloud_failed=failed
+            variants=[]
+            for interval,result in rescues:
+                if not any(s['start_ms']<interval['quote_end_ms'] and interval['quote_start_ms']<s['end_ms'] for s in result):
+                    continue
+                cloud=' '.join(s['text'] for s in result)
+                self._cloud_term_sources.append(cloud)
+                variants.append({'original_quote':interval['text'],'cloud_text':cloud})
+            self._qwen_review_material={'variants':variants,'unresolved':unresolved}
+            self._reporter.info(f'    [Qwen review] located={len(located)}, unresolved={len(unresolved)}, cloud={attempted:.1f}s')
+        except Exception as error:
+            self._reporter.info(f'    [WARN] Qwen review unavailable: {type(error).__name__}; preserving local text')
+        return transcript,segments
+
+    def _homework_visual(self, candidates, intervals):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = self._client
+        if client is None:
+            # The gather runner normally needs no login. Create a scoped
+            # read-only session only when assignment evidence was detected.
+            from main import login_with_retry
+            from src.api.icourse import ICourseClient
+            client = ICourseClient(login_with_retry())
+        return collect_visual_evidence(client, self._homework_course_id, self._homework_sub_id,
+                                       candidates, intervals)
+
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
         try:
@@ -483,18 +609,43 @@ class LectureRunner:
             prompt_text, mode = bucketer.assemble(
                 transcript, transcript_segments, kept_pages,
             )
+            if getattr(self, '_prepared_asr', None) and self._prepared_asr.get('official_support'):
+                prompt_text += ('\n\n官方字幕辅助材料（低可信度；不得覆盖 Qwen 转写，不得据此补写未识别的课堂内容）：\n'
+                                +json.dumps(self._prepared_asr['official_support'], ensure_ascii=False))
+            if self._qwen_review_material:
+                general_review = {k: v for k, v in self._qwen_review_material.items() if k != 'homework'}
+                prompt_text += ('\n\n局部云端复核版本（不保证正确，不得无条件替换原文；未解决疑点不得编造）：\n'
+                                +json.dumps(general_review,ensure_ascii=False))
+            from src.ai.homework_review import assignment_candidates, prioritize_candidates, homework_prompt, ensure_homework_notice
+            homework = self._qwen_review_material.get('homework', {})
+            if not homework.get('candidates'):
+                chunks = (getattr(self, '_prepared_asr', None) or {}).get('full_chunks') or getattr(self._transcriber, 'last_chunks', [])
+                if isinstance(chunks, list):
+                    homework = {'candidates': prioritize_candidates(assignment_candidates(chunks)), 'review_unavailable': True}
+            prompt_text += homework_prompt(homework)
             self._reporter.info(
                 f"    [Time] Generating summary at "
                 f"{time.strftime('%H:%M:%S')}"
                 f" — mode={mode}, prompt={len(prompt_text)} chars"
             )
-            summary, model_used = self._summarizer.summarize(
-                course_title, prompt_text,
-            )
+            keywords = []
+            if self._automatic_glossary:
+                sources={'asr':[transcript], 'ppt':[p['text'] for p in kept_pages if p.get('text')],
+                         'cloud':self._cloud_term_sources}
+                summary, model_used, keywords = self._summarizer.summarize_with_keywords(
+                    course_title,prompt_text,sources,self._historical_terms)
+            else:
+                summary, model_used = self._summarizer.summarize(course_title, prompt_text)
+            summary = ensure_homework_notice(summary, homework)
             self._reporter.info(
                 f"    [OK] Summary by {model_used}: {len(summary)} chars"
             )
             self._db.update_summary(sub_id, summary, model_used)
+            if self._automatic_glossary:
+                try:
+                    self._automatic_glossary.save(sub_id,keywords)
+                except Exception as error:
+                    self._reporter.info(f'    [WARN] Keyword metadata not saved: {type(error).__name__}')
             return summary
         except Exception as e:
             self._reporter.info(

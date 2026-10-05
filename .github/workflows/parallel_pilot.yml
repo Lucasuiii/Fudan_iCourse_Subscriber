@@ -1,0 +1,247 @@
+name: iCourse Parallel Pilot
+'on':
+  push:
+    branches:
+    - codex/qwen-production-pilot
+    paths:
+    - .github/workflows/parallel_pilot.yml
+  workflow_dispatch:
+    inputs:
+      validation_course_id:
+        description: Only validate this course's latest playable lecture (requires no publication or email)
+        type: string
+        default: ''
+      automatic_terms:
+        description: Enable evidence-bounded automatic glossary
+        type: boolean
+        default: false
+      shard_mode:
+        description: Two runners by default; auto uses three above 60 speech minutes
+        type: choice
+        options:
+        - '2'
+        - auto
+        default: '2'
+      publish_results:
+        description: Publish encrypted lecture results to the data branch
+        type: boolean
+        default: false
+      send_email:
+        description: Send course emails after publication (requires publish_results)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      validation_course_id:
+        type: string
+        default: ''
+      automatic_terms:
+        type: boolean
+        default: false
+      shard_mode:
+        type: string
+        default: '2'
+      publish_results:
+        type: boolean
+        default: false
+      send_email:
+        type: boolean
+        default: false
+      caller_holds_lock:
+        type: boolean
+        default: false
+    secrets:
+      DB_ENCRYPTION_KEY:
+        required: true
+      STUID:
+        required: true
+      UISPSW:
+        required: true
+      COURSE_IDS:
+        required: true
+      DOUBAO_ASR_API_KEY:
+        required: false
+      TAVILY_API_KEY:
+        required: false
+      DASHSCOPE_API_KEY:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      DEEPSEEK_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      DASHSCOPE_BASE_URL:
+        required: false
+      DEEPSEEK_BASE_URL:
+        required: false
+      GEMINI_BASE_URL:
+        required: false
+      COURSE_SESSION_RULES:
+        required: false
+      COURSE_SESSION_OVERRIDE_DATES:
+        required: false
+      SMTP_EMAIL:
+        required: false
+      RECEIVER_EMAILS:
+        required: false
+      RECEIVER_EMAIL:
+        required: false
+permissions:
+  actions: read
+  contents: write
+concurrency:
+  group: ${{ github.event_name == 'push' && format('icourse-registration-{0}', github.run_id)
+    || inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
+    || format('icourse-data-{0}', github.repository) }}
+  cancel-in-progress: false
+jobs:
+  register:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+    - run: echo 'Manual pilot entry registered; no classroom processing on push'
+  plan:
+    if: ${{ github.event_name != 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      QWEN_PRODUCTION_TASK: 'true'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      SEND_EMAIL: ${{ inputs.send_email }}
+    outputs:
+      tasks: ${{ steps.plan.outputs.tasks }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - name: plan
+      run: python -m scripts.production_qwen plan
+      id: plan
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-queue
+        path: ${{ runner.temp }}/qwen-shards/out/queue.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() && inputs.validation_course_id != '' }}
+      with:
+        name: qwen-validation-selection
+        path: ${{ runner.temp }}/qwen-shards/out/validation-selection.json
+        retention-days: 7
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  lecture:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.tasks) }}
+    uses: ./.github/workflows/qwen_production_lecture.yml
+    with:
+      task_slot: ${{ matrix.task_slot }}
+      automatic_terms: ${{ inputs.automatic_terms }}
+      shard_mode: ${{ inputs.shard_mode }}
+      publish_results: ${{ inputs.publish_results }}
+    secrets:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      STUID: ${{ secrets.STUID }}
+      UISPSW: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+      DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+      GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
+  finalize:
+    needs:
+    - plan
+    - lecture
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      QWEN_PRODUCTION_TASK: 'true'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      SEND_EMAIL: ${{ inputs.send_email }}
+      SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+      RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+      RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - uses: actions/download-artifact@v4
+      with:
+        name: qwen-production-queue
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - name: finalize
+      run: python -m scripts.production_qwen finalize
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-mail-receipts
+        path: ${{ runner.temp }}/qwen-shards/out/receipts.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-catalog
+        path: ${{ runner.temp }}/qwen-shards/out/catalog.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}

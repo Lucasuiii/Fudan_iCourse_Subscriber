@@ -1,56 +1,22 @@
 name: Qwen ASR CPU Benchmark
-
-on:
-  workflow_dispatch:
-    inputs:
-      public_sample:
-        description: 'Use Qwen official public sample to isolate CPU feasibility from iCourse networking'
-        type: boolean
-        default: false
-      full_lecture:
-        description: 'Test the entire authorized lecture (maximum 3 hours), with VAD; no production changes'
-        type: boolean
-        default: false
-      long_chunk_sample:
-        description: 'One bounded sample with approximately 2-minute pause-aware chunks'
-        type: boolean
-        default: false
-      sample_minutes:
-        description: 'Authorized sample duration, starting at the private request offset'
-        type: choice
-        options:
-          - '10'
-          - '30'
-        default: '10'
-      quality_sample:
-        description: 'Long-chunk sample only: one DeepSeek review and at most 120s Doubao rescue; no overwrite'
-        type: boolean
-        default: false
-      latest_lecture:
-        description: 'Select the private course latest non-future lecture for an isolated test'
-        type: boolean
-        default: false
-      generate_summary:
-        description: 'Generate one encrypted test summary, without database writes or email'
-        type: boolean
-        default: false
-      reuse_run_id:
-        description: 'Optional prior encrypted 10-minute quality artifact: rerun alignment/rescue only'
-        type: string
-        default: ''
-
 permissions:
   contents: read
   actions: read
-
 concurrency:
-  group: qwen-asr-benchmark
+  group: icourse-data-${{ github.repository }}
   cancel-in-progress: false
-
 jobs:
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.full_lecture && 300 || inputs.sample_minutes == '30' && 90 || 60 }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        slot: ${{ fromJSON(inputs.course_slots == 'pair' && '[0,1]' || inputs.course_slots == '0' && '[0]' || inputs.course_slots == '1' && '[1]' || '[-1]') }}
+    concurrency:
+      group: qwen-asr-benchmark-slot-${{ matrix.slot }}
+      cancel-in-progress: false
     env:
       HF_HUB_DISABLE_TELEMETRY: '1'
       TOKENIZERS_PARALLELISM: 'false'
@@ -61,106 +27,168 @@ jobs:
       QUALITY_SAMPLE: ${{ inputs.quality_sample }}
       REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
       SAMPLE_MINUTES: ${{ inputs.sample_minutes }}
+      RUNTIME_SAMPLE: ${{ inputs.runtime_sample }}
       LATEST_LECTURE: ${{ inputs.latest_lecture }}
       GENERATE_SUMMARY: ${{ inputs.generate_summary }}
+      TEST_COURSE_SLOT: ${{ matrix.slot }}
     steps:
-      - name: Validate isolated test mode
-        env:
-          PUBLIC_SAMPLE: ${{ inputs.public_sample }}
-        run: |
-          if [ "$PUBLIC_SAMPLE" = true ] && [ "$FULL_LECTURE" = true ]; then
-            exit 1
+    - name: Validate isolated test mode
+      env:
+        PUBLIC_SAMPLE: ${{ inputs.public_sample }}
+      run: |
+        if [ "$PUBLIC_SAMPLE" = true ] && [ "$FULL_LECTURE" = true ]; then
+          exit 1
+        fi
+        if [ "$LONG_CHUNK_SAMPLE" = true ] && { [ "$FULL_LECTURE" = true ] || [ "$PUBLIC_SAMPLE" = true ]; }; then
+          exit 1
+        fi
+        if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ] && [ "$FULL_LECTURE" != true ]; then
+          exit 1
+        fi
+        if [ "$SAMPLE_MINUTES" = 30 ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
+          exit 1
+        fi
+        if [ "$LATEST_LECTURE" = true ]; then
+          { [ "$LONG_CHUNK_SAMPLE" = true ] || [ "$FULL_LECTURE" = true ]; } && [ "$QUALITY_SAMPLE" = true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+        fi
+        if [ "$GENERATE_SUMMARY" = true ]; then
+          [ "$QUALITY_SAMPLE" = true ] && [ "$PUBLIC_SAMPLE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+        fi
+        if [ -n "$REUSE_RUN_ID" ]; then
+          [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$QUALITY_SAMPLE" = true ] || exit 1
+        fi
+
+        if [ "$RUNTIME_SAMPLE" = true ]; then
+          [ "$LONG_CHUNK_SAMPLE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+          if [ "$PUBLIC_SAMPLE" = true ]; then
+            [ "$FULL_LECTURE" != true ] && [ "$QUALITY_SAMPLE" != true ] && [ "$GENERATE_SUMMARY" != true ] && [ "$LATEST_LECTURE" != true ] || exit 1
+          else
+            [ "$FULL_LECTURE" = true ] || exit 1
           fi
-          if [ "$LONG_CHUNK_SAMPLE" = true ] && { [ "$FULL_LECTURE" = true ] || [ "$PUBLIC_SAMPLE" = true ]; }; then
-            exit 1
-          fi
-          if [ "$QUALITY_SAMPLE" = true ] && [ "$LONG_CHUNK_SAMPLE" != true ] && [ "$FULL_LECTURE" != true ]; then
-            exit 1
-          fi
-          if [ "$SAMPLE_MINUTES" = 30 ] && [ "$LONG_CHUNK_SAMPLE" != true ]; then
-            exit 1
-          fi
-          if [ "$LATEST_LECTURE" = true ]; then
-            { [ "$LONG_CHUNK_SAMPLE" = true ] || [ "$FULL_LECTURE" = true ]; } && [ "$QUALITY_SAMPLE" = true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
-          fi
-          if [ "$GENERATE_SUMMARY" = true ]; then
-            [ "$QUALITY_SAMPLE" = true ] && [ "$PUBLIC_SAMPLE" != true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
-          fi
-          if [ -n "$REUSE_RUN_ID" ]; then
-            [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]] && [ "$QUALITY_SAMPLE" = true ] || exit 1
-          fi
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install private audio acquisition dependencies
-        run: |
-          python -m pip install requests pycryptodome cryptography
-          if [ "$QUALITY_SAMPLE" = true ]; then
-            python -m pip install rapidocr-onnxruntime Pillow openai
-          fi
-          if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y ffmpeg
-          fi
-      - name: Fetch only the authorized test slice
-        if: ${{ !inputs.public_sample }}
-        env:
-          StuId: ${{ secrets.STUID }}
-          UISPsw: ${{ secrets.UISPSW }}
-          QWEN_ASR_TEST_REQUEST: ${{ secrets.QWEN_ASR_TEST_REQUEST }}
-          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-        run: python -m scripts.benchmark_qwen_asr fetch
-      - name: Install isolated CPU inference dependencies
-        run: |
-          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install qwen-asr==0.0.6 --no-deps
-          python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa soundfile qwen-omni-utils sox sherpa-onnx
-      - name: Download public SenseVoice baseline
-        if: ${{ !inputs.full_lecture && !inputs.long_chunk_sample }}
-        run: |
-          curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2 -o "$RUNNER_TEMP/sensevoice.tar.bz2"
-          tar xf "$RUNNER_TEMP/sensevoice.tar.bz2" -C "$RUNNER_TEMP"
-      - name: Download public speech detector
-        if: ${{ (inputs.full_lecture || inputs.long_chunk_sample) && inputs.reuse_run_id == '' }}
-        run: curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
-      - name: Run Qwen 1.7B on CPU and encrypt the comparison
-        if: ${{ inputs.reuse_run_id == '' }}
-        env:
-          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-          PUBLIC_SAMPLE: ${{ inputs.public_sample }}
-        run: python -m scripts.benchmark_qwen_asr infer
-      - name: Restore encrypted prior quality result only
-        if: ${{ inputs.reuse_run_id != '' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: qwen-asr-encrypted-result
-          path: ${{ runner.temp }}/qwen-benchmark
-          run-id: ${{ inputs.reuse_run_id }}
-          github-token: ${{ github.token }}
-      - name: Review references and rescue bounded suspect speech without overwriting
-        if: ${{ inputs.quality_sample }}
-        env:
-          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
-        run: python -m scripts.benchmark_qwen_asr review
-      - name: Generate encrypted isolated lecture summary
-        if: ${{ inputs.generate_summary }}
-        env:
-          QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: python -m scripts.benchmark_qwen_asr summary
-      - name: Save encrypted test result only
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen-asr-encrypted-result
-          path: ${{ runner.temp }}/qwen-benchmark/result.enc
-          if-no-files-found: ignore
-          retention-days: 1
-      - name: Remove private runner files
-        if: always()
-        run: python -m scripts.benchmark_qwen_asr clean
+        fi
+        if [ "$TEST_COURSE_SLOT" != -1 ]; then
+          [ "$PUBLIC_SAMPLE" != true ] && [ "$FULL_LECTURE" = true ] && [ "$RUNTIME_SAMPLE" = true ] && [ "$LATEST_LECTURE" = true ] && [ -z "$REUSE_RUN_ID" ] || exit 1
+        fi
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install private audio acquisition dependencies
+      run: |
+        python -m pip install requests pycryptodome cryptography
+        if [ "$QUALITY_SAMPLE" = true ]; then
+          python -m pip install rapidocr-onnxruntime Pillow openai
+        fi
+        if ! command -v ffmpeg >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+        fi
+    - name: Fetch only the authorized test slice
+      if: ${{ !inputs.public_sample }}
+      env:
+        StuId: ${{ secrets.STUID }}
+        UISPsw: ${{ secrets.UISPSW }}
+        QWEN_ASR_TEST_REQUEST: ${{ secrets.QWEN_ASR_TEST_REQUEST }}
+        QWEN_ASR_TEST_REQUESTS: ${{ secrets.QWEN_ASR_TEST_REQUESTS }}
+        QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+      run: python -m scripts.benchmark_qwen_asr fetch
+    - name: Install isolated CPU inference dependencies
+      run: |
+        python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install qwen-asr==0.0.6 --no-deps
+        python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa soundfile qwen-omni-utils sox sherpa-onnx
+    - name: Download public speech detector
+      if: ${{ (inputs.full_lecture || inputs.long_chunk_sample || inputs.runtime_sample) && inputs.reuse_run_id == '' }}
+      run: curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
+    - name: Run Qwen 1.7B on CPU and encrypt the comparison
+      if: ${{ inputs.reuse_run_id == '' }}
+      env:
+        SILERO_VAD_PATH: ${{ runner.temp }}/silero_vad.onnx
+        QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+        PUBLIC_SAMPLE: ${{ inputs.public_sample }}
+      run: python -m scripts.benchmark_qwen_asr infer
+    - name: Restore encrypted prior quality result only
+      if: ${{ inputs.reuse_run_id != '' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: qwen-asr-encrypted-result
+        path: ${{ runner.temp }}/qwen-benchmark
+        run-id: ${{ inputs.reuse_run_id }}
+        github-token: ${{ github.token }}
+    - name: Review references and rescue bounded suspect speech without overwriting
+      if: ${{ inputs.quality_sample }}
+      env:
+        QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+      run: python -m scripts.benchmark_qwen_asr review
+    - name: Generate encrypted isolated lecture summary
+      if: ${{ inputs.generate_summary }}
+      env:
+        QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      run: python -m scripts.benchmark_qwen_asr summary
+    - name: Save encrypted test result only
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.slot != -1 && format('qwen-asr-encrypted-result-{0}', matrix.slot) || 'qwen-asr-encrypted-result' }}
+        path: ${{ runner.temp }}/qwen-benchmark/result.enc
+        if-no-files-found: ignore
+        retention-days: 1
+    - name: Remove private runner files
+      if: always()
+      run: python -m scripts.benchmark_qwen_asr clean
+'on':
+  workflow_dispatch:
+    inputs:
+      course_slots:
+        description: 'Private full-runtime slots: pair concurrently, or retry only 0/1; legacy uses the single-request Secret'
+        type: choice
+        options:
+        - legacy
+        - pair
+        - '0'
+        - '1'
+        default: legacy
+      public_sample:
+        description: Use Qwen official public sample to isolate CPU feasibility from iCourse networking
+        type: boolean
+        default: false
+      runtime_sample:
+        description: 'Actual production recognizer: public smoke or an authorized full lecture'
+        type: boolean
+        default: false
+      full_lecture:
+        description: Test the entire authorized lecture (maximum 3 hours), with VAD; no production changes
+        type: boolean
+        default: false
+      long_chunk_sample:
+        description: One bounded sample with approximately 2-minute pause-aware chunks
+        type: boolean
+        default: false
+      sample_minutes:
+        description: Authorized sample duration, starting at the private request offset
+        type: choice
+        options:
+        - '10'
+        - '30'
+        default: '10'
+      quality_sample:
+        description: 'One review; Doubao capped at 120s for samples or 600s/20 clips for full lectures'
+        type: boolean
+        default: false
+      latest_lecture:
+        description: Select the private course latest playable non-future recording for an isolated test
+        type: boolean
+        default: false
+      generate_summary:
+        description: Generate one encrypted test summary, without database writes or email
+        type: boolean
+        default: false
+      reuse_run_id:
+        description: 'Optional prior encrypted 10-minute quality artifact: rerun alignment/rescue only'
+        type: string
+        default: ''

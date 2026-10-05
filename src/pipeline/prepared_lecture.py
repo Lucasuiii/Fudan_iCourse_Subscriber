@@ -1,0 +1,77 @@
+"""Validated cross-runner material at the normal LectureRunner boundary."""
+from __future__ import annotations
+import hashlib
+import math
+from scripts.qwen_sharding import validate_plan, validate_result, fingerprint
+from scripts.qwen_segmentation import deduplicated_chunk_rows
+
+
+def assemble_material(plan, results, *, audio_path=None, media_seconds=None):
+    validate_plan(plan)
+    if len(results) != len(plan['shards']):
+        raise ValueError('All planned ASR shards must finish before finalization')
+    seen, rows = set(), []
+    for result in results:
+        shard = result['shard_id']
+        if shard in seen:
+            raise ValueError('Duplicate ASR shard')
+        validate_result(plan, result, shard, require_complete=True)
+        seen.add(shard)
+        rows.extend(result['chunks'])
+    rows.sort(key=lambda row: row['chunk_id'])
+    clean = deduplicated_chunk_rows(rows)
+    material = dict(selection=plan['selection'], plan_hash=fingerprint(plan), complete=True,
+                    audio_seconds=plan['audio_seconds'], media_seconds=media_seconds,
+                    audio_sha256=plan['audio_sha256'], recognition_terms=plan['recognition_terms'],
+                    full_chunks=rows, vad_windows=plan['vad_windows'], audio_path=audio_path,
+                    weak_windows=[{'start_ms': round(max(a, r['start'])*1000),
+                                   'end_ms': round(min(b, r['end'])*1000), 'text': r['text']}
+                                  for r in rows for a,b in plan['vad_windows']
+                                  if min(b,r['end']) > max(a,r['start'])],
+                    transcript='\n'.join(row['text'] for row in clean),
+                    segments=[dict(start_ms=round(row['start']*1000), end_ms=round(row['end']*1000),
+                                   text=row['text']) for row in clean])
+    validate_material(material, plan['selection']['course_id'], plan['selection']['sub_id'])
+    return material
+
+
+def validate_material(material, course_id, sub_id):
+    if (material.get('complete') is not True
+            or any(str(material.get('selection', {}).get(k)) != str(v)
+                   for k, v in [('course_id', course_id), ('sub_id', sub_id)])
+            or not isinstance(material.get('transcript'), str)
+            or not isinstance(material.get('segments'), list)
+            or not isinstance(material.get('full_chunks'), list)
+            or not isinstance(material.get('vad_windows'), list)
+            or not isinstance(material.get('recognition_terms'), list)):
+        raise ValueError('Invalid prepared lecture identity or material')
+    duration = material.get('audio_seconds')
+    if not isinstance(duration, (float, int)) or not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Invalid prepared audio duration')
+    expected = material.get('media_seconds') or 0
+    # The production downloader has no three-hour sampling cap. Reject a
+    # substantial known shortfall rather than publish a partial classroom.
+    if expected > 0 and duration < expected - max(120, expected * .05):
+        raise ValueError('Prepared audio is incomplete relative to media duration')
+    for segment in material['segments']:
+        if (not isinstance(segment.get('text'), str)
+                or not 0 <= segment['start_ms'] < segment['end_ms'] <= round(duration*1000)):
+            raise ValueError('Prepared segment changed the source timeline')
+
+
+def cached_material(db, lecture):
+    """Only a transcript tied to saved complete timeline metadata is reusable."""
+    import json
+    raw = db.read_meta('qwen_pipeline:' + str(lecture['sub_id']))
+    if not raw or not lecture.get('transcript'):
+        return None
+    metadata = json.loads(raw)
+    if 'material' not in metadata:
+        return None
+    material = metadata['material']
+    digest = hashlib.sha256(lecture['transcript'].encode()).hexdigest()
+    if digest != metadata['transcript_sha256']:
+        raise ValueError('Cached transcript differs from its verified checkpoint')
+    material['transcript'] = lecture['transcript']
+    validate_material(material, lecture['course_id'], lecture['sub_id'])
+    return material, metadata['review']

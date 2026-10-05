@@ -17,7 +17,7 @@ import uuid
 
 import requests
 
-from src.ai.segment_rescue import MAX_CLOUD_CLIPS, MAX_CLOUD_SECONDS
+from src.ai.segment_rescue import MAX_CLOUD_CLIPS, MAX_CLOUD_SECONDS, cloud_budget_limits
 
 
 BASE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel"
@@ -192,6 +192,7 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
                          max_seconds: float = MAX_CLOUD_SECONDS,
                          max_clips: int = MAX_CLOUD_CLIPS,
                          hotwords: list[str] | None = None,
+                         budget_profile: str = 'production',
                          ) -> tuple[list[tuple[dict, list[dict]]], float, bool]:
     """Recognize only selected short speech intervals.
 
@@ -206,9 +207,9 @@ def rescue_intervals_pcm(path: str, api_key: str, intervals: list[dict],
     rescues = []
     attempted = 0.0
     failed = False
-    max_seconds = min(MAX_CLOUD_SECONDS, max(0, max_seconds))
-    # Default production cap remains 10; isolated full-course trial may request 12.
-    max_clips = min(12, max(0, max_clips))
+    seconds_cap, clips_cap = cloud_budget_limits(budget_profile)
+    max_seconds = min(seconds_cap, max(0, max_seconds))
+    max_clips = min(clips_cap, max(0, max_clips))
     try:
         for interval in intervals:
             if len(rescues) >= max_clips:

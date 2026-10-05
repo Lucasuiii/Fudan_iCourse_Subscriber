@@ -32,6 +32,54 @@ def _load_runner_class():
 
 
 class LectureQualityGateIntegrationTests(unittest.TestCase):
+    def test_reused_runner_disables_glossary_without_retaining_previous_course_terms(self):
+        LectureRunner = _load_runner_class()
+        db = MagicMock()
+        # A cached summary must remain unchanged while state still resets.
+        db.get_lecture.return_value = {'summary': '历史摘要', 'emailed_at': 'already sent'}
+        transcriber = MagicMock()
+        runner = LectureRunner(MagicMock(), db, MagicMock(), transcriber,
+                               MagicMock(), MagicMock())
+        with patch('src.ai.automatic_glossary.AutomaticGlossary') as glossary, \
+             patch('src.ai.course_glossary.course_terms', side_effect=[['甲人工词'], ['乙人工词']]):
+            glossary.return_value.terms.return_value = ['甲自动词']
+            with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'true'}):
+                runner.run('10', '课程甲', {'sub_id': '1'})
+            with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'false'}):
+                runner.run('20', '课程乙', {'sub_id': '2'})
+        self.assertEqual(transcriber.set_terms.call_args.args[0], ['乙人工词'])
+        self.assertIsNone(runner._automatic_glossary)
+        db.update_summary.assert_not_called()
+
+    def test_reused_runner_does_not_feed_previous_review_into_next_summary(self):
+        LectureRunner = _load_runner_class()
+        db = MagicMock()
+        db.get_lecture.return_value = None
+        db.get_done_ppt_pages.return_value = []
+        db.get_ppt_status_counts.return_value = {}
+        summarizer = MagicMock()
+        summarizer.summarize.return_value = ('当前课摘要', 'test')
+        runner = LectureRunner(MagicMock(), db, MagicMock(), MagicMock(),
+                               summarizer, MagicMock())
+        runner._ppt = MagicMock()
+        runner._ppt.submit.return_value.drain.return_value = SimpleNamespace(failed=0)
+        runner._get_transcript = MagicMock(return_value=('当前课正文', []))
+
+        def review(text, segments, pages, **kwargs):
+            if not summarizer.summarize.called:
+                runner._qwen_review_material = {'variants': [{'cloud_text': '上课复核证据'}]}
+                runner._cloud_term_sources.append('上课术语证据')
+            return text, segments
+
+        runner._refine_unclear_transcript = review
+        with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'false'}):
+            runner.run('10', '课程甲', {'sub_id': '1'})
+            runner.run('20', '课程乙', {'sub_id': '2'})
+        first, second = summarizer.summarize.call_args_list
+        self.assertIn('上课复核证据', first.args[1])
+        self.assertNotIn('上课复核证据', second.args[1])
+        self.assertEqual(runner._cloud_term_sources, [])
+
     def test_vad_speech_with_empty_local_result_is_recorded_for_rescue(self):
         with patch.dict(sys.modules, {
             "sherpa_onnx": types.ModuleType("sherpa_onnx"),
@@ -43,15 +91,9 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         vad = SimpleNamespace(done=False, front=speech)
         vad.empty = lambda: vad.done
         vad.pop = lambda: setattr(vad, "done", True)
-        transcriber._vad = vad
-        transcriber._recognizer = MagicMock()
-        transcriber._recognizer.create_stream.return_value.result.text = ""
-        segments = []
-        transcriber._drain_segments(segments)
-        self.assertEqual(segments, [])
-        self.assertEqual(transcriber.last_speech_windows, [{
-            "start_ms": 1_000, "end_ms": 11_000, "text": "",
-        }])
+        windows=[]
+        transcriber._drain_vad(vad,windows)
+        self.assertEqual(windows,[(1.0,11.0)])
 
     def test_local_asr_returns_substantial_audio_despite_media_mismatch(self):
         with patch.dict(sys.modules, {
@@ -231,7 +273,7 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
             runner._refine_unclear_transcript(local[0]["text"], local, [],
                                               course_title="高等代数Ⅰ")
         self.assertEqual(rescue.call_args.kwargs,
-                         {"max_seconds": 30, "max_clips": 2})
+                     {"max_seconds": 30, "max_clips": 12})
         self.assertEqual(runner._cloud_seconds, 590)
         self.assertEqual(summarizer.find_unclear_windows.call_args.kwargs,
                          {"course_title": "高等代数Ⅰ"})

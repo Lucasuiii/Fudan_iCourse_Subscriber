@@ -19,6 +19,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
+from scripts.qwen_segmentation import reaches_acquisition_limit
 
 MODEL = "Qwen/Qwen3-ASR-1.7B"
 REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
@@ -27,16 +28,27 @@ WINDOWS = [(62.022, 76.128), (176.294, 187.328),
 TERMS = "数值算法与案例分析。术语：良态问题、病态问题、扰动、希尔伯特矩阵、Hilbert矩阵、逆矩阵、条件数、delta、范数。"
 
 
-def recognition_context():
+def recognition_context(course_title=None):
+    if course_title:
+        from src.ai.course_glossary import course_terms
+        terms = course_terms(course_title)
+        return '术语：' + '、'.join(terms) if terms else ''
     # New lecture topics are unknown; do not reuse previous lecture's hotwords.
-    return '数值算法与案例分析。' if os.environ.get('LATEST_LECTURE') == 'true' else TERMS
+    return '' if os.environ.get('LATEST_LECTURE') == 'true' else TERMS
+
+
+def review_hotwords(report, evidence):
+    """Reuse the selected course's hints, never the old numerical test terms."""
+    selection = report.get('selection') or evidence.get('selection') or {}
+    title = selection.get('course_title')
+    if title:
+        from src.ai.course_glossary import course_terms
+        return course_terms(title)
+    return [] if os.environ.get('LATEST_LECTURE') == 'true' else TERMS.split('术语：')[-1].rstrip('。').split('、')
 
 
 def latest_request(detail, request, today=None):
-    """Latest listed non-future lecture, NOT gated on playback_status.
-
-    If its playback cannot be resolved, fail rather than silently test older audio.
-    """
+    """Latest listed non-future lecture, NOT gated on playback_status."""
     today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
     candidates = []
     for lecture in detail.get('lectures', []):
@@ -54,9 +66,30 @@ def latest_request(detail, request, today=None):
         raise ValueError('No dated non-future lecture available')
     lecture = max(candidates, key=lambda item: item[:3])[3]
     return {**request, 'sub_id': str(lecture['sub_id']), 'offset': 0,
-            'duration': 1800, 'selection': {'course_title': detail.get('title'),
+            'duration': 1800, 'selection': {'course_id': request.get('course_id'), 'course_title': detail.get('title'),
              'sub_title': lecture.get('sub_title'), 'date': lecture['date'],
              'sub_id': str(lecture['sub_id']), 'offset': 0, 'duration': 1800}}
+
+
+def resolve_latest_playback(client, request, today=None):
+    """Find the newest real recording using the existing playback fallbacks."""
+    detail = client.get_course_detail(request['course_id'])
+    remaining = list(detail.get('lectures', []))
+    skipped = []
+    while remaining:
+        try:
+            selected = latest_request({**detail, 'lectures': remaining}, request, today)
+        except ValueError:
+            break
+        selected['selection']['skipped_unavailable'] = list(skipped)
+        save_encrypted({'stage': 'playback_resolution', 'request': selected,
+                        'selection': selected['selection']})
+        url = client.get_video_url(selected['course_id'], selected['sub_id'])
+        if url:
+            return selected, url
+        skipped.append({k: selected['selection'][k] for k in ('date', 'sub_title', 'sub_id')})
+        remaining = [lecture for lecture in remaining if str(lecture.get('sub_id')) != selected['sub_id']]
+    raise RuntimeError('No playback available in any non-future lecture')
 
 
 def workspace() -> Path:
@@ -75,6 +108,22 @@ def parse_request(raw: str) -> dict:
         raise ValueError("Test slice must be at most 600 seconds")
     return {"course_id": str(value["course_id"]), "sub_id": str(value["sub_id"]),
             "offset": offset, "duration": duration}
+
+
+def selected_test_request():
+    """Two immutable private selections for one parallel test workflow."""
+    slot = os.environ.get('TEST_COURSE_SLOT', '-1')
+    if slot == '-1':
+        return parse_request(os.environ['QWEN_ASR_TEST_REQUEST'])
+    if slot not in ('0', '1'):
+        raise ValueError('Invalid parallel test slot')
+    requests = json.loads(os.environ['QWEN_ASR_TEST_REQUESTS'])
+    if not isinstance(requests, list) or len(requests) != 2:
+        raise ValueError('Parallel test requires exactly two private requests')
+    parsed = [parse_request(json.dumps(request)) for request in requests]
+    if parsed[0]['course_id'] == parsed[1]['course_id']:
+        raise ValueError('Parallel test courses must be distinct')
+    return parsed[int(slot)]
 
 
 def sample_seconds() -> int:
@@ -125,10 +174,24 @@ def configure_auth_session(session, events):
     session.request = request
 
 
+def failed_media_probe(client, media):
+    """Bounded private diagnostic; close even when a server ignores Range."""
+    try:
+        with client.vpn.session.get(media, headers={'Range': 'bytes=0-4095'},
+                                    stream=True, timeout=30) as response:
+            first = next(response.iter_content(chunk_size=4096), b'')[:4096]
+            return {'status': response.status_code,
+                    'content_type': response.headers.get('Content-Type', ''),
+                    'private_final_url': response.url,
+                    'private_prefix_b64': base64.b64encode(first).decode()}
+    except Exception as error:
+        return {'error_type': type(error).__name__, 'private_error': str(error)[-2000:]}
+
+
 def fetch() -> None:
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
-    request = parse_request(os.environ["QWEN_ASR_TEST_REQUEST"])
+    request = selected_test_request()
     if os.environ.get('LONG_CHUNK_SAMPLE')=='true':
         request['duration']=sample_seconds()
     print("Acquiring one privately selected authorized audio slice", flush=True)
@@ -159,13 +222,16 @@ def fetch() -> None:
     print("Authentication complete; resolving selected playback", flush=True)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
         client = ICourseClient(vpn)
+        url = None
         if os.environ.get('LATEST_LECTURE') == 'true':
-            request = latest_request(client.get_course_detail(request['course_id']), request)
+            request, url = resolve_latest_playback(client, request)
         if os.environ.get('FULL_LECTURE') == 'true':
             request['offset'], request['duration'] = 0, 10800
             if request.get('selection'):
                 request['selection'].update(offset=0, duration=10800)
-        url = client.get_video_url(request["course_id"], request["sub_id"])
+        save_encrypted({'stage': 'playback_resolution', 'request': request,
+                        'selection': request.get('selection')})
+        url = url or client.get_video_url(request["course_id"], request["sub_id"])
         if not url:
             raise RuntimeError("No playback available")
         media, headers = client.get_stream_params(url)
@@ -180,11 +246,16 @@ def fetch() -> None:
            timeout=1200 if full or request['duration']>600 else 420)
         if process.returncode:
             save_encrypted({"stage": "audio_acquisition", "returncode": process.returncode,
+                            "selection": request.get('selection'),
+                            "media_probe": failed_media_probe(client, media),
                             "private_diagnostic": process.stderr.decode(errors="replace")[-8000:]})
             raise RuntimeError("Audio acquisition failed; encrypted diagnostic saved")
     print("Authorized slice acquisition completed; no audio artifact uploaded", flush=True)
     if os.environ.get("QUALITY_SAMPLE") == "true":
         fetch_evidence(client, request)
+    else:
+        (workspace()/'evidence.json').write_text(
+            json.dumps({'selection': request.get('selection')}, ensure_ascii=False), encoding='utf-8')
 
 
 def fetch_evidence(client, request):
@@ -241,7 +312,24 @@ def save_encrypted(report: dict) -> None:
     (workspace() / "result.enc").write_bytes(b"QASR1" + nonce + AESGCM(key).encrypt(nonce, raw, b"qwen-asr-benchmark-v1"))
 
 
+def record_failure(mode, error):
+    """Keep the final failure encrypted, alongside any earlier checkpoints."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    path = workspace() / 'result.enc'
+    report = {}
+    if path.exists():
+        data = path.read_bytes()
+        key = base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'], validate=True)
+        report = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
+    report['test_failure'] = {'mode': mode, 'error_type': type(error).__name__,
+                              'private_error': str(error)[-2000:]}
+    save_encrypted(report)
+
+
 def infer() -> None:
+    if os.environ.get('RUNTIME_SAMPLE') == 'true':
+        infer_runtime_sample()
+        return
     if os.environ.get("FULL_LECTURE") == "true" or os.environ.get("LONG_CHUNK_SAMPLE") == "true":
         infer_lecture()
         return
@@ -269,20 +357,6 @@ def infer() -> None:
     report["source"] = "official_public_sample" if public_sample else "authorized_classroom_slice"
     save_encrypted(report)  # Check encryption before expensive inference.
     print(f"CPU threads=4; available RAM={os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1024**3:.2f} GiB", flush=True)
-    sense_dir = Path(os.environ["RUNNER_TEMP"]) / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-    baseline = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=str(sense_dir / "model.int8.onnx"), tokens=str(sense_dir / "tokens.txt"),
-        num_threads=4, use_itn=True, debug=False)
-    for index, (start, end) in enumerate(windows):
-        began = time.perf_counter()
-        stream = baseline.create_stream()
-        stream.accept_waveform(sr, audio[round(start * sr):round(end * sr)])
-        baseline.decode_stream(stream)
-        report["clips"].append({"backend": "SenseVoiceSmall-int8", "start": start,
-                                "end": end, "text": stream.result.text,
-                                "seconds": time.perf_counter() - began})
-    del baseline
-    print(f"SenseVoice baseline finished on {len(windows)} matching clip(s)", flush=True)
     began = time.perf_counter()
     model_path = snapshot_download(MODEL, revision=REVISION,
         allow_patterns=["*.json", "*.safetensors", "*.txt"])
@@ -325,6 +399,58 @@ def infer() -> None:
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
     save_encrypted(report)
     print(f"Benchmark completed: selected RTF={ratio:.3f}, peak RSS={report['peak_rss_gib']:.2f} GiB", flush=True)
+
+
+def infer_runtime_sample():
+    """Actual production recognizer, public smoke or isolated full classroom."""
+    import soundfile as sf
+    from types import SimpleNamespace
+    from src.ai.transcriber import Transcriber
+    public = os.environ.get('PUBLIC_SAMPLE') == 'true'
+    if not public and os.environ.get('FULL_LECTURE') != 'true':
+        raise ValueError('Private runtime tests require the full-lecture mode')
+    wav=workspace()/'audio.wav'
+    if public:
+        import requests
+        response=requests.get('https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav',timeout=60)
+        response.raise_for_status()
+        wav.write_bytes(response.content)
+    info=sf.info(wav)
+    if info.samplerate != 16000 or info.channels != 1 or info.duration <= 0:
+        raise ValueError('Runtime audio must be nonempty mono 16kHz')
+    evidence_path=workspace()/'evidence.json'
+    evidence=json.loads(evidence_path.read_text()) if evidence_path.exists() else {}
+    selection=evidence.get('selection') or {}
+    raw=workspace()/'audio.raw'
+    subprocess.run(['ffmpeg','-nostdin','-v','error','-i',str(wav),'-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
+    transcriber=Transcriber()
+    from src.ai.course_glossary import course_terms
+    terms=course_terms(selection.get('course_title', ''))
+    transcriber.set_terms(terms)
+    began=time.perf_counter()
+    report={'source':'official_public_runtime_smoke' if public else 'authorized_full_runtime',
+            'model':MODEL,'revision':REVISION,'complete':False,'selection':selection,
+            'recognition_terms':terms,'reference_evidence':evidence,
+            'acquired_audio_seconds':info.duration,
+            'acquisition_limit_reached':not public and reaches_acquisition_limit(info.duration)}
+    save_encrypted(report)  # Validate encryption before expensive inference.
+    try:
+        if report['acquisition_limit_reached']:
+            raise ValueError('Audio reached the full-lecture acquisition cap')
+        transcript,segments=transcriber.transcribe_tail(str(raw),SimpleNamespace(poll=lambda:0,returncode=0),[])
+        if not transcript.strip(): raise ValueError('Production runtime transcript empty')
+        report.update(transcript=transcript,segments=segments,complete=True)
+    except Exception as error:
+        report['error_type']=type(error).__name__
+        raise
+    finally:
+        report.update(full_chunks=transcriber.last_chunks,vad_windows=transcriber.last_vad_windows,
+                      audio_seconds=transcriber.last_audio_duration,seconds=time.perf_counter()-began,
+                      peak_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024**2)
+        save_encrypted(report)
+        transcriber.release_model()
+    print(f"Production Qwen runtime passed: audio={report['audio_seconds']:.1f}s, runtime={report['seconds']:.1f}s, peak={report['peak_rss_gib']:.2f}GiB",flush=True)
 
 
 def infer_lecture() -> None:
@@ -384,16 +510,18 @@ def infer_lecture() -> None:
               "chunk_target_seconds": 120, "max_new_tokens": 2048,
               "requested_sample_seconds": expected,
               "audio_seconds": info.duration, "vad_seconds": time.perf_counter() - began,
-              "acquisition_limit_reached": info.duration >= 10800,
+              "acquisition_limit_reached": reaches_acquisition_limit(info.duration),
               "included_audio_seconds": included, "skipped_audio_seconds": info.duration - included,
               "vad_windows": windows, "planned_chunks": chunks, "full_chunks": [],
               "complete": False, "device": "cpu", "dtype": "float32", "threads": 4}
     if (workspace() / 'evidence.json').exists():
         report['selection'] = json.loads((workspace() / 'evidence.json').read_text()).get('selection')
-    context = recognition_context()
+    context = recognition_context((report.get('selection') or {}).get('course_title'))
     report['recognition_context'] = context
     save_encrypted(report)
     del vad
+    if report['acquisition_limit_reached']:
+        raise ValueError('Audio reached the full-lecture acquisition cap')
     gc.collect()
     print(f"VAD completed: audio={info.duration:.1f}s, chunks={len(chunks)}, skipped={info.duration-included:.1f}s", flush=True)
     if not chunks:
@@ -463,7 +591,7 @@ def infer_lecture() -> None:
     report["transcript"] = join_chunk_text(report["full_chunks"])
     report["full_slice_seconds"] = sum(row["seconds"] for row in report["full_chunks"])
     report["peak_rss_gib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
-    report["complete"] = info.duration < 10800
+    report["complete"] = not reaches_acquisition_limit(info.duration)
     save_encrypted(report)
     print("Full lecture completed; private text is encrypted only", flush=True)
 
@@ -492,12 +620,17 @@ def quality_review():
     # without paying for another full local transcription or review request.
     selected=report.get('review_suspects') if os.environ.get('REUSE_RUN_ID') else None
     full = os.environ.get('FULL_LECTURE') == 'true'
-    budget = 600 if full else 120
-    report['quality_limits'] = {'cloud_seconds':budget, 'max_suspects':12 if full else 4}
+    from src.ai.segment_rescue import cloud_budget_limits
+    profile = os.environ.get('QWEN_REVIEW_PROFILE', 'production')
+    seconds_cap, clips_cap = cloud_budget_limits(profile)
+    budget = seconds_cap if full else 120
+    report['quality_limits'] = {'cloud_seconds':budget, 'max_suspects':clips_cap if full else 4,
+                                'max_clips':clips_cap if full else 10, 'profile':profile}
     if selected is None:
         selected=review_quality(OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'],base_url='https://api.deepseek.com/v1'),
                                 'deepseek-v4-flash',report,evidence,
-                                max_suspects=12 if full else 4, input_budget=96000 if full else 30000)
+                                max_suspects=clips_cap if full else 4, input_budget=96000 if full else 30000,
+                                budget_profile=profile)
     report['review_suspects']=selected
     save_encrypted(report)
     intervals,located,unresolved,metrics=align_suspects(report,selected,workspace()/'audio.wav',save_encrypted,budget=budget)
@@ -505,21 +638,25 @@ def quality_review():
     report['localization']={'located':located,'unresolved':unresolved}
     save_encrypted(report)
     raw=workspace()/'audio.raw'
+    hotwords=review_hotwords(report,evidence)
     if intervals:
         subprocess.run(['ffmpeg','-v','error','-i',str(workspace()/'audio.wav'),
                         '-f','f32le','-ac','1','-ar','16000','-y',str(raw)],
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=60)
         rescues,attempted,failed=rescue_intervals_pcm(str(raw),os.environ.get('DOUBAO_ASR_API_KEY',''),
-                                                   intervals,max_seconds=budget,max_clips=12 if full else 10,
-                                                   hotwords=(['数值算法','舍入误差','截断误差','收敛性','误差估计',
-                                                              '条件数','迭代法','插值','线性方程组','数值积分']
-                                                             if os.environ.get('LATEST_LECTURE') == 'true' else
-                                                             ['希尔伯特矩阵','逆矩阵','条件数','扰动','奇异值',
-                                                              '指数','舍入误差','显式表达式','范数','高斯消去法']))
+                                                   intervals,max_seconds=budget,max_clips=clips_cap if full else 10,
+                                                   budget_profile=profile,
+                                                   hotwords=hotwords)
     else:
         rescues,attempted,failed=[],0,False
+    completed_seconds = sum((w['end_ms']-w['start_ms'])/1000 for w, _ in rescues)
+    attempted_clips = len(rescues) + int(failed and attempted > completed_seconds+1e-6)
     report['cloud_review']={'rescues':rescues,'attempted_audio_seconds':attempted,'failed':failed,
-                            'hotword_hints_enabled':True,
+                            'completed_clips':len(rescues),
+                            'attempted_clips':attempted_clips,
+                            'seconds_cap_reached':attempted >= budget,
+                            'clips_cap_reached':attempted_clips >= (clips_cap if full else 10),
+                            'hotword_hints_enabled':bool(hotwords),
                             'selection_limit':'Whole-chunk audio forced alignment locates quoted text; not a correctness guarantee. Unresolved locations are not uploaded. Originals retained.'}
     report['rescue_comparisons']=[{'chunk_id':w['chunk_id'],'original_quote':w['text'],
         'cloud_text':' '.join(s['text'] for s in segments),
@@ -535,6 +672,9 @@ def summary_material(report, evidence):
     if not report.get('complete') or not report.get('transcript', '').strip():
         raise ValueError('Cannot summarize incomplete or empty transcription')
     material = '本地 ASR 正文（按录音顺序）：\n' + report['transcript']
+    if report.get('full_lecture_complete') is False:
+        material = ('输入范围限制：完整课堂范围未经验证，可能存在时长差异或获取截断。'
+                    '仅总结已识别的输入，不得声称覆盖整堂课。\n' + material)
     pages = [p for p in evidence.get('ppt', []) if p.get('text')]
     material += '\n\nPPT OCR 辅助材料：\n' + json.dumps(pages, ensure_ascii=False)
     material += ('\n\n局部云端复核（只是另一识别版本，不保证正确；只可结合上下文判断，'
@@ -579,21 +719,45 @@ def generate_summary():
     evidence = json.loads(evidence_path.read_text()) if evidence_path.exists() else report.get('reference_evidence', {})
     material = summary_material(report, evidence)
     selection = report.get('selection') or {}
+    automatic = os.environ.get('AUTO_COURSE_TERMS') == 'true'
+    system = load_system_prompt()
+    user = f"课程：{selection.get('course_title','数值算法与案例分析')}\n课次：{selection.get('sub_title','')}\n<course_material>\n" + material + '\n</course_material>'
+    sources = {}
+    if automatic:
+        from src.ai.automatic_glossary import INSTRUCTION, validated_keywords
+        sources = {'asr':[report['transcript']],
+                   'ppt':[p['text'] for p in evidence.get('ppt',[]) if p.get('text')],
+                   'cloud':[c['cloud_text'] for c in report.get('rescue_comparisons',[]) if c.get('cloud_text')]}
+        system += '\n\n' + INSTRUCTION
+        user = json.dumps({'course':selection.get('course_title'),'material':material,
+                           'evidence_sources':{'asr':'material中的本地 ASR 正文',
+                              'ppt':'material中的PPT OCR辅助材料',
+                              'cloud':'material中的局部云端复核cloud_text字段'}},ensure_ascii=False)
     client = OpenAI(api_key=os.environ['DEEPSEEK_API_KEY'], base_url='https://api.deepseek.com',
                     max_retries=0, timeout=600)
     began = time.perf_counter()
     try:
         response = client.chat.completions.create(model='deepseek-v4-flash', temperature=0.2,
         extra_body={'thinking':{'type':'enabled'}}, reasoning_effort='high',
-        max_tokens=64000, messages=[{'role':'system','content':load_system_prompt()},
-        {'role':'user','content':f"课程：{selection.get('course_title','数值算法与案例分析')}\n"
-                               f"课次：{selection.get('sub_title','')}\n<course_material>\n"
-                               + material + '\n</course_material>'}])
+        max_tokens=64000, messages=[{'role':'system','content':system},{'role':'user','content':user}],
+        **({'response_format':{'type':'json_object'}} if automatic else {}))
     except Exception as error:
         report.setdefault('summary_attempts', []).append({'error_type':type(error).__name__,
             'seconds':time.perf_counter()-began, 'private_error':str(error)[-2000:]})
         save_encrypted(report)
         raise
+    if automatic and response.choices:
+        report['keyword_response'] = response.choices[0].message.content
+        report['keyword_response_diagnostic'] = {
+            'finish_reason':response.choices[0].finish_reason,
+            'seconds':time.perf_counter()-began,
+            'usage':response.usage.model_dump() if response.usage else None}
+        save_encrypted(report)
+        data=json.loads(response.choices[0].message.content)
+        if not isinstance(data,dict) or not isinstance(data.get('summary'),str):
+            raise ValueError('Invalid summary/keyword envelope')
+        response.choices[0].message.content = data['summary']
+        report['automatic_keywords'] = validated_keywords(data.get('keywords',[]),sources,data['summary'])
     complete = record_summary_response(report, response, time.perf_counter()-began)
     report['summary_attempts'][-1].update(thinking='enabled', reasoning_effort='high', max_tokens=64000)
     if complete:
@@ -617,5 +781,10 @@ if __name__ == "__main__":
         {"fetch": fetch, "infer": infer, "review": quality_review, "summary": generate_summary, "clean": clean}[mode]()
     except Exception as error:
         # Exception bodies and command arguments may contain private URLs.
+        if mode != 'clean':
+            try:
+                record_failure(mode, error)
+            except Exception:
+                print('Final encrypted diagnostic unavailable', flush=True)
         print(f"Benchmark {mode} failed ({type(error).__name__}); private details withheld", flush=True)
         raise SystemExit(1)

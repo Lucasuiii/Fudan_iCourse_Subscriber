@@ -1,13 +1,146 @@
 import json
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
 
-from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context,record_summary_response
+from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context,record_summary_response,selected_test_request,review_hotwords,infer_runtime_sample
 from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
 
 
 class QwenBenchmarkTests(unittest.TestCase):
+    def test_failed_media_probe_is_bounded_and_closes_response(self):
+        import base64
+        from unittest.mock import MagicMock
+        from scripts.benchmark_qwen_asr import failed_media_probe
+        client = MagicMock()
+        response = client.vpn.session.get.return_value.__enter__.return_value
+        response.status_code = 200
+        response.headers = {'Content-Type': 'text/html'}
+        response.url = 'private url'
+        response.iter_content.return_value = iter([b'x' * 9000, b'unread'])
+        result = failed_media_probe(client, 'private url')
+        self.assertEqual(len(base64.b64decode(result['private_prefix_b64'])), 4096)
+        client.vpn.session.get.return_value.__exit__.assert_called_once()
+        client.vpn.session.get.assert_called_once_with('private url',
+            headers={'Range': 'bytes=0-4095'}, stream=True, timeout=30)
+
+    def test_latest_recording_skips_empty_schedule_and_keeps_review_gate_fallback(self):
+        from scripts.benchmark_qwen_asr import resolve_latest_playback
+        client = Mock()
+        client.get_course_detail.return_value = {'title': '高等代数Ⅰ', 'lectures': [
+            {'date': '2026-09-30', 'sub_id': '1', 'sub_title': '第1-2节', 'has_playback': False},
+            {'date': '2026-10-01', 'sub_id': '2', 'sub_title': '第1-2节', 'has_playback': False},
+            {'date': '2026-10-06', 'sub_id': '3', 'sub_title': '第1-2节', 'has_playback': True}]}
+        client.get_video_url.side_effect = [None, 'private playback']
+        with patch('scripts.benchmark_qwen_asr.save_encrypted'):
+            request, url = resolve_latest_playback(client, {'course_id': '38404'}, '2026-10-04')
+        self.assertEqual(request['sub_id'], '1')
+        self.assertEqual(url, 'private playback')
+        self.assertEqual(request['selection']['skipped_unavailable'][0]['sub_id'], '2')
+        self.assertEqual(client.get_video_url.call_args_list, [
+            unittest.mock.call('38404', '2'), unittest.mock.call('38404', '1')])
+        client.get_video_url.side_effect = [None, None]
+        with patch('scripts.benchmark_qwen_asr.save_encrypted'), self.assertRaises(RuntimeError):
+            resolve_latest_playback(client, {'course_id': '38404'}, '2026-10-04')
+
+    def test_final_failure_is_encrypted_and_preserves_prior_checkpoint(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from scripts.benchmark_qwen_asr import save_encrypted, record_failure
+        key = b'x' * 32
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('scripts.benchmark_qwen_asr.workspace', return_value=Path(tmp)), \
+             patch.dict('os.environ', {'QWEN_ASR_TEST_KEY': base64.b64encode(key).decode()}):
+            for checkpoint in (None, {'attempts': [1]}):
+                (Path(tmp) / 'result.enc').unlink(missing_ok=True)
+                if checkpoint:
+                    save_encrypted(checkpoint)
+                record_failure('fetch', RuntimeError('private playback reason'))
+                data = (Path(tmp) / 'result.enc').read_bytes()
+                self.assertNotIn(b'private playback reason', data)
+                result = json.loads(AESGCM(key).decrypt(data[5:17], data[17:], b'qwen-asr-benchmark-v1'))
+                self.assertEqual(result['test_failure']['private_error'], 'private playback reason')
+                self.assertEqual(result.get('attempts'), checkpoint.get('attempts') if checkpoint else None)
+
+    def test_parallel_requests_remain_isolated_and_single_mode_is_unchanged(self):
+        requests = [{'course_id': '10', 'sub_id': '0', 'offset': 0, 'duration': 600},
+                    {'course_id': '20', 'sub_id': '0', 'offset': 0, 'duration': 600}]
+        for slot, course in [('0', '10'), ('1', '20')]:
+            with patch.dict('os.environ', {'TEST_COURSE_SLOT': slot,
+                            'QWEN_ASR_TEST_REQUESTS': json.dumps(requests)}):
+                self.assertEqual(selected_test_request()['course_id'], course)
+        with patch.dict('os.environ', {'TEST_COURSE_SLOT': '-1',
+                        'QWEN_ASR_TEST_REQUEST': json.dumps(requests[0])}):
+            self.assertEqual(selected_test_request()['course_id'], '10')
+        for slot, values in [('2', requests), ('0', requests[:1]),
+                             ('0', [requests[0], requests[0]])]:
+            with patch.dict('os.environ', {'TEST_COURSE_SLOT': slot,
+                            'QWEN_ASR_TEST_REQUESTS': json.dumps(values)}), self.assertRaises(ValueError):
+                selected_test_request()
+
+    def test_probability_test_does_not_use_numerical_course_hints(self):
+        self.assertEqual(recognition_context('概率论'), '')
+        self.assertEqual(review_hotwords({'selection': {'course_title': '概率论'}}, {}), [])
+        with patch.dict('os.environ', {'LATEST_LECTURE': 'true'}):
+            self.assertEqual(recognition_context(), '')
+            self.assertEqual(review_hotwords({}, {}), [])
+
+    def run_private_runtime(self, error=None, duration=160):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        t = MagicMock(last_audio_duration=160, last_chunks=[{'start': 0, 'end': 160, 'text': '概率课堂'}],
+                      last_vad_windows=[(0, 160)])
+        if error:
+            t.transcribe_tail.side_effect = error
+        else:
+            t.transcribe_tail.return_value = ('概率课堂', [{'start_ms': 0, 'end_ms': 160000, 'text': '概率课堂'}])
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'evidence.json').write_text(json.dumps({'selection': {'course_title': '概率论'}}))
+            reports=[]
+            with patch.dict('os.environ', {'PUBLIC_SAMPLE': 'false', 'FULL_LECTURE': 'true'}), \
+                 patch('scripts.benchmark_qwen_asr.workspace', return_value=root), \
+                 patch.dict(sys.modules, {'soundfile': SimpleNamespace(info=lambda _: SimpleNamespace(samplerate=16000, channels=1, duration=duration))}), \
+                 patch('scripts.benchmark_qwen_asr.subprocess.run'), \
+                 patch('src.ai.transcriber.Transcriber', return_value=t), \
+                 patch('scripts.benchmark_qwen_asr.save_encrypted', side_effect=lambda r: reports.append(json.loads(json.dumps(r)))):
+                if error:
+                    with self.assertRaises(type(error)):
+                        infer_runtime_sample()
+                else:
+                    infer_runtime_sample()
+        return t, reports
+
+    def test_full_runtime_uses_production_transcriber_and_retains_selected_course(self):
+        t, reports=self.run_private_runtime()
+        t.set_terms.assert_called_once_with([])
+        t.transcribe_tail.assert_called_once()
+        self.assertEqual(reports[-1]['source'], 'authorized_full_runtime')
+        self.assertEqual(reports[-1]['selection']['course_title'], '概率论')
+        self.assertTrue(reports[-1]['complete'])
+        self.assertEqual(reports[-1]['vad_windows'], [[0, 160]])
+        t.release_model.assert_called_once()
+
+    def test_full_runtime_preserves_encrypted_partial_diagnostic_on_failure(self):
+        t, reports=self.run_private_runtime(TimeoutError('private diagnostic'))
+        self.assertFalse(reports[-1]['complete'])
+        self.assertEqual(reports[-1]['error_type'], 'TimeoutError')
+        self.assertEqual(reports[-1]['full_chunks'][0]['text'], '概率课堂')
+        self.assertNotIn('private diagnostic', json.dumps(reports))
+        t.release_model.assert_called_once()
+
+    def test_rounded_acquisition_cutoff_is_rejected_before_model_inference(self):
+        for duration in (10799.999, 10800, 10800.05):
+            t, reports = self.run_private_runtime(ValueError('acquisition cap'), duration=duration)
+            t.transcribe_tail.assert_not_called()
+            self.assertFalse(reports[-1]['complete'])
+            self.assertTrue(reports[-1]['acquisition_limit_reached'])
+            self.assertEqual(reports[-1]['acquired_audio_seconds'], duration)
+
     def test_incomplete_summary_preserves_diagnostic_not_success(self):
         report={}
         choice=SimpleNamespace(finish_reason='length',message=SimpleNamespace(content='未完成正文',reasoning_content='思考'))
@@ -43,6 +176,9 @@ class QwenBenchmarkTests(unittest.TestCase):
         self.assertIn('另一识别版本',material)
         with self.assertRaises(ValueError):
             summary_material({**report,'complete':False},{})
+        bounded = summary_material({**report, 'full_lecture_complete': False}, {})
+        self.assertIn('完整课堂范围未经验证', bounded)
+        self.assertIn('不得声称覆盖整堂课', bounded)
     def test_bounded_sample_duration(self):
         with patch.dict('os.environ',{'SAMPLE_MINUTES':'30','LONG_CHUNK_SAMPLE':'true'}):
             self.assertEqual(sample_seconds(),1800)

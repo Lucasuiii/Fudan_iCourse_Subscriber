@@ -233,8 +233,10 @@ def aligned_rescue_intervals(chunks, located, *, budget=120):
     return intervals,accepted,unresolved
 
 
-def review_quality(client, model, report, evidence, *, max_suspects=4, input_budget=30000):
-    max_suspects = min(12, max(1, max_suspects))
+def review_quality(client, model, report, evidence, *, max_suspects=4, input_budget=30000,
+                   budget_profile='production'):
+    from src.ai.segment_rescue import cloud_budget_limits
+    max_suspects = min(cloud_budget_limits(budget_profile)[1], max(1, max_suspects))
     input_budget = min(96000, max(1, input_budget))
     rows = [{'id': i, 'text': x['text'][:1800], 'start': x['start'], 'end': x['end']}
             for i,x in enumerate(report['full_chunks'])]
@@ -261,7 +263,8 @@ def review_quality(client, model, report, evidence, *, max_suspects=4, input_bud
         raise ValueError('Review exceeds bounded input')
     response = client.chat.completions.create(model=model,
         messages=[{'role':'system','content':prompt},{'role':'user','content':payload}],
-        temperature=0,max_tokens=3000 if max_suspects>4 else 1000,timeout=120 if max_suspects>4 else 60,
+        temperature=0,max_tokens=4500 if max_suspects>12 else 3000 if max_suspects>4 else 1000,
+        timeout=180 if max_suspects>12 else 120 if max_suspects>4 else 60,
         extra_body={'thinking':{'type':'disabled'}},response_format={'type':'json_object'})
     result=json.loads(response.choices[0].message.content)
     selected=[]

@@ -1,388 +1,82 @@
 name: iCourse Check
-
-on:
-  schedule:
-    # Beijing 17:07 primary run. 20:07 is a conditional fallback: it only
-    # continues when today's primary scheduled run has not started or failed.
-    # The non-round minute avoids the busiest GitHub Actions queue window.
-    - cron: "7 9 * * *"
-    - cron: "7 12 * * *"
-  workflow_dispatch:
-
 permissions:
   actions: read
   contents: write
-
-concurrency:
-  group: icourse-data-${{ github.repository }}
-  cancel-in-progress: false
-
 jobs:
   schedule_gate:
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
     steps:
-      - name: Decide whether the fallback should run
-        id: decide
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_SCHEDULE: ${{ github.event.schedule }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          # Manual runs and the 17:07 primary run always continue.
-          if [ "$EVENT_NAME" != "schedule" ] || \
-             [ "$EVENT_SCHEDULE" != "7 12 * * *" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+    - name: Decide whether the fallback should run
+      id: decide
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        EVENT_SCHEDULE: ${{ github.event.schedule }}
+        CURRENT_RUN_ID: ${{ github.run_id }}
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ github.repository }}
+      run: |
+        # Manual runs and the 17:07 primary run always continue.
+        if [ "$EVENT_NAME" != "schedule" ] || \
+           [ "$EVENT_SCHEDULE" != "7 12 * * *" ]; then
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
-          # At 20:07, skip the expensive pipeline only when a useful scheduled
-          # run has already appeared today in Beijing time. A queued/running
-          # primary counts; a completed primary counts only when successful.
-          day_start_utc=$(python3 - <<'PY'
-          from datetime import datetime, timezone
-          from zoneinfo import ZoneInfo
+        # At 20:07, skip the expensive pipeline only when a useful scheduled
+        # run has already appeared today in Beijing time. A queued/running
+        # primary counts; a completed primary counts only when successful.
+        day_start_utc=$(python3 - <<'PY'
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
 
-          now = datetime.now(ZoneInfo("Asia/Shanghai"))
-          start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-          print(start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-          PY
-          )
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        print(start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        PY
+        )
 
-          if ! runs_json=$(gh api --method GET \
-              "repos/$REPOSITORY/actions/workflows/check.yml/runs" \
-              -f event=schedule -f branch=main -f per_page=100); then
-            echo "::warning::Could not inspect today's scheduled runs; running fallback."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+        if ! runs_json=$(gh api --method GET \
+            "repos/$REPOSITORY/actions/workflows/check.yml/runs" \
+            -f event=schedule -f branch=main -f per_page=100); then
+          echo "::warning::Could not inspect today's scheduled runs; running fallback."
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
-          prior_useful_runs=$(printf '%s' "$runs_json" | jq \
-            --arg current "$CURRENT_RUN_ID" \
-            --arg cutoff "$day_start_utc" \
-            '[.workflow_runs[] | select(
-              (.id | tostring) != $current and
-              .created_at >= $cutoff and
-              (.status != "completed" or .conclusion == "success")
-            )] | length')
+        prior_useful_runs=$(printf '%s' "$runs_json" | jq \
+          --arg current "$CURRENT_RUN_ID" \
+          --arg cutoff "$day_start_utc" \
+          '[.workflow_runs[] | select(
+            (.id | tostring) != $current and
+            .created_at >= $cutoff and
+            (.status != "completed" or .conclusion == "success")
+          )] | length')
 
-          if [ "$prior_useful_runs" -gt 0 ]; then
-            echo "A scheduled run already started today; skipping 20:07 fallback."
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "No useful scheduled run started today; running 20:07 fallback."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          fi
-
+        if [ "$prior_useful_runs" -gt 0 ]; then
+          echo "A scheduled run already started today; skipping 20:07 fallback."
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "No useful scheduled run started today; running 20:07 fallback."
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+        fi
   check:
     needs: schedule_gate
     if: needs.schedule_gate.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Node for local formula rendering
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: npm
-
-      - name: Install formula renderer
-        run: npm ci --ignore-scripts
-
-      - name: Validate database encryption key
-        env:
-          DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        run: |
-          if [ "${#DB_ENCRYPTION_KEY}" -lt 32 ]; then
-            echo "::error::DB_ENCRYPTION_KEY must contain at least 32 characters"
-            exit 2
-          fi
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Cache Python packages
-        id: cache-pip
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.pythonLocation }}/lib/python*/site-packages
-          key: pip-${{ hashFiles('requirements.txt') }}
-
-      - name: Install Python dependencies
-        if: steps.cache-pip.outputs.cache-hit != 'true'
-        run: pip install -r requirements.txt
-
-      - name: Install media and PDF dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-cjk libpango-1.0-0 libcairo2
-
-      - name: Cache ASR models
-        id: cache-models
-        uses: actions/cache@v4
-        with:
-          path: |
-            sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/
-            silero_vad.onnx
-          key: asr-models-sense-voice-2024-07-17
-
-      - name: Download ASR models
-        if: steps.cache-models.outputs.cache-hit != 'true'
-        run: |
-          wget -q https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-          tar xf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-          rm sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-          wget -q https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-
-      - name: Cache RapidOCR models
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/rapidocr
-          key: rapidocr-onnx-default-v1
-
-      - name: Fetch database from data branch
-        id: db-source
-        run: |
-          mkdir -p data
-          remote_ref=$(git ls-remote --heads origin refs/heads/data) \
-            || { echo "::error::Could not inspect the data branch."; exit 1; }
-          if [ -z "$remote_ref" ]; then
-            echo "No data branch; this is a confirmed first run."
-            echo "state=fresh" >> "$GITHUB_OUTPUT"
-            touch .db-source-ok
-            exit 0
-          fi
-          git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" \
-            || { echo "::error::Could not fetch the existing data branch."; exit 1; }
-          # Use ls-tree (reads tree directly) instead of cat-file
-          # (requires fetched blobs) in case the shallow clone hasn't
-          # fetched every blob object yet.
-          git ls-tree origin/data --name-only data/ | grep -q . \
-            || { echo "::error::Existing data branch contains no database."; exit 1; }
-          # Determine format from tree listing (ls-tree reads tree
-          # objects directly without needing the blobs fetched).
-          files=$(git ls-tree origin/data --name-only data/ | tr '\n' ' ')
-          echo "Data branch files: $files"
-          if echo "$files" | grep -q "icourse-index.enc"; then
-            mkdir -p data/sharded/shards
-            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
-            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
-            for path in $shard_paths; do
-              base=$(basename "$path")
-              git show "origin/data:$path" > "data/sharded/shards/$base"
-            done
-            echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
-          elif echo "$files" | grep -q "icourse.db.gz.enc"; then
-            git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
-            echo "Loaded legacy compressed database."
-          elif echo "$files" | grep -q "icourse.db.enc"; then
-            git show origin/data:data/icourse.db.enc > data/icourse.db.enc
-            echo "Loaded legacy uncompressed database."
-          else
-            echo "::error::Existing data branch has an unknown database format."
-            exit 1
-          fi
-          echo "state=existing" >> "$GITHUB_OUTPUT"
-
-      - name: Decode database
-        id: db-decode
-        if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
-        env:
-          STUID: ${{ secrets.STUID }}
-          UISPSW: ${{ secrets.UISPSW }}
-          DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        run: |
-          if [ -f data/sharded/icourse-index.enc ]; then
-            # Sharded format — always v2.
-            rm -f data/icourse.db.reassembled
-            python scripts/db_shard.py reassemble data/sharded data/icourse.db.reassembled
-            python scripts/validate_db.py data/icourse.db.reassembled
-            mv data/icourse.db.reassembled data/icourse.db
-            echo "Reassembled sharded database."
-            touch .db-source-ok
-            exit 0
-          fi
-
-          # Legacy single-file path (one-time migration on first sharded run).
-          if [ -n "$DB_ENCRYPTION_KEY" ]; then
-            NEW_KEY="$DB_ENCRYPTION_KEY"
-          else
-            NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
-          fi
-          LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
-
-          decrypt_blob() {
-            local in_path="$1"
-            local out_path="$2"
-            if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-                 -in "$in_path" -out "$out_path" \
-                 -pass pass:"$NEW_KEY" 2>/dev/null; then
-              echo "v2"
-              return 0
-            fi
-            if openssl enc -aes-256-cbc -d -pbkdf2 \
-                 -in "$in_path" -out "$out_path" \
-                 -pass pass:"$LEGACY_KEY" 2>/dev/null; then
-              echo "legacy"
-              return 0
-            fi
-            return 1
-          }
-
-          if [ -f data/icourse.db.gz.enc ]; then
-            if VER=$(decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz); then
-              gzip -d data/icourse.db.gz
-              echo "Legacy compressed DB decrypted ($VER)."
-            else
-              echo "::error::Database decryption failed; refusing to replace existing data."
-              rm -f data/icourse.db data/icourse.db.gz
-              exit 1
-            fi
-          elif [ -f data/icourse.db.enc ]; then
-            if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
-              echo "Legacy uncompressed DB decrypted ($VER)."
-            else
-              echo "::error::Database decryption failed; refusing to replace existing data."
-              rm -f data/icourse.db
-              exit 1
-            fi
-          fi
-          python scripts/validate_db.py data/icourse.db
-          touch .db-source-ok
-
-      - name: Record database state
-        id: db-before
-        run: |
-          if [ -f data/icourse.db ]; then
-            echo "hash=$(md5sum data/icourse.db | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-          else
-            echo "hash=none" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run
-        timeout-minutes: 350
-        env:
-          StuId: ${{ secrets.STUID }}
-          UISPsw: ${{ secrets.UISPSW }}
-          COURSE_IDS: ${{ secrets.COURSE_IDS }}
-          COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
-          COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
-          USE_OFFICIAL_TRANSCRIPT: "1"
-          CRAWL_TERM: ${{ secrets.CRAWL_TERM }}
-          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
-          DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          # All secrets, JSON-encoded. provider_env.py exports only the
-          # vars named by config.MODEL_PROVIDERS (api_key_env /
-          # base_url_env), so user-defined providers with custom env-var
-          # names work without editing this workflow.
-          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
-        run: |
-          eval "$(python scripts/provider_env.py)"
-          unset SECRETS_CONTEXT
-          python -u main.py
-
-      - name: Deploy database to data branch
-        if: always()
-        env:
-          STUID: ${{ secrets.STUID }}
-          UISPSW: ${{ secrets.UISPSW }}
-          DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-          COURSE_IDS: ${{ secrets.COURSE_IDS }}
-          # Persisted by the sharder into meta('subscribed_course_ids')
-          # so single_run.yml / delete_course.yml (which run with a
-          # different or no COURSE_IDS) still know the user's real
-          # subscription and don't reclassify everything as cold.
-          SUBSCRIBED_COURSE_IDS: ${{ secrets.COURSE_IDS }}
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ ! -f .db-source-ok ]; then
-            echo "::error::Database source was not verified; refusing to publish."
-            exit 1
-          fi
-          if [ ! -f data/icourse.db ]; then
-            echo "No database file, skipping."
-            exit 0
-          fi
-
-          python scripts/validate_db.py data/icourse.db
-
-          AFTER=$(md5sum data/icourse.db | cut -d' ' -f1)
-          if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ]; then
-            echo "Database unchanged, skipping commit."
-            exit 0
-          fi
-
-          # Pull the latest remote shards (a concurrent run may have written
-          # new data) and merge our local changes in before re-sharding.
-          remote_ref=$(git ls-remote --heads origin refs/heads/data) \
-            || { echo "::error::Could not inspect the data branch before publish."; exit 1; }
-          if [ -n "$remote_ref" ]; then
-            git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" \
-              || { echo "::error::Could not refresh the data branch before publish."; exit 1; }
-          fi
-          DEPLOY_DB=data/icourse.db
-          if git rev-parse origin/data >/dev/null 2>&1 && \
-             git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
-            rm -rf data/remote_sharded
-            mkdir -p data/remote_sharded/shards
-            git show origin/data:data/icourse-index.enc > data/remote_sharded/icourse-index.enc
-            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
-            for path in $shard_paths; do
-              base=$(basename "$path")
-              git show "origin/data:$path" > "data/remote_sharded/shards/$base"
-            done
-            python scripts/db_shard.py reassemble data/remote_sharded data/remote.db
-            echo "Merging local changes into latest remote..."
-            python scripts/merge_db.py data/icourse.db data/remote.db
-            DEPLOY_DB=data/remote.db
-          fi
-
-          python scripts/validate_db.py "$DEPLOY_DB"
-
-          # Re-shard the merged DB, then append a normal commit to data.  A
-          # rejected non-fast-forward push fails safely instead of overwriting.
-          rm -rf data/sharded_out
-          mkdir -p data/sharded_out
-          python scripts/db_shard.py shard "$DEPLOY_DB" data/sharded_out
-
-          rm -rf /tmp/db_deploy
-          mkdir -p /tmp/db_deploy
-          cd /tmp/db_deploy
-
-          git init -q
-          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          if [ -n "$remote_ref" ]; then
-            git fetch -q --depth=1 origin data
-            git checkout -q -b data FETCH_HEAD
-          else
-            git checkout -q -b data
-          fi
-          rm -rf data
-          mkdir -p data/shards
-          cp "$GITHUB_WORKSPACE/data/sharded_out/icourse-index.enc" data/
-          cp "$GITHUB_WORKSPACE"/data/sharded_out/shards/*.db.gz.enc data/shards/
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data/
-          if git diff --cached --quiet; then
-            echo "Encrypted database unchanged after merge; nothing to publish."
-            exit 0
-          fi
-          git commit -q -m "chore: update encrypted database (sharded v2)"
-          git push origin data
+    uses: ./.github/workflows/parallel_pilot.yml
+    with:
+      automatic_terms: false
+      shard_mode: '2'
+      publish_results: true
+      send_email: true
+      caller_holds_lock: true
+    secrets: inherit
+'on':
+  schedule:
+  - cron: 7 9 * * *
+  - cron: 7 12 * * *
+  workflow_dispatch: null
+concurrency:
+  group: icourse-data-${{ github.repository }}
+  cancel-in-progress: false

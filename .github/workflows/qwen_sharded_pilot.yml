@@ -1,0 +1,223 @@
+name: Qwen Single-Lecture Sharded Pilot
+'on':
+  push:
+    branches: [codex/qwen-production-pilot]
+    paths:
+    - .github/workflows/qwen_sharded_pilot.yml
+    - .github/workflows/qwen_sharded_course.yml
+    - tests/test_qwen_workflow_schedule.py
+    - scripts/qwen_sharding.py
+    - scripts/sharded_qwen_pilot.py
+    - tests/test_qwen_sharding.py
+  workflow_dispatch:
+    inputs:
+      baselines:
+        description: 'JSON baseline references; private_latest can start ASR before numbered baselines finish'
+        type: string
+        required: true
+      prepare_mode:
+        description: 'baseline freezes completed blocks; private_latest prepares existing private slots with the same VAD'
+        type: choice
+        options: [baseline, private_latest]
+        default: baseline
+      shard_mode:
+        description: 'Start with two runners; auto experiments with three above 60 minutes of planned audio'
+        type: choice
+        options: ['2', auto]
+        default: '2'
+      review_profile:
+        description: 'Keep production quota for the first comparison; pilot15 experiments with 900s/18 clips'
+        type: choice
+        options: [production, pilot15]
+        default: production
+      reuse_sharded_run_id:
+        description: 'Optional completed sharded experiment: reuse its ASR to test another quota; keep baseline list/order unchanged'
+        type: string
+        default: ''
+      allow_partial_comparison:
+        description: 'Explicit partial comparison; with reuse, finalize completed ASR-only shards without redecoding'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+# Shared with subscriber publishing: one batch at a time, never 5 courses x 15 workers.
+concurrency:
+  group: icourse-data-${{ github.repository }}
+  cancel-in-progress: false
+env:
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '4'
+  MKL_NUM_THREADS: '4'
+jobs:
+  validate:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Validate synthetic plans only, without credentials or course access
+      env:
+        PYTHONPATH: tests
+      run: |
+        python -m pip install PyYAML==6.0.3
+        python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule
+  plan:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      courses: ${{ steps.plan.outputs.courses }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - id: plan
+      env:
+        BASELINES: ${{ inputs.baselines }}
+      run: python -m scripts.sharded_qwen_pilot plan
+  prepare:
+    needs: plan
+    name: prepare (${{ matrix.course_slot }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.courses) }}
+    env:
+      COURSE_SLOT: ${{ matrix.course_slot }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
+      PREPARE_MODE: ${{ inputs.prepare_mode }}
+      ALLOW_PARTIAL_COMPARISON: ${{ inputs.allow_partial_comparison }}
+      BASELINE_RUN_ID: ${{ matrix.run_id }}
+      BASELINE_ARTIFACT: ${{ matrix.artifact }}
+      QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      REUSE_SHARDED_RUN_ID: ${{ inputs.reuse_sharded_run_id }}
+      REUSE_SOURCE_SLOT: ${{ matrix.reuse_source_slot }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        python -m pip install requests pycryptodome cryptography
+        if [ "$PREPARE_MODE" = private_latest ] && [ "$REUSE_SHARDED_RUN_ID" = '' ]; then
+          python -m pip install numpy sherpa-onnx
+          curl -fsSL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx -o "$RUNNER_TEMP/silero_vad.onnx"
+        fi
+        if ! command -v ffmpeg >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+        fi
+    - name: Acquire authorized lecture and pack original VAD blocks
+      env:
+        StuId: ${{ secrets.STUID }}
+        UISPsw: ${{ secrets.UISPSW }}
+        QWEN_ASR_TEST_REQUESTS: ${{ secrets.QWEN_ASR_TEST_REQUESTS }}
+        SILERO_VAD_PATH: ${{ runner.temp }}/silero_vad.onnx
+      run: python -m scripts.sharded_qwen_pilot prepare
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-shard-plan-${{ matrix.course_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/plan.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-shard-input-${{ matrix.course_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/input.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-shard-audio-${{ matrix.course_slot }}-0
+        path: ${{ runner.temp }}/qwen-shards/out/shard-0.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-shard-audio-${{ matrix.course_slot }}-1
+        path: ${{ runner.temp }}/qwen-shards/out/shard-1.enc
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-shard-audio-${{ matrix.course_slot }}-2
+        path: ${{ runner.temp }}/qwen-shards/out/shard-2.enc
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: qwen-shard-prepare-diagnostic-${{ matrix.course_slot }}
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/diagnostic.enc
+          ${{ runner.temp }}/qwen-benchmark/result.enc
+        if-no-files-found: ignore
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+    - if: always()
+      run: python -m scripts.sharded_qwen_pilot clean
+  plan_workers:
+    needs: [plan, prepare]
+    runs-on: ubuntu-latest
+    outputs:
+      courses: ${{ steps.plan.outputs.courses }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: qwen-shard-plan-*
+        path: ${{ runner.temp }}/qwen-shards/plans
+    - id: plan
+      env:
+        BASELINES: ${{ inputs.baselines }}
+        QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+      run: python -m scripts.sharded_qwen_pilot workers
+    - if: always()
+      run: python -m scripts.sharded_qwen_pilot clean
+  course:
+    needs: plan_workers
+    name: course (${{ matrix.course_slot }})
+    strategy:
+      fail-fast: false
+      # Each active course uses <=3 ASR runners OR one gather runner.
+      # Calling a reusable workflow allocates no waiting parent runner: 5 x 3 <= 15.
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan_workers.outputs.courses) }}
+    uses: ./.github/workflows/qwen_sharded_course.yml
+    with:
+      course_slot: ${{ matrix.course_slot }}
+      workers: ${{ toJSON(matrix.workers) }}
+      review_profile: ${{ inputs.review_profile }}
+      reuse_sharded_run_id: ${{ inputs.reuse_sharded_run_id }}
+    secrets:
+      QWEN_ASR_TEST_KEY: ${{ secrets.QWEN_ASR_TEST_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}

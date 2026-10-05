@@ -2,6 +2,11 @@
 import math
 
 
+def reaches_acquisition_limit(duration, limit=10800.0):
+    """A hard ffmpeg cutoff may round just below its requested duration."""
+    return not math.isfinite(duration) or duration >= limit - 0.1
+
+
 def plan_chunks(windows, duration, maximum=28.0, padding=1.0):
     """Keep VAD pauses; merge adjacent speech only within the size limit.
 
@@ -28,7 +33,7 @@ def plan_chunks(windows, duration, maximum=28.0, padding=1.0):
     return chunks
 
 
-def join_chunk_text(rows):
+def deduplicated_chunk_rows(rows):
     """Trim only exact substantial repeats across overlapping audio windows.
 
     Do not manufacture sentence timestamps; rows retain their audio intervals.
@@ -45,9 +50,13 @@ def join_chunk_text(rows):
                     text = text[size:]
                     break
         if text:
-            output.append(text)
+            output.append({**row, 'text': text})
         previous = row
-    return "\n".join(output)
+    return output
+
+
+def join_chunk_text(rows):
+    return "\n".join(row['text'] for row in deduplicated_chunk_rows(rows))
 
 
 def plan_long_chunks(windows, duration, target=120.0, silence_skip=10.0, padding=1.0):
