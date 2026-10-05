@@ -19,6 +19,12 @@ def validate_ledger(state):
                    or i['status'] not in ('reserved', 'complete', 'failed') for i in attempts)
             or abs(state.get('seconds', 0)-seconds) > 1e-6):
         raise ValueError('Invalid whole-lecture cloud quota checkpoint')
+    calls = state.get('homework', {}).get('vision_calls', [])
+    if (not isinstance(calls, list) or len(calls) > 4
+            or any(not isinstance(c, dict) or c.get('status') not in ('reserved', 'complete', 'failed')
+                   or not isinstance(c.get('candidate_id'), str) for c in calls)
+            or len({c['candidate_id'] for c in calls}) != len(calls)):
+        raise ValueError('Invalid homework vision checkpoint')
 
 
 def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_ocr=None):
@@ -53,7 +59,9 @@ def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_
             from src.ai.homework_visual_evidence import assess_visual
             homework['visual'] = assess_visual(homework['visual'], homework_cloud)
         return {'variants': variants, 'weak_rescues': weak, 'unresolved': state.get('unresolved', []),
-                'homework': {**homework, 'cloud': homework_cloud},
+                # Transport ledger belongs in the private recovery state, not
+                # duplicated into the summary's visual evidence/prompt.
+                'homework': {**{k: v for k, v in homework.items() if k != 'vision_calls'}, 'cloud': homework_cloud},
                 'uncertain_calls': sum(i['status'] == 'reserved' for i in attempts)}
 
     def rescue(intervals):

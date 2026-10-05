@@ -595,6 +595,11 @@ class LectureRunner:
 
     def _homework_visual(self, candidates, intervals):
         from src.pipeline.homework_visual import collect_visual_evidence
+        reader = None
+        state, checkpoint = self._review_state, self._checkpoint
+        if isinstance(state, dict) and callable(checkpoint):
+            ledger = state.setdefault('homework', {}).setdefault('vision_calls', [])
+            reader = self._summarizer.homework_image_reader(ledger, checkpoint)
         client = self._client
         if client is None:
             # The gather runner normally needs no login. Create a scoped
@@ -604,6 +609,7 @@ class LectureRunner:
             client = ICourseClient(login_with_retry())
         return collect_visual_evidence(client, self._homework_course_id, self._homework_sub_id,
                                        candidates, intervals,
+                                       vision_reader=reader,
                                        audio_seconds=(getattr(self, '_prepared_asr', None) or {}).get('audio_seconds'))
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,

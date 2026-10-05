@@ -83,15 +83,9 @@ def run():
             json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), recipient, SOURCE, 0))
     checkpoint()
     def observe(image, row):
-        if image and row['source'] == 'video_frame' and len(payload['previews']) < 6:
-            from PIL import Image
-            with Image.open(io.BytesIO(image)) as src:
-                image = src.convert('RGB'); size = list(image.size)
-                buf = io.BytesIO(); image.save(buf, format='JPEG', quality=85)
-            # Diagnostic preview only; actual OCR receives native pixels.
-            if sum(len(p['jpeg_base64']) for p in payload['previews'])+len(buf.getvalue())*4/3 < 1400000:
-                payload['previews'].append({'seconds': row['seconds'], 'source': row['source'],
-                    'original_size': size, 'jpeg_base64': base64.b64encode(buf.getvalue()).decode()})
+        if image and row['source'] == 'video_frame':
+            from src.pipeline.homework_previews import retain_preview
+            retain_preview(payload['previews'], image, row)
             checkpoint()
     from main import login_with_retry
     from src.api.icourse import ICourseClient
