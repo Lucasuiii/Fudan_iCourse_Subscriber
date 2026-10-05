@@ -488,6 +488,15 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_source_probe_reason_codes_never_export_private_stderr(self):
+        from scripts.production_media_inspection import safe_probe_errors
+        error=safe_probe_errors(b'https://private/token HTTP error 403 Forbidden\n'
+                               b'Could not seek to position: private-cookie\n'
+                               b'Input/output error\n')
+        self.assertEqual(error,{'error_counts':{'input_read_error':1,'seek_failed':1},
+                               'http_error_statuses':[403]})
+        self.assertNotIn('private',json.dumps(error))
+
     def test_source_inspection_auth_failure_keeps_encrypted_stage_without_private_message(self):
         import base64
         from cryptography.hazmat.primitives import serialization

@@ -20,6 +20,23 @@ ENTRIES = ('format=start_time,duration,size:'
            'channels,time_base,duration_ts,nb_frames')
 
 
+def safe_probe_errors(stderr):
+    """Diagnostic reason codes only, never echo a signed URL or header."""
+    from src.runtime.scheduler import record_decode_errors
+    counts = {}
+    record_decode_errors(stderr, counts)
+    lowered = stderr.lower()
+    for code, markers in {
+        'seek_failed': (b'could not seek', b'failed to seek', b'error seeking'),
+        'range_unsupported': (b'cannot seek', b'not seekable'),
+        'invalid_argument': (b'invalid argument',),
+        'invalid_media': (b'invalid data found', b'moov atom not found'),
+    }.items():
+        if any(marker in lowered for marker in markers): counts[code] = 1
+    statuses = sorted({int(code) for code in re.findall(rb'http error ([45]\d\d)', lowered)})
+    return {'error_counts':counts, 'http_error_statuses':statuses}
+
+
 def safe_metadata(raw):
     """Whitelist numeric fields; never pass tags, private URLs or error text."""
     result = {'format': {}, 'streams': []}
@@ -57,6 +74,7 @@ def probe_headers(url, headers):
     result = {'probe_return_code': process.returncode,
               'probe_seconds': time.monotonic()-began, 'header_only': True,
               'stderr_present': bool(process.stderr.strip())}
+    result.update(safe_probe_errors(process.stderr))
     if process.returncode:
         result['status'] = 'failed'
         return result
@@ -85,6 +103,7 @@ def probe_late_packets(url, headers, retained_seconds, stream):
     result = {'probe_return_code':process.returncode, 'probe_seconds':time.monotonic()-began,
               'requested_starts':starts, 'maximum_packets':128, 'decoding':False,
               'payload_exported':False, 'stderr_present':bool(process.stderr.strip()), 'packets':[]}
+    result.update(safe_probe_errors(process.stderr))
     if process.returncode:
         result['status']='failed'
         return result
