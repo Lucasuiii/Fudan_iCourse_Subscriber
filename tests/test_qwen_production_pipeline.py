@@ -501,9 +501,10 @@ class EncryptedStageTests(unittest.TestCase):
             transcriber.last_audio_duration=4;transcriber.last_media_duration=400;transcriber.last_vad_windows=[(1,3)]
             with patch.object(pipeline,'artifact',return_value=False), \
                  patch.object(pipeline,'task_files',return_value=(db,'10','概率论',lecture)), \
-                 patch.dict('sys.modules',{'main':SimpleNamespace(login_with_retry=lambda:None)}), \
+                 patch.dict('sys.modules',{'main':SimpleNamespace(login_with_retry=lambda:None),
+                    'src.pipeline.ppt_pipeline':SimpleNamespace(PPTPipeline=MagicMock()),
+                    'src.api.icourse':SimpleNamespace(ICourseClient=MagicMock())}), \
                  patch('src.runtime.scheduler.Scheduler',return_value=scheduler), \
-                 patch('src.pipeline.ppt_pipeline.PPTPipeline'),patch('src.api.icourse.ICourseClient'), \
                  patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber), \
                  patch.object(pipeline,'freeze_course_terms') as freeze:
                 with self.assertRaisesRegex(ValueError,'Production audio is incomplete'):pipeline.prepare()

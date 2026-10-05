@@ -43,6 +43,8 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/homework_vision.py'
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
+    - 'src/runtime/scheduler.py'
+    - 'tests/test_audio_timeline.py'
     - 'tests/test_homework_review.py'
     - 'tests/test_shared_asr_queue.py'
     - 'tests/test_automatic_glossary.py'
@@ -53,6 +55,8 @@ name: Qwen Production Pipeline Validation
     paths:
     - '.github/**'
     - 'scripts/production_*.py'
+    - 'src/runtime/scheduler.py'
+    - 'tests/test_audio_timeline.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'
     - 'src/pipeline/**'
@@ -158,6 +162,6 @@ jobs:
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Original shard invariants and independent course scheduling
-      run: PYTHONPATH=tests python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
+      run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary
