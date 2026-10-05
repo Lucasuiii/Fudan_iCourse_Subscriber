@@ -332,6 +332,32 @@ class BoardEvidenceTests(unittest.TestCase):
 
 
 class TailValidationTests(unittest.TestCase):
+    def test_visual_replay_reuses_pinned_quote_and_original_alignment(self):
+        import hashlib
+        from scripts.production_homework_visual_validation import replay_selection, AUDIO_HASH, PLAN_HASH
+        quote = '今天布置作业，请完成具体题目，题号再看一下。'
+        original = {'audio_seconds': 6532.096, 'audio_sha256': AUDIO_HASH, 'plan_hash': PLAN_HASH,
+                    'full_chunks': [dict(start=5985+i*120, end=6105+i*120, text=quote if i == 3 else '') for i in range(4)]}
+        with patch('scripts.production_homework_visual_validation.QUOTE_HASH', hashlib.sha256(quote.encode()).hexdigest()):
+            data, scope, candidates, intervals = replay_selection(original)
+            self.assertEqual(intervals[0]['quote_end_ms'], 6346475)
+            self.assertEqual(intervals[0]['text'], quote)
+            with self.assertRaises(ValueError): replay_selection(dict(original, audio_sha256='changed'))
+            original['full_chunks'][3]['text'] += '改变'
+            with self.assertRaises(ValueError): replay_selection(original)
+
+    def test_visual_replay_credentials_cannot_call_cloud_or_send_email(self):
+        import yaml
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        flow = yaml.safe_load((root/'.github/workflows/qwen_homework_visual_validation.yml').read_text())
+        self.assertEqual(flow['permissions'], {'contents': 'read', 'actions': 'read'})
+        env = flow['jobs']['replay']['env']
+        for name in ['SMTP_PASSWORD', 'DOUBAO_ASR_API_KEY', 'DASHSCOPE_API_KEY', 'DEEPSEEK_API_KEY', 'GEMINI_API_KEY']:
+            self.assertNotIn(name, env)
+        self.assertEqual(flow['jobs']['replay']['if'], "github.event_name == 'workflow_dispatch'")
+        self.assertFalse(any(step.get('with', {}).get('inference') == 'true' for step in flow['jobs']['replay']['steps']))
+
     def test_tail_preserves_original_clock_and_excludes_partial_boundary_block(self):
         from scripts.production_homework_validation import scoped_material
         original = {'audio_seconds': 1000, 'full_chunks': [

@@ -87,7 +87,7 @@ def read_frame(image, ocr):
 
 
 def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *, audio_seconds=None,
-                            screenshot_fetcher=None, ocr=None):
+                            screenshot_fetcher=None, ocr=None, frame_observer=None):
     if screenshot_fetcher is None:
         from src.api.icourse import fetch_ppt_image
         screenshot_fetcher = fetch_ppt_image
@@ -114,12 +114,15 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
             if identity in seen:
                 continue
             seen.add(identity)
+            image = None
             try:
                 image = screenshot_fetcher(client, shot, max_attempts=1, timeout=15)
                 row = read_frame(image, ocr)
             except Exception as error:
                 row = {'status': 'capture_failed', 'error_type': type(error).__name__, 'text': '', 'references': [], 'views': []}
             results.append(dict(row, source='platform_screenshot', seconds=shot['created_sec'], candidate_id=cid))
+            if callable(frame_observer):
+                frame_observer(image, results[-1])
         # Ordinary formula OCR is never a reason to skip delayed board frames.
         # Unaligned keywords cannot create a guessed video seek position.
         if window:
@@ -136,8 +139,11 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
                 if video_count >= MAX_VIDEO_FRAMES:
                     break
                 video_count += 1
-                row = read_frame(video_frame(video_params, seconds) if video_params else None, ocr)
+                image = video_frame(video_params, seconds) if video_params else None
+                row = read_frame(image, ocr)
                 results.append(dict(row, source='video_frame', seconds=seconds, candidate_id=cid))
+                if callable(frame_observer):
+                    frame_observer(image, results[-1])
     valid = [r for r in results if r['status'] in ('ok', 'no_text')]
     complete = results and len(valid) == len(results) and all(
         all(v['status'] in ('ok', 'no_text') for v in r['views']) for r in valid)
