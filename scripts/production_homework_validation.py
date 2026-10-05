@@ -59,7 +59,7 @@ def acceptance(state, scope, baseline_count, summary, raw_saved):
         'cloud_completed_nonempty': bool(fresh) and all(a['status'] == 'complete' and a.get('segments') for a in fresh),
         'only_assignment_calls': bool(fresh) and all(a['interval'].get('kind') == 'homework' for a in fresh),
         'review_complete': state.get('complete') is True and not state.get('failed') and not state.get('error_type'),
-        'visual_completed': visual.get('status') == 'ok' and any(f.get('text') for f in visual.get('frames', [])),
+        'visual_completed': visual.get('capture_status') == 'complete' and visual.get('reference_status') == 'supported',
         'summary_has_assignment_section': '作业与课务提醒' in summary,
         'raw_transcript_preserved': raw_saved,
     }
@@ -163,6 +163,8 @@ def run():
                      new_review_seconds=state.get('seconds', 0)-prior.get('seconds', 0),
                      total_review_clips=len(state['attempts']), total_review_seconds=state.get('seconds', 0),
                      visual_status=state.get('homework', {}).get('visual', {}).get('status'),
+                     visual_capture_status=state.get('homework', {}).get('visual', {}).get('capture_status'),
+                     visual_reference_status=state.get('homework', {}).get('visual', {}).get('reference_status'),
                      ocr_frames=len(state.get('homework', {}).get('visual', {}).get('frames', [])),
                      summary_chars=len(summary), checks=checks, passed=all(checks.values()),
                      asr_decoded_blocks=0, publish_results=False, send_email=False)

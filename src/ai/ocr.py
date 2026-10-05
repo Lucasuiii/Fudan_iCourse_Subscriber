@@ -33,10 +33,11 @@ class OCRBlock:
     box: list
 
 
-def ocr_image(image_bytes: bytes) -> list[OCRBlock]:
+def ocr_image(image_bytes: bytes, *, strict: bool = False) -> list[OCRBlock]:
     """Run OCR on raw image bytes. Returns list of recognized blocks.
 
-    Returns [] on any decode/engine failure (never raises for normal failures).
+    Default callers receive [] on decode/engine failure. strict=True propagates
+    failures so a focused review can distinguish them from an empty image.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -45,6 +46,8 @@ def ocr_image(image_bytes: bytes) -> list[OCRBlock]:
         import numpy as np
         arr = np.array(img)
     except Exception as e:
+        if strict:
+            raise
         print(f"[OCR] image decode failed: {type(e).__name__}")
         return []
 
@@ -52,6 +55,8 @@ def ocr_image(image_bytes: bytes) -> list[OCRBlock]:
     try:
         result, _elapsed = engine(arr)
     except Exception as e:
+        if strict:
+            raise
         print(f"[OCR] engine call failed: {type(e).__name__}")
         return []
 
@@ -67,6 +72,11 @@ def ocr_image(image_bytes: bytes) -> list[OCRBlock]:
             continue
         blocks.append(OCRBlock(text=text.strip(), confidence=score, box=box))
     return blocks
+
+
+def ocr_image_strict(image_bytes: bytes) -> list[OCRBlock]:
+    """Keep failure distinct from a successfully read frame with no text."""
+    return ocr_image(image_bytes, strict=True)
 
 
 def ocr_image_text(image_bytes: bytes) -> str:
