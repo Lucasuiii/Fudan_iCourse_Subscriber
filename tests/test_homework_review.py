@@ -194,3 +194,44 @@ class AssignmentRunnerTests(unittest.TestCase):
         self.assertEqual(env['StuId'], '${{ secrets.STUID }}')
         self.assertEqual(env['UISPsw'], '${{ secrets.UISPSW }}')
         self.assertNotIn('SMTP_PASSWORD', env)
+
+
+class TailValidationTests(unittest.TestCase):
+    def test_tail_preserves_original_clock_and_excludes_partial_boundary_block(self):
+        from scripts.production_homework_validation import scoped_material
+        original = {'audio_seconds': 1000, 'full_chunks': [
+            {'chunk_id': 0, 'start': 350, 'end': 472, 'text': '边界前内容'},
+            {'chunk_id': 1, 'start': 470, 'end': 592, 'text': '具体作业要求'}]}
+        data, scope = scoped_material(original)
+        self.assertEqual(scope['start'], 400)
+        self.assertEqual(data['full_chunks'][0]['chunk_id'], 1)
+        self.assertEqual(data['segments'][0]['start_ms'], 470000)
+        self.assertEqual(data['transcript'], '具体作业要求')
+        self.assertEqual(data['weak_windows'], [])
+        self.assertEqual(len(original['full_chunks']), 2)
+
+    def test_tail_review_keeps_every_original_quota_reservation(self):
+        from scripts.production_homework_validation import isolated_ledger
+        original = {'complete': True, 'seconds': 30, 'attempts': [
+            {'interval': {'start_ms': 0, 'end_ms': 30000, 'kind': 'weak'},
+             'seconds': 30, 'status': 'complete', 'segments': []}], 'intervals': [{'old': True}]}
+        state = isolated_ledger(original)
+        self.assertEqual(state['attempts'], original['attempts'])
+        self.assertEqual(state['seconds'], 30)
+        self.assertNotIn('complete', state)
+        self.assertEqual(state['intervals'], [])
+        self.assertTrue(original['complete']); validate_ledger(state)
+        for unsafe in [dict(original, complete=False), dict(original, failed=True)]:
+            with self.assertRaises(ValueError): isolated_ledger(unsafe)
+
+    def test_tail_entry_is_read_only_and_cannot_run_on_push(self):
+        import yaml
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        flow = yaml.safe_load((root/'.github/workflows/qwen_homework_validation.yml').read_text())
+        self.assertEqual(flow['permissions'], {'contents': 'read', 'actions': 'read'})
+        self.assertIn("github.event_name == 'workflow_dispatch'", flow['jobs']['review']['if'])
+        env = flow['jobs']['review']['env']
+        self.assertNotIn('SMTP_PASSWORD', env)
+        self.assertEqual(env['AUTO_COURSE_TERMS'], 'false')
+        self.assertEqual(flow['jobs']['register']['permissions'], {})
