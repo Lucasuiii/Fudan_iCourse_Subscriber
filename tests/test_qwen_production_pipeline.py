@@ -294,6 +294,10 @@ class FormalWorkflowTests(unittest.TestCase):
         self.assertEqual(formal['on']['workflow_dispatch']['inputs']['send_email']['default'],'false')
         self.assertEqual(formal['on']['workflow_dispatch']['inputs']['publish_results']['default'],'false')
         self.assertNotIn('asr',str(child['jobs']['publish']['steps']))
+        self.assertNotIn('toJSON(secrets)',str(formal))
+        self.assertNotIn('SECRETS_CONTEXT',str(child))
+        self.assertNotIn('SMTP_PASSWORD',child['jobs']['gather']['env'])
+        self.assertEqual(child['jobs']['gather']['env']['DEEPSEEK_API_KEY'],'${{ secrets.DEEPSEEK_API_KEY }}')
 
 
 

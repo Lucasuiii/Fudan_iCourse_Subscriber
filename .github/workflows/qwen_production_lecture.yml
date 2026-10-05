@@ -31,7 +31,15 @@ name: Qwen Production Lecture
         required: false
       SMTP_PASSWORD:
         required: false
-      PROVIDER_CONTEXT:
+      DEEPSEEK_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      DASHSCOPE_BASE_URL:
+        required: false
+      DEEPSEEK_BASE_URL:
+        required: false
+      GEMINI_BASE_URL:
         required: false
 permissions:
   contents: write
@@ -159,6 +167,12 @@ jobs:
       USE_OFFICIAL_TRANSCRIPT: '1'
       DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+      DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+      GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -176,12 +190,7 @@ jobs:
         pattern: qwen-production-asr-${{ inputs.task_slot }}-*
         path: ${{ runner.temp }}/qwen-shards/results
     - name: Finalize through LectureRunner with saved quota
-      env:
-        SECRETS_CONTEXT: ${{ secrets.PROVIDER_CONTEXT }}
-      run: |-
-        eval "$(python scripts/provider_env.py)"
-        unset SECRETS_CONTEXT
-        python -m scripts.production_qwen gather
+      run: python -m scripts.production_qwen gather
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
