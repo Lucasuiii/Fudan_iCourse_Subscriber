@@ -160,7 +160,7 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertEqual(result['frames'][0]['text'], '第2题')
         self.assertEqual(result['reference_status'], 'unverified')  # no confidence or matching audio
         self.assertEqual(result['capture_status'], 'partial')
-        self.assertNotIn('private', str(result)); client.get_video_url.assert_called_once()
+        self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_delayed_board_is_captured_after_original_audio_focus(self):
         from src.pipeline.homework_visual import collect_visual_evidence
@@ -176,7 +176,7 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertEqual([row['seconds'] for row in result['frames']], [95, 115, 135, 155, 175, 179.9])
         self.assertEqual(result['reference_status'], 'supported')
         self.assertEqual(result['capture_status'], 'complete')
-        self.assertNotIn('private', str(result)); client.get_video_url.assert_called_once_with('10', '1')
+        self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_unaligned_quote_never_seeks_guessed_video_position(self):
         from src.pipeline.homework_visual import collect_visual_evidence
@@ -305,7 +305,22 @@ class BoardEvidenceTests(unittest.TestCase):
             collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=300, ocr=ocr)
         self.assertEqual(events[:6], ['capture']*6)
         self.assertEqual(events[24:30], ['capture']*6)  # 6 captures + 18 OCR passes
-        self.assertEqual(client.get_video_url.call_count, 2)
+        self.assertEqual(client.get_video_url.call_count, 12)
+
+    def test_independent_seeks_never_reuse_signed_transport_identity(self):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = MagicMock(); client.get_ppt_list.return_value = []
+        client.get_video_url.side_effect = [f'signed-{i}' for i in range(6)]
+        client.get_stream_params.side_effect = lambda url: (url, 'private')
+        candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
+        seen = set()
+        def fetch(params, seconds, **kwargs):
+            if params[0] in seen: return {'image': None, 'error_code': 'http_403'}
+            seen.add(params[0]); return {'image': board_png(), 'error_code': None}
+        with patch('src.pipeline.homework_visual.video_frame', side_effect=fetch):
+            result = collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=180, ocr=lambda _: [])
+        self.assertEqual(len(seen), 6)
+        self.assertEqual(result['capture_status'], 'complete')
 
     def test_frame_transport_diagnostics_never_expose_private_error_bodies(self):
         import subprocess

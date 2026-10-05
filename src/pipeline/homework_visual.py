@@ -126,22 +126,22 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
         # Ordinary formula OCR is never a reason to skip delayed board frames.
         # Unaligned keywords cannot create a guessed video seek position.
         if window:
-            # Get a fresh signed source for each window, then finish transport
-            # before expensive OCR. Otherwise later seeks reuse a URL after
-            # several full-resolution OCR passes have already elapsed.
-            video_params = None
-            try:
-                url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain
-                if url:
-                    video_params = client.get_stream_params(url)
-            except Exception:
-                pass
+            # Separate ffmpeg processes must not reuse a signed transport
+            # identity. The real CDN accepted the first seek but returned 403
+            # for all later processes using that same URL, even before OCR.
             times = frame_times(interval, window)[:FRAMES_PER_CUE]
             captured = []
             for seconds in times:
                 if video_count >= MAX_VIDEO_FRAMES:
                     break
                 video_count += 1
+                video_params = None
+                try:
+                    url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain
+                    if url:
+                        video_params = client.get_stream_params(url)
+                except Exception:
+                    pass
                 response = video_frame(video_params, seconds, diagnostic=True) if video_params else None
                 image = response.get('image') if isinstance(response, dict) else response
                 error = response.get('error_code') if isinstance(response, dict) else None
