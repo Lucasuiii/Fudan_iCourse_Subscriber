@@ -57,6 +57,8 @@ def failure_code(error):
         'Recovery artifact is expired or ambiguous': 'recovery_expired',
         'Required recovery artifact is absent': 'recovery_missing',
         'Production audio is incomplete': 'incomplete_audio',
+        'Production audio has read or decode errors': 'audio_decode_errors',
+        'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
         'Isolated validation produced no transcript or summary': 'validation_empty_output',
         'All planned ASR shards must finish before finalization': 'incomplete_shards',
         'Shard incomplete; summary forbidden': 'incomplete_shards',
@@ -466,11 +468,14 @@ def retain_prepared_audio(handle, specification, files):
             handle.process.kill(); handle.process.wait(timeout=5)
         specification['decode_interrupted'] = True
     pcm = Path(handle.path)
+    # A process can exit before the drain thread consumes its final error.
+    done = getattr(handle, 'stderr_done', None)
+    diagnostics_complete = done is None or done.wait(timeout=5)
     size = pcm.stat().st_size if pcm.exists() else 0
     stderr = b''.join(handle.stderr_chunks).decode(errors='replace')
     match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
     media = specification.get('media_seconds')
-    if media is None and match:
+    if not media and match:
         media = int(match[1])*3600+int(match[2])*60+float(match[3])
     duration = size/64000
     specification.update(audio_seconds=duration, media_seconds=media)
@@ -480,6 +485,11 @@ def retain_prepared_audio(handle, specification, files):
                    'decode_return_code': handle.process.returncode,
                    'decode_interrupted': bool(specification.get('decode_interrupted')),
                    'timeline_preserved': bool(getattr(handle, 'timeline_preserved', False)),
+                   'stderr_complete': diagnostics_complete,
+                   'decode_error_counts': {code: count for code, count in
+                       getattr(handle, 'decode_error_counts', {}).copy().items()
+                       if code in {'premature_eof', 'input_read_error', 'decode_error', 'stderr_read_error'}
+                       and type(count) is int and 0 < count <= 1_000_000},
                    'audio_retained': 'lecture.flac' in files}
     specification['audio_diagnostics'] = diagnostics
     if not size or size % 4:
@@ -490,6 +500,19 @@ def retain_prepared_audio(handle, specification, files):
                         '-i', str(pcm), '-c:a', 'flac', '-y', str(flac)], timeout=300)
         files['lecture.flac'] = flac.read_bytes()
     diagnostics.update(audio_retained=True, audio_sha256=hashlib.sha256(files['lecture.flac']).hexdigest())
+
+
+def validate_prepared_audio(specification):
+    """Never turn a zero decoder exit into evidence of complete input."""
+    diagnostics = specification['audio_diagnostics']
+    if not diagnostics.get('stderr_complete', True):
+        raise ValueError('Production audio diagnostics are incomplete')
+    if (diagnostics.get('decode_error_counts') or diagnostics.get('decode_return_code') != 0
+            or diagnostics.get('decode_interrupted')):
+        raise ValueError('Production audio has read or decode errors')
+    duration, media = specification['audio_seconds'], specification.get('media_seconds')
+    if media and duration < media-max(120, media*.05):
+        raise ValueError('Production audio is incomplete')
 
 
 def prepare():
@@ -592,8 +615,8 @@ def prepare():
                 retain_prepared_audio(handle, specification, files)
                 if abs(specification['audio_seconds']-duration) > 1/16000:
                     raise ValueError('VAD input differs from retained PCM samples')
-                if media and duration < media-max(120, media*.05):
-                    raise ValueError('Production audio is incomplete')
+                validate_prepared_audio(specification)
+                media = specification.get('media_seconds') or 0
                 flac = root()/'lecture.flac'
                 digest = specification['audio_diagnostics']['audio_sha256']
                 plan = build_audio_plan({'selection': {'course_id': course, 'sub_id': sub_id},

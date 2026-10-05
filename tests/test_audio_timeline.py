@@ -5,10 +5,35 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
-from src.runtime.scheduler import AudioDownloader, _PendingSpawn
+from src.runtime.scheduler import AudioDownloader, _PendingSpawn, record_decode_errors
 
 
 class AudioTimelineTests(unittest.TestCase):
+    def test_downloader_keeps_header_and_error_counts_after_log_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloader=AudioDownloader(tmp,max_concurrent=1)
+            pending=_PendingSpawn();downloader._active['1']=pending
+            client=MagicMock();client.get_video_url.return_value='private-url'
+            client.get_stream_params.return_value=('private-url','private-header')
+            process=MagicMock();process.poll.return_value=0
+            process.stderr=[b'Duration: 00:10:00.00\n',b'Stream ends prematurely: private-url\n']+[b'frame=10\n']*3000
+            with patch('src.runtime.scheduler.subprocess.Popen',return_value=process):
+                downloader._spawn_when_ready(client,'10','1',pending,True)
+            handle=downloader.get('1');self.assertTrue(handle.stderr_done.wait(5))
+            self.assertLessEqual(len(handle.stderr_chunks),2048)
+            self.assertIn(b'Duration: 00:10:00.00',b''.join(handle.stderr_chunks))
+            self.assertEqual(handle.decode_error_counts,{'premature_eof':1})
+            downloader.shutdown()
+
+    def test_safe_decode_errors_survive_rotating_private_log_tail(self):
+        counts={}
+        record_decode_errors(b'https://private/token Stream ends prematurely at 20, should be 50\n',counts)
+        for _ in range(3000):record_decode_errors(b'frame=123 time=00:01:20\n',counts)
+        record_decode_errors(b'private-cookie: Error during demuxing: Input/output error\n',counts)
+        record_decode_errors(b'Error while decoding stream #0:1: private-url\n',counts)
+        self.assertEqual(counts,{'premature_eof':1,'input_read_error':1,'decode_error':1})
+        self.assertNotIn('private',str(counts))
+
     def extraction_command(self, preserve):
         with tempfile.TemporaryDirectory() as tmp:
             downloader=AudioDownloader(tmp,max_concurrent=1)

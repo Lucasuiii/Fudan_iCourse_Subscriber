@@ -112,41 +112,62 @@ def inspect():
     identity(run, slot)
     recipient = base64.b64decode(os.environ['RECIPIENT_PUBLIC_KEY'], validate=True)
     if len(recipient) != 32: raise ValueError('Invalid recipient public key')
-    info = json.loads(subprocess.check_output(['gh', 'api',
-        f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run}'],
-        stderr=subprocess.PIPE, timeout=60))
-    if info['status'] != 'completed' or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml':
-        raise ValueError('Source must be a completed formal pilot')
-    target = pipeline.root()/'media-inspection-source'
-    pipeline.artifact(f'qwen-production-prepare-{slot}', target, run=run, required=True)
-    with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
-        files = pipeline.decode(target/'prepared.enc', 'prepared')
-    spec = json.loads(files['specification.json']); del files
-    lecture = spec['lecture']; course = str(spec['course_id'])
-    vpn = WebVPNSession()
+    payload = {'source_run_id':run, 'source_slot':slot, 'same_source_bytes_verified':False}
+    stage = 'source_identity'
+    vpn = None
     try:
-        vpn.login(); vpn.authenticate_icourse()
+        info = json.loads(subprocess.check_output(['gh', 'api',
+            f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run}'],
+            stderr=subprocess.PIPE, timeout=60))
+        if info['status'] != 'completed' or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml':
+            raise ValueError('Source must be a completed formal pilot')
+        payload['source_commit'] = info['head_sha']
+        stage = 'retained_artifact'
+        target = pipeline.root()/'media-inspection-source'
+        pipeline.artifact(f'qwen-production-prepare-{slot}', target, run=run, required=True)
+        stage = 'retained_input'
+        with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
+            files = pipeline.decode(target/'prepared.enc', 'prepared')
+        spec = json.loads(files['specification.json']); del files
+        lecture = spec['lecture']; course = str(spec['course_id'])
+        payload.update(course_id=course, sub_id=str(lecture['sub_id']), date=lecture.get('date'),
+                       sub_title=lecture.get('sub_title'), retained_audio=spec.get('audio_diagnostics', {}))
+        vpn = WebVPNSession()
+        stage = 'webvpn_login'
+        vpn.login()
+        stage = 'icourse_authentication'
+        vpn.authenticate_icourse()
+        stage = 'playback_selection'
         client = ICourseClient(vpn)
         # Resolve exactly the stored lecture using the existing fallback chain.
         # No scanning, alternate-track switch, audio extraction or model call.
         url = client.get_video_url(course, str(lecture['sub_id']))
         if not url: raise ValueError('Saved lesson has no current playable source')
         vpn_url, headers = client.get_stream_params(url)
+        stage = 'source_headers'
         metadata = probe_headers(vpn_url, headers)
+        payload['current_source_metadata'] = metadata
+        if metadata['status'] != 'complete': raise ValueError('Source metadata probe failed')
         audio = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'audio']
         retained = spec.get('audio_diagnostics', {}).get('audio_seconds')
+        stage = 'late_packets'
         late = (probe_late_packets(vpn_url, headers, retained, audio[0])
-                if len(audio) == 1 and isinstance(retained, (int,float)) and metadata['status']=='complete'
+                if len(audio) == 1 and isinstance(retained, (int,float))
                 else {'status':'ambiguous_or_unavailable','packets':[]})
+        payload['current_source_late_packets'] = late
+        if late['status'] == 'failed': raise ValueError('Source late packet probe failed')
+        payload['inspection_status'] = 'complete'
+    except Exception as error:
+        # Do not serialize provider messages: they can contain signed URLs,
+        # login response bodies or cookies. Fixed stage names locate failures.
+        payload.update(inspection_status='failed', failure_stage=stage,
+                       failure_type=type(error).__name__)
+        raise
     finally:
-        vpn.session.close()
-    payload = {'source_run_id':run, 'source_slot':slot, 'source_commit':info['head_sha'],
-        'course_id':course, 'sub_id':str(lecture['sub_id']), 'date':lecture.get('date'),
-        'sub_title':lecture.get('sub_title'), 'retained_audio':spec.get('audio_diagnostics', {}),
-        'current_source_metadata':metadata, 'current_source_late_packets':late,
-        'same_source_bytes_verified':False}
-    pipeline.out('media-inspection.enc').write_bytes(encrypt(shards.encoded(payload), recipient, run, slot))
-    if metadata['status'] != 'complete': raise ValueError('Source metadata probe failed')
+        try:
+            if vpn is not None: vpn.session.close()
+        finally:
+            pipeline.out('media-inspection.enc').write_bytes(encrypt(shards.encoded(payload), recipient, run, slot))
 
 
 if __name__ == '__main__':

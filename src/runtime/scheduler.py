@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from src.runtime import config
@@ -132,6 +132,24 @@ class AudioHandle:
     process: subprocess.Popen
     stderr_chunks: list[bytes]
     timeline_preserved: bool = False
+    decode_error_counts: dict[str, int] = field(default_factory=dict)
+    stderr_done: Optional[threading.Event] = None
+
+
+def record_decode_errors(chunk: bytes, counts: dict[str, int]) -> None:
+    """Keep fixed error categories even when the private stderr tail rotates."""
+    text = chunk.lower()
+    patterns = {
+        'premature_eof': (b'stream ends prematurely', b'partial file'),
+        'input_read_error': (b'input/output error', b'error during demuxing',
+                             b'error opening input', b'connection timed out',
+                             b'connection reset by peer'),
+        'decode_error': (b'error while decoding', b'error decoding',
+                         b'corrupt input packet', b'packet corrupt'),
+    }
+    for code, needles in patterns.items():
+        if any(needle in text for needle in needles):
+            counts[code] = min(1_000_000, counts.get(code, 0)+1)
 
 
 class _PendingSpawn:
@@ -241,16 +259,22 @@ class AudioDownloader:
                 # Drain stderr so the pipe never deadlocks.  Keep last few KB
                 # for diagnostics if ffmpeg dies.
                 stderr_chunks: list[bytes] = []
+                decode_error_counts: dict[str, int] = {}
+                stderr_done = threading.Event()
 
                 def _drain():
                     try:
                         for chunk in proc.stderr:
+                            record_decode_errors(chunk, decode_error_counts)
                             stderr_chunks.append(chunk)
                             if len(stderr_chunks) > 2048:
-                                # keep only the tail to bound memory
-                                del stderr_chunks[: -1024]
+                                # Preserve the input header (Duration) and a
+                                # bounded tail; errors have separate counters.
+                                del stderr_chunks[64: -1024]
                     except Exception:
-                        pass
+                        decode_error_counts['stderr_read_error'] = 1
+                    finally:
+                        stderr_done.set()
 
                 threading.Thread(
                     target=_drain, name=f"audio-stderr-{sub_id}",
@@ -261,6 +285,8 @@ class AudioDownloader:
                     sub_id=sub_id, path=path,
                     process=proc, stderr_chunks=stderr_chunks,
                     timeline_preserved=preserve_timestamps,
+                    decode_error_counts=decode_error_counts,
+                    stderr_done=stderr_done,
                 )
 
                 # Install the handle — unless release() already removed our

@@ -488,6 +488,68 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_source_inspection_auth_failure_keeps_encrypted_stage_without_private_message(self):
+        import base64
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from scripts import production_media_inspection as inspection
+        from scripts.production_result_export import decrypt
+        private=X25519PrivateKey.generate()
+        private_bytes=private.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,
+                                           serialization.NoEncryption())
+        public=private.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{
+                'RUNNER_TEMP':tmp,'SOURCE_RUN_ID':'99','SOURCE_SLOT':'0','GITHUB_REPOSITORY':'owner/repo',
+                'RECIPIENT_PUBLIC_KEY':base64.b64encode(public).decode()}):
+            info={'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'abc'}
+            spec={'course_id':'10','lecture':{'sub_id':'1','date':'2026-09-24'},'audio_diagnostics':{'audio_seconds':4000}}
+            vpn=MagicMock();vpn.login.side_effect=RuntimeError('private-password-and-signed-url')
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'artifact',return_value=True), \
+                 patch.object(pipeline,'decode',return_value={'specification.json':json.dumps(spec).encode()}), \
+                 patch('src.api.webvpn.WebVPNSession',return_value=vpn), \
+                 patch.object(inspection,'probe_headers') as probe:
+                with self.assertRaises(RuntimeError):inspection.inspect()
+            payload=json.loads(decrypt((pipeline.root()/'out'/'media-inspection.enc').read_bytes(),private_bytes,'99',0))
+            self.assertEqual(payload['failure_stage'],'webvpn_login')
+            self.assertEqual(payload['failure_type'],'RuntimeError')
+            self.assertEqual(payload['inspection_status'],'failed')
+            self.assertNotIn('private-password',json.dumps(payload));probe.assert_not_called()
+            vpn.session.close.assert_called_once()
+
+    def test_zero_exit_with_read_errors_cannot_create_asr_plan(self):
+        spec={'audio_seconds':600,'media_seconds':600,'audio_diagnostics':{
+            'decode_return_code':0,'stderr_complete':True,'decode_error_counts':{'premature_eof':1}}}
+        with self.assertRaisesRegex(ValueError,'read or decode errors'):
+            pipeline.validate_prepared_audio(spec)
+        self.assertEqual(pipeline.failure_code(ValueError('Production audio has read or decode errors')),
+                         'audio_decode_errors')
+        spec['audio_diagnostics']['decode_error_counts']={}
+        spec['audio_diagnostics']['stderr_complete']=False
+        with self.assertRaisesRegex(ValueError,'diagnostics are incomplete'):
+            pipeline.validate_prepared_audio(spec)
+        spec['audio_diagnostics']['stderr_complete']=True
+        pipeline.validate_prepared_audio(spec)
+        spec['audio_seconds']=400
+        with self.assertRaisesRegex(ValueError,'audio is incomplete'):pipeline.validate_prepared_audio(spec)
+
+    def test_retention_waits_for_final_stderr_without_persisting_private_text(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp}):
+            raw=pipeline.root()/'partial.raw';raw.write_bytes(np.zeros(16000,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=0;process.returncode=0
+            counts={};done=MagicMock()
+            def drained(timeout):
+                counts.update(premature_eof=1);return True
+            done.wait.side_effect=drained
+            handle=SimpleNamespace(path=raw,process=process,stderr_chunks=[b'private-cookie'],
+                                   decode_error_counts=counts,stderr_done=done)
+            spec={};files={};pipeline.retain_prepared_audio(handle,spec,files)
+            done.wait.assert_called_once_with(timeout=5)
+            self.assertEqual(spec['audio_diagnostics']['decode_error_counts'],{'premature_eof':1})
+            self.assertNotIn('private',json.dumps(spec));self.assertIn('lecture.flac',files)
+            with self.assertRaisesRegex(ValueError,'read or decode errors'):pipeline.validate_prepared_audio(spec)
+
     def test_source_metadata_header_probe_never_decodes_or_exports_private_fields(self):
         from scripts.production_media_inspection import probe_headers, safe_metadata
         raw={'format':{'duration':'6565.43','filename':'private-url','tags':{'password':'secret'}},
