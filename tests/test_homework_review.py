@@ -290,6 +290,32 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertGreater(views[1][2][0], 1280)
         self.assertGreater(views[1][2][1], 1080)
 
+    def test_transport_finishes_before_video_ocr_and_new_cue_refreshes_source(self):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
+        client.get_stream_params.return_value = ('private', '')
+        candidates = assignment_candidates([dict(start=0, end=120, text='作业完成第二题。'),
+                                            dict(start=120, end=240, text='下次作业完成第三题。')])
+        intervals = [dict(chunk_id=c['id'], text=c['quote'], quote_start_ms=(i*120+10)*1000,
+                          quote_end_ms=(i*120+20)*1000) for i, c in enumerate(candidates)]
+        events = []
+        def fetch(*args, **kwargs): events.append('capture'); return board_png()
+        def ocr(data): events.append('ocr'); return []
+        with patch('src.pipeline.homework_visual.video_frame', side_effect=fetch):
+            collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=300, ocr=ocr)
+        self.assertEqual(events[:6], ['capture']*6)
+        self.assertEqual(events[24:30], ['capture']*6)  # 6 captures + 18 OCR passes
+        self.assertEqual(client.get_video_url.call_count, 2)
+
+    def test_frame_transport_diagnostics_never_expose_private_error_bodies(self):
+        import subprocess
+        from src.pipeline.homework_visual import video_frame
+        error = subprocess.CalledProcessError(1, 'ffmpeg', stderr=b'HTTP error 403: private-url?cookie=secret')
+        with patch('src.pipeline.homework_visual.subprocess.run', side_effect=error):
+            result = video_frame(('private-url', 'private-cookie'), 100, diagnostic=True)
+        self.assertEqual(result, {'image': None, 'error_code': 'http_403'})
+        self.assertNotIn('secret', str(result))
+
     def test_only_later_frames_with_homework_references_support_evidence(self):
         from src.pipeline.homework_visual import collect_visual_evidence
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110}]
@@ -300,7 +326,7 @@ class BoardEvidenceTests(unittest.TestCase):
             from PIL import Image
             w, _ = Image.open(io.BytesIO(data)).size
             return [{'text': '第7题' if w == 650 else 'A2=4', 'confidence': .96}]
-        with patch('src.pipeline.homework_visual.video_frame', side_effect=lambda params, sec: board if sec >= 155 else ordinary) as frame:
+        with patch('src.pipeline.homework_visual.video_frame', side_effect=lambda params, sec, **kw: board if sec >= 155 else ordinary) as frame:
             result = collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=180,
                                             screenshot_fetcher=lambda *a, **k: ordinary, ocr=ocr)
         self.assertEqual(result['reference_status'], 'supported')

@@ -99,7 +99,7 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
     except Exception:
         pages = []
     results, seen, windows, ids = [], set(), [], []
-    video_params = None; video_checked = False; video_count = 0
+    video_count = 0
     for candidate in candidates[:MAX_FOCUS]:
         cid = candidate_key(candidate['id'], candidate['quote']); ids.append(cid)
         interval = next((row for row in intervals if row.get('chunk_id') == candidate['id']
@@ -126,21 +126,30 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
         # Ordinary formula OCR is never a reason to skip delayed board frames.
         # Unaligned keywords cannot create a guessed video seek position.
         if window:
-            if not video_checked:
-                video_checked = True
-                try:
-                    url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain
-                    if url:
-                        video_params = client.get_stream_params(url)
-                except Exception:
-                    video_params = None
+            # Get a fresh signed source for each window, then finish transport
+            # before expensive OCR. Otherwise later seeks reuse a URL after
+            # several full-resolution OCR passes have already elapsed.
+            video_params = None
+            try:
+                url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain
+                if url:
+                    video_params = client.get_stream_params(url)
+            except Exception:
+                pass
             times = frame_times(interval, window)[:FRAMES_PER_CUE]
+            captured = []
             for seconds in times:
                 if video_count >= MAX_VIDEO_FRAMES:
                     break
                 video_count += 1
-                image = video_frame(video_params, seconds) if video_params else None
+                response = video_frame(video_params, seconds, diagnostic=True) if video_params else None
+                image = response.get('image') if isinstance(response, dict) else response
+                error = response.get('error_code') if isinstance(response, dict) else None
+                captured.append((seconds, image, error))
+            for seconds, image, error in captured:
                 row = read_frame(image, ocr)
+                if error:
+                    row['capture_error_code'] = error
                 results.append(dict(row, source='video_frame', seconds=seconds, candidate_id=cid))
                 if callable(frame_observer):
                     frame_observer(image, results[-1])
@@ -152,7 +161,7 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
                           'windows': windows, 'frames': results})
 
 
-def video_frame(params, seconds):
+def video_frame(params, seconds, *, diagnostic=False):
     url, headers = params
     with tempfile.TemporaryDirectory(prefix='icourse-homework-frame-') as tmp:
         path = Path(tmp)/'frame.png'
@@ -161,7 +170,17 @@ def video_frame(params, seconds):
             subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-rw_timeout', '15000000',
                             '-headers', headers, '-ss', str(seconds), '-i', url,
                             '-frames:v', '1', '-y', str(path)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=30)
-            return path.read_bytes()
-        except (OSError, subprocess.SubprocessError):
-            return None
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=30)
+            data = path.read_bytes()
+            return {'image': data, 'error_code': None} if diagnostic else data
+        except (OSError, subprocess.SubprocessError) as error:
+            # Inspect only in memory; never return stderr, private URL or body.
+            body = (getattr(error, 'stderr', None) or b'').decode(errors='ignore').lower()
+            if isinstance(error, subprocess.TimeoutExpired): code = 'capture_timeout'
+            elif '401' in body and ('http' in body or 'server' in body): code = 'http_401'
+            elif '403' in body and ('http' in body or 'server' in body): code = 'http_403'
+            elif '404' in body and ('http' in body or 'server' in body): code = 'http_404'
+            elif 'timed out' in body: code = 'transport_timeout'
+            elif isinstance(error, FileNotFoundError): code = 'no_frame_or_runtime_missing'
+            else: code = 'capture_failed'
+            return {'image': None, 'error_code': code} if diagnostic else None
