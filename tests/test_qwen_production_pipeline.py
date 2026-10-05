@@ -392,6 +392,51 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_existing_audio_inspection_exports_private_clips_without_asr_or_retrieval(self):
+        import base64
+        import numpy as np
+        import soundfile as sf
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from scripts import production_audio_inspection as inspection
+        from scripts.production_result_export import decrypt
+        private = X25519PrivateKey.generate()
+        public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP': tmp, 'GITHUB_RUN_ID': '100', 'GITHUB_REPOSITORY': 'owner/repo',
+                'SOURCE_RUN_ID': '99', 'SOURCE_SLOT': '0', 'QWEN_PRODUCTION_TASK': 'true',
+                'RECIPIENT_PUBLIC_KEY': base64.b64encode(public).decode()}):
+            root = pipeline.root(); flac = root/'fixture.flac'
+            sf.write(flac, np.zeros(60*16000, dtype='float32'), 16000, subtype='PCM_24')
+            stats, levels = inspection.audio_stats(flac)
+            self.assertEqual(stats['peak'], 0); self.assertEqual(stats['rms'], 0)
+            self.assertEqual(stats['seconds_below_rms_1e_5'], 60)
+            offsets = inspection.listening_offsets(levels, 60)
+            self.assertTrue(all(0 <= n <= 50 for n in offsets)); self.assertLessEqual(len(offsets), 8)
+            plan = build_audio_plan({'selection': {'course_id':'10','sub_id':'1'}, 'audio_seconds':60,
+                'full_chunks':[], 'recognition_terms':[], 'vad_windows':[]}, reference={'pipeline':'production'},
+                course_slot=0, run_id='99', audio_sha256=hashlib.sha256(flac.read_bytes()).hexdigest(),
+                production=True, mode='shared')
+            spec = {'plan':plan, 'course_id':'10','course_title':'高等代数',
+                    'lecture':{'sub_id':'1','date':'2026-09-28','sub_title':'2026-09-28第1-2节'}}
+            files = {'specification.json':pipeline.shards.encoded(spec),'lecture.flac':flac.read_bytes()}
+            transcriber = MagicMock(); transcriber._model = None
+            transcriber.prepare_pcm_stream.return_value = []; transcriber.last_vad_windows = []
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps({
+                    'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'a'*40}).encode()), \
+                 patch.object(pipeline,'artifact') as artifact, patch.object(pipeline,'decode',return_value=files), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber):
+                inspection.inspect()
+            artifact.assert_called_once_with('qwen-production-prepare-0',root/'audio-inspection-source',run='99',required=True)
+            transcriber._init.assert_not_called(); transcriber.recognize_blocks.assert_not_called()
+            raw_private = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+            payload = json.loads(decrypt((root/'out'/'audio-inspection.enc').read_bytes(),raw_private,'99',0))
+            self.assertEqual(payload['sub_title'],spec['lecture']['sub_title'])
+            self.assertEqual(payload['original_blocks'],0); self.assertTrue(payload['clips'])
+            for clip in payload['clips']:
+                data = base64.b64decode(clip['mp3_base64'])
+                self.assertEqual(hashlib.sha256(data).hexdigest(),clip['sha256'])
+
     def test_isolated_no_content_trial_fails_and_retains_checkpoint(self):
         Runner = _load_runner_class(); plan, results = fixture()
         plan['audio_seconds'] = 1800

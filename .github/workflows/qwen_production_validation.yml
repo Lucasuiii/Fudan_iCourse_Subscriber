@@ -18,6 +18,10 @@ name: Qwen Production Pipeline Validation
         description: Also export original complete Qwen blocks, before cloud review
         type: boolean
         default: false
+      inspect_audio:
+        description: Inspect existing prepared audio and export bounded listening clips, no ASR
+        type: boolean
+        default: false
   push:
     branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation]
     paths:
@@ -70,7 +74,7 @@ permissions:
   contents: read
 jobs:
   export:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -97,6 +101,41 @@ jobs:
       with:
         name: qwen-summary-private-export
         path: ${{ runner.temp }}/qwen-shards/out/summary-export.enc
+        retention-days: 7
+        if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  inspect-audio:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        python -m pip install cryptography pycryptodome numpy soundfile sherpa-onnx
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        curl --fail --silent --show-error --location -o silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+    - run: python -m scripts.production_audio_inspection
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-audio-private-inspection
+        path: ${{ runner.temp }}/qwen-shards/out/audio-inspection.enc
         retention-days: 7
         if-no-files-found: error
     - run: python -m scripts.production_qwen clean
