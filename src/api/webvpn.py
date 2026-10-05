@@ -208,6 +208,9 @@ class WebVPNSession:
            service URL with forward param and r=auth/login)
         3. IDP auth steps through WebVPN
         4. Follow ticket back to iCourse through WebVPN
+
+        strict=True requires successful final API verification. The default
+        keeps the existing caller's fallback behavior for unavailable APIs.
         """
         student_id = student_id or config.STUDENT_ID
         password = password or config.PASSWORD
@@ -638,6 +641,10 @@ class WebVPNSession:
                     "wengine_vpn_ticket" in c.name
                     for c in self.session.cookies
                 )
+                self.auth_diagnostics.append({'stage':'webvpn_ticket_follow',
+                    'transport_error':'timeout','attempt':attempt+1,
+                    'session_cookie_present':has_ticket})
+                self.auth_diagnostics = self.auth_diagnostics[-32:]
                 if has_ticket:
                     print("    Session cookie set despite timeout.")
                     return

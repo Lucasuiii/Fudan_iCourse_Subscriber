@@ -66,6 +66,8 @@ name: Qwen Production Pipeline Validation
     - '.github/**'
     - 'scripts/production_*.py'
     - 'src/runtime/scheduler.py'
+    - 'src/api/webvpn.py'
+    - 'tests/test_webvpn_auth_diagnostics.py'
     - 'tests/test_audio_timeline.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'

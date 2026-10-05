@@ -18,6 +18,16 @@ def response(data=None, *, text='', url='https://private/?lck=private-context', 
 
 
 class AuthDiagnosticTests(unittest.TestCase):
+    def test_session_ticket_timeouts_are_bounded_and_expose_no_cookie_or_url(self):
+        import requests
+        vpn=WebVPNSession();vpn.session=MagicMock();vpn.session.cookies=[]
+        vpn.session.get.side_effect=requests.exceptions.ReadTimeout('private-ticket-url')
+        with self.assertRaises(requests.exceptions.ReadTimeout):vpn._establish_session('private-ticket-url')
+        self.assertEqual(vpn.session.get.call_count,3)
+        self.assertEqual([row['attempt'] for row in vpn.auth_diagnostics],[1,2,3])
+        self.assertTrue(all(row['transport_error']=='timeout' for row in vpn.auth_diagnostics))
+        self.assertNotIn('private',json.dumps(vpn.auth_diagnostics));vpn.session.close()
+
     def session(self, *, api=None, execute=None, methods=None, cas=None, warmup=None):
         vpn=WebVPNSession();vpn.session=MagicMock();vpn._encrypt_password=MagicMock(return_value='private-encrypted-password')
         vpn.session.get.side_effect=[warmup or response(),cas or response(),response({'data':'private-public-key'}),
