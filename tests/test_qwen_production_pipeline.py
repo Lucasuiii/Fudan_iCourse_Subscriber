@@ -114,6 +114,7 @@ class ClassroomSelectionTests(unittest.TestCase):
     def test_new_fixed_trial_reuses_exact_failed_selection_and_frozen_terms(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
                 'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'100','GITHUB_REPOSITORY':'owner/repo',
+                'GITHUB_RUN_ATTEMPT':'1',
                 'COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,'QWEN_PRODUCTION_TASK':'true',
                 'VALIDATION_COURSE_ID':'10','VALIDATION_LECTURE_RANK':'1',
                 'VALIDATION_BEFORE_DATE':'2026-10-05','VALIDATION_SOURCE_RUN_ID':'99',
@@ -147,6 +148,12 @@ class ClassroomSelectionTests(unittest.TestCase):
             self.assertEqual(saved['history.db'],b'preserved-encrypted-history')
             with pipeline.shards.environment({'GITHUB_RUN_ID':'99'}):
                 with self.assertRaises(Exception):pipeline.decode(root/'out'/'queue.enc','queue')
+            with patch.dict(os.environ,{'GITHUB_RUN_ATTEMPT':'2'}), \
+                 patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'validation_source_queue') as source:
+                with self.assertRaisesRegex(ValueError,'Rerun has lost its queue checkpoint'):
+                    pipeline.plan()
+                source.assert_not_called()
 
     def test_source_rejects_active_runs_success_or_existing_recognition_input(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp,
