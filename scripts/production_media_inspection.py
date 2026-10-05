@@ -1,6 +1,6 @@
-"""Read source container/stream headers for one saved lecture, without decoding.
+"""Read source headers and bounded late packet timestamps without decoding.
 
-No media file, packets, frames, ASR, model credentials or publisher are used.
+No media file, packet payload export, frames, ASR or publisher are used.
 The current source's metadata is diagnostic evidence, not proof that a previous
 download of that lecture had the same bytes or was complete.
 """
@@ -65,6 +65,43 @@ def probe_headers(url, headers):
     return result
 
 
+def probe_late_packets(url, headers, retained_seconds, stream):
+    """At most 128 packet headers, no packet payload or frame decoding.
+
+    This checks whether current source audio beyond the saved input is readable;
+    it does not assert that the previously acquired source was identical.
+    """
+    endpoint = stream.get('end_time')
+    if not isinstance(endpoint, (float, int)) or endpoint <= retained_seconds+120:
+        return {'status':'not_needed', 'packets':[]}
+    starts = [max(0, retained_seconds+10), max(0, endpoint-10)]
+    intervals = ','.join(f'{start:.3f}%+#64' for start in starts)
+    began = time.monotonic()
+    process = subprocess.run(['ffprobe', '-v', 'error', '-nofind_stream_info',
+        '-rw_timeout', '30000000', '-headers', headers, '-select_streams', 'a:0',
+        '-read_intervals', intervals, '-show_packets', '-show_entries',
+        'packet=stream_index,pts_time,dts_time,duration_time,size,pos', '-of', 'json', url],
+        capture_output=True, timeout=90)
+    result = {'probe_return_code':process.returncode, 'probe_seconds':time.monotonic()-began,
+              'requested_starts':starts, 'maximum_packets':128, 'decoding':False,
+              'payload_exported':False, 'stderr_present':bool(process.stderr.strip()), 'packets':[]}
+    if process.returncode:
+        result['status']='failed'
+        return result
+    if len(process.stdout) > 256*1024: raise ValueError('Oversized packet metadata')
+    packets = json.loads(process.stdout).get('packets', [])
+    if len(packets) > 128: raise ValueError('Packet diagnostic bound exceeded')
+    for packet in packets:
+        row={}
+        for key in ('stream_index','pts_time','dts_time','duration_time','size','pos'):
+            try: value=float(packet.get(key))
+            except (TypeError,ValueError): continue
+            if math.isfinite(value):row[key]=value
+        result['packets'].append(row)
+    result['status']='complete'
+    return result
+
+
 def inspect():
     import base64
     from scripts import production_qwen as pipeline, sharded_qwen_pilot as shards
@@ -96,12 +133,18 @@ def inspect():
         if not url: raise ValueError('Saved lesson has no current playable source')
         vpn_url, headers = client.get_stream_params(url)
         metadata = probe_headers(vpn_url, headers)
+        audio = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'audio']
+        retained = spec.get('audio_diagnostics', {}).get('audio_seconds')
+        late = (probe_late_packets(vpn_url, headers, retained, audio[0])
+                if len(audio) == 1 and isinstance(retained, (int,float)) and metadata['status']=='complete'
+                else {'status':'ambiguous_or_unavailable','packets':[]})
     finally:
         vpn.session.close()
     payload = {'source_run_id':run, 'source_slot':slot, 'source_commit':info['head_sha'],
         'course_id':course, 'sub_id':str(lecture['sub_id']), 'date':lecture.get('date'),
         'sub_title':lecture.get('sub_title'), 'retained_audio':spec.get('audio_diagnostics', {}),
-        'current_source_metadata':metadata, 'same_source_bytes_verified':False}
+        'current_source_metadata':metadata, 'current_source_late_packets':late,
+        'same_source_bytes_verified':False}
     pipeline.out('media-inspection.enc').write_bytes(encrypt(shards.encoded(payload), recipient, run, slot))
     if metadata['status'] != 'complete': raise ValueError('Source metadata probe failed')
 
@@ -110,7 +153,7 @@ if __name__ == '__main__':
     os.environ['QWEN_PRODUCTION_TASK'] = 'true'
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()): inspect()
-        print('Source stream headers inspected encrypted; no audio decoding or ASR')
+        print('Source metadata inspected encrypted; no audio decoding or ASR')
     except Exception as error:
         print(f'Source metadata inspection failed ({type(error).__name__}); private details withheld')
         sys.exit(1)

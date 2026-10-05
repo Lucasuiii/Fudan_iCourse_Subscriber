@@ -522,6 +522,26 @@ class EncryptedStageTests(unittest.TestCase):
         self.assertNotIn('production_qwen prepare',text);self.assertNotIn('qwen_transcriber',text)
         self.assertNotIn('sharded_qwen_pilot worker',text)
 
+    def test_late_audio_packet_diagnostic_is_bounded_and_never_decodes_payload(self):
+        from scripts.production_media_inspection import probe_late_packets
+        packets={'packets':[{'stream_index':1,'pts_time':'6500.1','duration_time':'0.021',
+                            'data':'private audio','tags':{'secret':'not exported'}}]}
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps(packets).encode(),stderr=b'')) as run:
+            result=probe_late_packets('private-url','header',4078,{'end_time':6565})
+        command=run.call_args.args[0]
+        self.assertEqual(command[0],'ffprobe');self.assertIn('-nofind_stream_info',command)
+        self.assertEqual(command[command.index('-read_intervals')+1],'4088.000%+#64,6555.000%+#64')
+        self.assertNotIn('-show_data',command);self.assertNotIn('-show_frames',command)
+        self.assertEqual(result['packets'][0]['pts_time'],6500.1)
+        self.assertNotIn('private',json.dumps(result));self.assertFalse(result['decoding'])
+        with patch('scripts.production_media_inspection.subprocess.run') as run:
+            self.assertEqual(probe_late_packets('url','head',4078,{'end_time':4080})['status'],'not_needed')
+            run.assert_not_called()
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps({'packets':[{}]*129}).encode(),stderr=b'')):
+            with self.assertRaises(ValueError):probe_late_packets('url','header',4078,{'end_time':6565})
+
     def test_incomplete_preparation_retains_audio_durations_terms_and_refuses_refetch(self):
         import numpy as np
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {

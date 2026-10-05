@@ -23,7 +23,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
       inspect_source_metadata:
-        description: Inspect stored lesson source stream headers only, without decoding or ASR
+        description: Inspect stored lesson headers and at most 128 late packet timestamps, without decoding or ASR
         type: boolean
         default: false
   push:
