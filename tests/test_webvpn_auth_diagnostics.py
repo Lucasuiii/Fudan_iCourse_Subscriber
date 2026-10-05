@@ -46,13 +46,14 @@ class AuthDiagnosticTests(unittest.TestCase):
         self.assertEqual(vpn.session.get.call_count,2)
         self.assertEqual(vpn.auth_diagnostics[-1]['stage'],'webvpn_session_probe');vpn.session.close()
 
-    def test_session_ticket_timeouts_are_bounded_and_expose_no_cookie_or_url(self):
+    def test_session_ticket_timeout_never_replays_ticket_or_exposes_cookie_or_url(self):
         import requests
         vpn=WebVPNSession();vpn.session=MagicMock();vpn.session.cookies=[]
         vpn.session.get.side_effect=requests.exceptions.ReadTimeout('private-ticket-url')
         with self.assertRaises(requests.exceptions.ReadTimeout):vpn._establish_session('private-ticket-url')
-        self.assertEqual(vpn.session.get.call_count,3)
-        self.assertEqual([row['attempt'] for row in vpn.auth_diagnostics],[1,2,3])
+        self.assertEqual(vpn.session.get.call_count,1)
+        self.assertEqual(vpn.session.get.call_args.kwargs['timeout'],60)
+        self.assertEqual([row['attempt'] for row in vpn.auth_diagnostics],[1])
         self.assertTrue(all(row['transport_error']=='timeout' for row in vpn.auth_diagnostics))
         self.assertNotIn('private',json.dumps(vpn.auth_diagnostics));vpn.session.close()
 

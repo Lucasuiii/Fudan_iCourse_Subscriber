@@ -623,39 +623,27 @@ class WebVPNSession:
         return ticket_url
 
     def _establish_session(self, ticket_url: str):
-        """Step 7: Follow the ticket URL to establish WebVPN session."""
-        for attempt in range(3):
-            try:
-                resp = self.session.get(
-                    ticket_url, allow_redirects=True, timeout=20
-                )
-            except requests.exceptions.Timeout:
-                has_ticket = any(
-                    "wengine_vpn_ticket" in c.name
-                    for c in self.session.cookies
-                )
-                self.auth_diagnostics.append({'stage':'webvpn_ticket_follow',
-                    'transport_error':'timeout','attempt':attempt+1,
-                    'session_cookie_present':has_ticket})
-                self.auth_diagnostics = self.auth_diagnostics[-32:]
-                if has_ticket:
-                    self._verify_webvpn_session()
-                    print("    Session cookie set despite timeout.")
-                    return
-                if attempt < 2:
-                    print(f"    Timeout, retrying ({attempt + 2}/3)...")
-                    continue
-                raise
-            self._record_icourse_auth('webvpn_ticket_follow',resp)
-            if resp.status_code == 200:
-                # A portal probe timeout must not replay an already consumed
-                # ticket; let the caller establish a fresh session instead.
+        """Follow a one-use CAS ticket once; recovery requires a fresh ticket."""
+        try:
+            resp = self.session.get(ticket_url, allow_redirects=True, timeout=60)
+        except requests.exceptions.Timeout:
+            has_ticket = any("wengine_vpn_ticket" in c.name for c in self.session.cookies)
+            self.auth_diagnostics.append({'stage':'webvpn_ticket_follow',
+                'transport_error':'timeout','attempt':1,'session_cookie_present':has_ticket})
+            self.auth_diagnostics = self.auth_diagnostics[-32:]
+            if has_ticket:
                 self._verify_webvpn_session()
-                print("    Session established.")
+                print("    Session verified despite ticket request timeout.")
                 return
-            raise RuntimeError(
-                f"Failed to establish WebVPN session (status={resp.status_code})"
-            )
+            # CAS service tickets may already have been consumed even when
+            # the response timed out. The caller must obtain a fresh ticket.
+            raise
+        self._record_icourse_auth('webvpn_ticket_follow',resp)
+        if resp.status_code == 200:
+            self._verify_webvpn_session()
+            print("    Session established.")
+            return
+        raise AuthenticationError('cold_session')
 
     def _verify_webvpn_session(self):
         # A ticket endpoint may return a login page with HTTP 200. Neither
