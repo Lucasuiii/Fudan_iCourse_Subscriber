@@ -187,6 +187,17 @@ class ClassroomSelectionTests(unittest.TestCase):
 
 
 class PrivateSummaryExportTests(unittest.TestCase):
+    def test_raw_export_preserves_original_shard_text_and_timestamps(self):
+        from scripts.production_result_export import raw_qwen_payload
+        plan,results=fixture()
+        exported=raw_qwen_payload({'mode':'sharded','plan':plan,'media_seconds':600},results)
+        expected=assemble_material(plan,results,media_seconds=600)
+        self.assertEqual(exported['transcript'],expected['transcript'])
+        self.assertEqual(exported['segments'],expected['segments'])
+        self.assertEqual(exported['chunks'],expected['full_chunks'])
+        with self.assertRaises(ValueError):
+            raw_qwen_payload({'mode':'sharded','plan':plan,'media_seconds':600},results[:1])
+
     def test_summary_export_is_bound_to_recipient_and_source(self):
         from scripts.production_result_export import encrypt,decrypt
         from cryptography.hazmat.primitives import serialization

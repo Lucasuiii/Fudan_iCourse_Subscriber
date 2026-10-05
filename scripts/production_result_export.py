@@ -1,4 +1,4 @@
-"""Read a completed state artifact; return only summary and terminology audit.
+"""Read completed artifacts; return summary/audit and optional raw Qwen text.
 
 The database key stays on the runner. Output is encrypted for an ephemeral
 recipient public key; no SMTP, model calls, audio fetch, or database publication.
@@ -88,6 +88,21 @@ def summary_payload(files):
         workspace.cleanup()
 
 
+def raw_qwen_payload(spec, results):
+    from src.pipeline.prepared_lecture import assemble_material
+    if spec.get('mode') != 'sharded':
+        raise ValueError('Raw Qwen export requires original complete shards')
+    material = assemble_material(spec['plan'], results, media_seconds=spec.get('media_seconds'))
+    return {'source': 'original Qwen shard results, before cloud review or summary',
+            'audio_seconds': material['audio_seconds'], 'media_seconds': material['media_seconds'],
+            'audio_sha256': material['audio_sha256'], 'plan_hash': material['plan_hash'],
+            'transcript': material['transcript'], 'segments': material['segments'],
+            'chunks': material['full_chunks'],
+            'shards': [{'shard_id': r['shard_id'], 'complete': r['complete'],
+                        'seconds': r.get('seconds'), 'peak_rss_gib': r.get('peak_rss_gib')}
+                       for r in results]}
+
+
 def export():
     from scripts import production_qwen as pipeline
     from scripts import sharded_qwen_pilot as shards
@@ -104,7 +119,17 @@ def export():
     pipeline.artifact(f'qwen-production-state-{slot}', target, run=run, required=True)
     with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
         files = pipeline.decode(target/'state.enc', 'state')
-    payload = json.dumps(summary_payload(files), ensure_ascii=False, allow_nan=False).encode()
+    payload = summary_payload(files)
+    if os.environ.get('INCLUDE_TRANSCRIPT') == 'true':
+        spec = json.loads(files['specification.json'])
+        results = []
+        for shard in spec['plan']['shards']:
+            shard_id = shard['shard_id']; destination = target/str(shard_id)
+            pipeline.artifact(f'qwen-production-asr-{slot}-{shard_id}', destination, run=run, required=True)
+            with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
+                results.append(json.loads(pipeline.decode(destination/'worker-result.enc', f'result-{shard_id}')['result.json']))
+        payload['raw_qwen'] = raw_qwen_payload(spec, results)
+    payload = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
     pipeline.out('summary-export.enc').write_bytes(encrypt(payload, recipient, run, slot))
     print('Completed summary exported encrypted; no models, audio acquisition, email or publication')
 

@@ -14,6 +14,10 @@ name: Qwen Production Pipeline Validation
         description: Ephemeral recipient X25519 public key, base64
         type: string
         required: true
+      include_transcript:
+        description: Also export original complete Qwen blocks, before cloud review
+        type: boolean
+        default: false
   push:
     branches: [codex/qwen-production-pilot]
     paths:
@@ -51,6 +55,7 @@ jobs:
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       SOURCE_SLOT: ${{ inputs.source_slot }}
       RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+      INCLUDE_TRANSCRIPT: ${{ inputs.include_transcript }}
     steps:
     - uses: actions/checkout@v4
       with:
