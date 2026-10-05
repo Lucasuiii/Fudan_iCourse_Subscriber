@@ -30,6 +30,10 @@ name: Qwen Production Pipeline Validation
     - 'scripts/sharded_qwen_pilot.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
+    - 'src/ai/homework_review.py'
+    - 'src/ai/segment_rescue.py'
+    - 'tests/test_homework_review.py'
+    - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
   pull_request:
     paths:
@@ -37,6 +41,10 @@ name: Qwen Production Pipeline Validation
     - 'scripts/production_*.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
+    - 'src/ai/homework_review.py'
+    - 'src/ai/segment_rescue.py'
+    - 'tests/test_homework_review.py'
+    - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
 permissions:
   contents: read
@@ -89,3 +97,5 @@ jobs:
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
+    - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
+      run: PYTHONPATH=tests python -m unittest test_homework_review test_doubao_asr

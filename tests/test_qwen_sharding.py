@@ -39,14 +39,14 @@ def results_for(plan, data):
 
 
 class ShardPlanTests(unittest.TestCase):
-    def test_review_selection_18_requires_pilot_profile(self):
+    def test_review_selection_respects_each_profile_clip_limit(self):
         from scripts.qwen_quality import review_quality
         client = Mock()
         client.chat.completions.create.return_value.choices = [Mock(message=Mock(content=json.dumps({
             'suspects': [{'id': i, 'quote': f'具体异常原文编号{i:02}', 'reason': '口述不完整'} for i in range(20)]})))]
         report = {'full_chunks': [{'start': i*120, 'end': (i+1)*120,
                   'text': f'具体异常原文编号{i:02}'} for i in range(20)]}
-        for profile, expected in [('production', 12), ('pilot15', 18)]:
+        for profile, expected in [('production', 20), ('pilot15', 18)]:
             selected = review_quality(client, 'fake', report, {}, max_suspects=100, budget_profile=profile)
             self.assertEqual(len(selected), expected)
 

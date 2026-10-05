@@ -495,7 +495,7 @@ class RecoveryBoundaryTests(unittest.TestCase):
              patch('src.ai.doubao_asr.rescue_intervals_pcm',return_value=([],60,False)) as recognize:
             review_prepared(material,[],MagicMock(),state,lambda:None)
         self.assertEqual(recognize.call_count,10);self.assertEqual(state['seconds'],600)
-        self.assertLessEqual(len(state['attempts']),12)
+        self.assertLessEqual(len(state['attempts']),20)
 
     def test_saved_review_variants_survive_missing_api_key(self):
         Runner=_load_runner_class();plan,results=fixture();material=assemble_material(plan,results)

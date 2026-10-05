@@ -118,6 +118,8 @@ class LectureRunner:
         """
         sub_id = str(lecture["sub_id"])
         self._reset_lecture_state()
+        self._homework_course_id = str(course_id)
+        self._homework_sub_id = sub_id
         self._prepared_asr = prepared_asr
         self._review_state = review_state
         self._checkpoint = checkpoint
@@ -501,8 +503,7 @@ class LectureRunner:
         remaining = MAX_CLOUD_SECONDS - self._cloud_seconds
         clips_left = MAX_CLOUD_CLIPS - len(self._cloud_windows)
         if (getattr(self, '_prepared_asr', None) is not None
-                and getattr(self, '_review_state', None) is not None
-                and (self._review_state.get('complete') or (config.DOUBAO_ASR_API_KEY and self._asr_audio_path))):
+                and getattr(self, '_review_state', None) is not None):
             return self._refine_qwen(transcript, segments, ppt_pages, remaining, clips_left)
         if (not config.DOUBAO_ASR_API_KEY or self._cloud_failed
                 or not self._asr_audio_path or remaining <= 0 or clips_left <= 0
@@ -545,7 +546,7 @@ class LectureRunner:
         if getattr(self, '_review_state', None) is not None:
             from src.ai.qwen_review_ledger import review_prepared
             material = review_prepared(self._prepared_asr, ppt_pages, self._summarizer,
-                                       self._review_state, self._checkpoint)
+                                       self._review_state, self._checkpoint, homework_ocr=self._homework_visual)
             self._qwen_review_material = material
             self._cloud_term_sources = [v['cloud_text'] for v in material.get('variants', [])]
             self._cloud_seconds = self._review_state.get('seconds', 0)
@@ -564,7 +565,7 @@ class LectureRunner:
                     'vad_windows':self._transcriber.last_vad_windows}
             provider=self._summarizer.providers[0]
             selected=review_quality(self._summarizer._clients[provider['name']],provider['models'][0],
-                report,{'ppt':ppt_pages},max_suspects=min(12,clips_left),input_budget=96000)
+                report,{'ppt':ppt_pages},max_suspects=min(MAX_CLOUD_CLIPS,clips_left),input_budget=96000)
             if not selected: return transcript,segments
             with tempfile.TemporaryDirectory(prefix='icourse-qwen-align-') as tmp:
                 wav=Path(tmp)/'speech.wav'
@@ -589,6 +590,18 @@ class LectureRunner:
             self._reporter.info(f'    [WARN] Qwen review unavailable: {type(error).__name__}; preserving local text')
         return transcript,segments
 
+    def _homework_visual(self, candidates, intervals):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = self._client
+        if client is None:
+            # The gather runner normally needs no login. Create a scoped
+            # read-only session only when assignment evidence was detected.
+            from main import login_with_retry
+            from src.api.icourse import ICourseClient
+            client = ICourseClient(login_with_retry())
+        return collect_visual_evidence(client, self._homework_course_id, self._homework_sub_id,
+                                       candidates, intervals)
+
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
         try:
@@ -600,8 +613,16 @@ class LectureRunner:
                 prompt_text += ('\n\n官方字幕辅助材料（低可信度；不得覆盖 Qwen 转写，不得据此补写未识别的课堂内容）：\n'
                                 +json.dumps(self._prepared_asr['official_support'], ensure_ascii=False))
             if self._qwen_review_material:
+                general_review = {k: v for k, v in self._qwen_review_material.items() if k != 'homework'}
                 prompt_text += ('\n\n局部云端复核版本（不保证正确，不得无条件替换原文；未解决疑点不得编造）：\n'
-                                +json.dumps(self._qwen_review_material,ensure_ascii=False))
+                                +json.dumps(general_review,ensure_ascii=False))
+            from src.ai.homework_review import assignment_candidates, prioritize_candidates, homework_prompt, ensure_homework_notice
+            homework = self._qwen_review_material.get('homework', {})
+            if not homework.get('candidates'):
+                chunks = (getattr(self, '_prepared_asr', None) or {}).get('full_chunks') or getattr(self._transcriber, 'last_chunks', [])
+                if isinstance(chunks, list):
+                    homework = {'candidates': prioritize_candidates(assignment_candidates(chunks)), 'review_unavailable': True}
+            prompt_text += homework_prompt(homework)
             self._reporter.info(
                 f"    [Time] Generating summary at "
                 f"{time.strftime('%H:%M:%S')}"
@@ -615,6 +636,7 @@ class LectureRunner:
                     course_title,prompt_text,sources,self._historical_terms)
             else:
                 summary, model_used = self._summarizer.summarize(course_title, prompt_text)
+            summary = ensure_homework_notice(summary, homework)
             self._reporter.info(
                 f"    [OK] Summary by {model_used}: {len(summary)} chars"
             )

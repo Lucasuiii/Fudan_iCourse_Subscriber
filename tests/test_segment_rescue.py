@@ -18,7 +18,7 @@ class SegmentRescueTests(unittest.TestCase):
             for i in range(2, 30)
         ]
         picked = select_weak_windows(windows, 1_200)
-        self.assertLessEqual(len(picked), 12)
+        self.assertLessEqual(len(picked), 20)
         self.assertLessEqual(sum(w["end_ms"] - w["start_ms"]
                                  for w in picked), 600_000)
         self.assertNotIn(windows[0], picked)

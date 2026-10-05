@@ -165,6 +165,8 @@ jobs:
       SHARD_MODE: ${{ inputs.shard_mode }}
       AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
       USE_OFFICIAL_TRANSCRIPT: '1'
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
       DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}

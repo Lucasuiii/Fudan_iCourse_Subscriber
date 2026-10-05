@@ -7,8 +7,8 @@ from src.ai import doubao_asr
 
 
 class DoubaoASRTests(unittest.TestCase):
-    def test_pilot_quota_is_explicit_and_production_caps_stay_unchanged(self):
-        for profile, seconds_cap, clips_cap in [('production', 600, 12), ('pilot15', 900, 18)]:
+    def test_profiles_enforce_shared_time_and_clip_caps(self):
+        for profile, seconds_cap, clips_cap in [('production', 600, 20), ('pilot15', 900, 18)]:
             for seconds in (1, 60):
                 intervals = [{'start_ms': i*60000, 'end_ms': i*60000+seconds*1000, 'text': ''}
                              for i in range(25)]
@@ -21,7 +21,7 @@ class DoubaoASRTests(unittest.TestCase):
                 self.assertLessEqual(spent, seconds_cap)
                 self.assertFalse(failed)
         from src.ai.segment_rescue import cloud_budget_limits
-        self.assertEqual(cloud_budget_limits(), (600, 12))
+        self.assertEqual(cloud_budget_limits(), (600, 20))
         with self.assertRaises(ValueError):
             cloud_budget_limits('unbounded')
 
@@ -178,18 +178,18 @@ class DoubaoASRTests(unittest.TestCase):
         self.assertEqual(len(rescues), 10)
         self.assertFalse(failed)
 
-    def test_rescue_hard_clip_cap_is_twelve_even_for_short_windows(self):
+    def test_rescue_hard_clip_cap_is_twenty_even_for_short_windows(self):
         intervals = [{'start_ms': i * 20_000, 'end_ms': (i + 1) * 20_000,
-                      'text': ''} for i in range(20)]
+                      'text': ''} for i in range(25)]
         with patch.object(doubao_asr, '_encode_chunk', return_value=b'mp3'), \
              patch.object(doubao_asr, '_recognize_chunk', return_value=[]) as recognize:
             rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
                 'unused', 'key', intervals, session=MagicMock(),
                 max_seconds=9999, max_clips=99,
             )
-        self.assertEqual(len(rescues), 12)
-        self.assertEqual(recognize.call_count, 12)
-        self.assertEqual(attempted, 240)
+        self.assertEqual(len(rescues), 20)
+        self.assertEqual(recognize.call_count, 20)
+        self.assertEqual(attempted, 400)
         self.assertFalse(failed)
 
     def test_rescue_respects_remaining_shared_budget(self):

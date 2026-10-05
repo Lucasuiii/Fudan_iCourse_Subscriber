@@ -21,12 +21,12 @@ def validate_ledger(state):
         raise ValueError('Invalid whole-lecture cloud quota checkpoint')
 
 
-def review_prepared(material, pages, summarizer, state, checkpoint):
+def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_ocr=None):
     from scripts.qwen_quality import review_quality
     from scripts.qwen_audio_alignment import align_suspects
     from src.ai.doubao_asr import rescue_intervals_pcm
     validate_ledger(state)
-    if not config.DOUBAO_ASR_API_KEY or state.get('complete'):
+    if state.get('complete'):
         return state.get('material', {})
     if not callable(checkpoint):
         raise ValueError('Cloud review requires durable checkpoints')
@@ -35,14 +35,19 @@ def review_prepared(material, pages, summarizer, state, checkpoint):
     used = {(a['interval']['start_ms'], a['interval']['end_ms']) for a in attempts}
 
     def material_state():
-        variants, weak = [], []
+        variants, weak, homework_cloud = [], [], []
         for item in attempts:
             interval, segments = item['interval'], item.get('segments', [])
             if interval.get('kind') == 'weak':
                 if segments: weak.append((interval, segments))
+            elif interval.get('kind') == 'homework':
+                homework_cloud.append({'start_ms': interval['start_ms'], 'end_ms': interval['end_ms'],
+                                       'original_quote': interval['text'], 'status': item['status'],
+                                       'cloud_text': ' '.join(s['text'] for s in segments)})
             elif any(s['start_ms'] < interval['quote_end_ms'] and interval['quote_start_ms'] < s['end_ms'] for s in segments):
                 variants.append({'original_quote': interval['text'], 'cloud_text': ' '.join(s['text'] for s in segments)})
         return {'variants': variants, 'weak_rescues': weak, 'unresolved': state.get('unresolved', []),
+                'homework': {**state.get('homework', {}), 'cloud': homework_cloud},
                 'uncertain_calls': sum(i['status'] == 'reserved' for i in attempts)}
 
     def rescue(intervals):
@@ -50,6 +55,13 @@ def review_prepared(material, pages, summarizer, state, checkpoint):
             identity = (interval['start_ms'], interval['end_ms'])
             seconds = (interval['end_ms']-interval['start_ms'])/1000
             if identity in used or not 0 < seconds <= 60:
+                continue
+            # Focused assignment context must not be charged again as a weak
+            # or generic suspect clip. Existing checkpoints keep their quota.
+            if any(interval['start_ms'] < a['interval']['end_ms']
+                   and a['interval']['start_ms'] < interval['end_ms']
+                   and (interval.get('kind') == 'homework' or a['interval'].get('kind') == 'homework')
+                   for a in attempts):
                 continue
             if len(attempts) >= MAX_CLOUD_CLIPS or state.get('seconds', 0)+seconds > MAX_CLOUD_SECONDS:
                 continue
@@ -66,6 +78,59 @@ def review_prepared(material, pages, summarizer, state, checkpoint):
             if failed: break
 
     try:
+        from src.ai.homework_review import assignment_candidates, prioritize_candidates, focus_intervals, nearby_pages, MAX_FOCUS
+        if 'homework' not in state:
+            candidates = assignment_candidates(material['full_chunks'])
+            state['homework'] = {'candidates': prioritize_candidates(candidates), 'deferred_count': max(0, len(candidates)-MAX_FOCUS)}
+            checkpoint()
+        homework = state['homework']
+        if 'intervals' not in homework:
+            selected = [c for c in homework['candidates'] if c.get('alignable', True)]
+            intervals, unresolved = [], [dict(c, state='invalid_or_repeated_quote') for c in homework['candidates']
+                                        if not c.get('alignable', True)]
+            budget = min(240, MAX_CLOUD_SECONDS-state.get('seconds', 0))
+            if (selected and config.DOUBAO_ASR_API_KEY and material.get('audio_path') and budget > 0
+                    and len(attempts) < MAX_CLOUD_CLIPS and not state.get('failed')):
+                try:
+                    with tempfile.TemporaryDirectory(prefix='icourse-homework-') as tmp:
+                        wav = Path(tmp)/'audio.wav'
+                        subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'f32le', '-ar', '16000',
+                                        '-ac', '1', '-i', material['audio_path'], '-y', str(wav)],
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+                        raw, _, rejected, _ = align_suspects(report, selected, wav, lambda _: None, budget=budget)
+                        unresolved.extend(rejected)
+                        intervals = focus_intervals(raw, material.get('audio_seconds', 0))
+                except Exception as error:
+                    unresolved.extend(dict(c, state='focus_alignment_failed', error_type=type(error).__name__) for c in selected)
+            homework.update(intervals=intervals, unresolved=unresolved)
+            state['material'] = material_state()
+            checkpoint()
+        if homework['candidates'] and 'visual' not in homework:
+            try:
+                if callable(homework_ocr):
+                    homework['visual'] = homework_ocr(homework['candidates'], homework['intervals'])
+                else:
+                    frames = []
+                    seen = set()
+                    for candidate in homework['candidates']:
+                        for page in nearby_pages(pages, candidate):
+                            identity = (page.get('page_num'), page['created_sec'])
+                            if identity not in seen and str(page.get('text') or '').strip():
+                                seen.add(identity)
+                                frames.append({'source': 'existing_ppt_ocr', 'seconds': page['created_sec'],
+                                               'text': page['text'][:2000], 'status': 'ok'})
+                    homework['visual'] = {'status': 'ok' if frames else 'unavailable', 'frames': frames}
+            except Exception as error:
+                homework['visual'] = {'status': 'failed', 'error_type': type(error).__name__, 'frames': []}
+            state['material'] = material_state()
+            checkpoint()
+        if config.DOUBAO_ASR_API_KEY and not state.get('failed'):
+            rescue(homework['intervals'])  # Assignment cues take priority, within the shared ledger.
+        if not config.DOUBAO_ASR_API_KEY:
+            homework['cloud_unavailable'] = True
+            state['material'] = material_state()
+            checkpoint()
+            return state['material']
         if 'weak_intervals' not in state:
             from src.ai.segment_rescue import select_weak_windows
             weak = select_weak_windows(material.get('weak_windows', []), material.get('audio_seconds', 0),

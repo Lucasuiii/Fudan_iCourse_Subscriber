@@ -177,7 +177,7 @@ jobs:
         - '30'
         default: '10'
       quality_sample:
-        description: 'One review; Doubao capped at 120s for samples or 600s/12 clips for full lectures'
+        description: 'One review; Doubao capped at 120s for samples or 600s/20 clips for full lectures'
         type: boolean
         default: false
       latest_lecture:

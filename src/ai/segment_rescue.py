@@ -7,7 +7,7 @@ sparse.  The budget is per lecture, not per retry or account.
 """
 
 MAX_CLOUD_SECONDS = 10 * 60
-MAX_CLOUD_CLIPS = 12
+MAX_CLOUD_CLIPS = 20
 
 
 def cloud_budget_limits(profile='production'):
