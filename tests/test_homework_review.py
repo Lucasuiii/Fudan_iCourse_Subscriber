@@ -1,5 +1,6 @@
 """Assignment reminders, conservative timestamps, private OCR and retry quotas."""
 import copy
+import io
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -142,27 +143,39 @@ class AssignmentLedgerTests(unittest.TestCase):
         self.assertNotIn('private-cookie', str(state)); self.assertEqual(state['seconds'], 40)
 
 
+def board_png(size=(640, 360)):
+    from PIL import Image
+    buf = io.BytesIO(); Image.new('RGB', size, 'black').save(buf, format='PNG')
+    return buf.getvalue()
+
+
 class AssignmentVisualTests(unittest.TestCase):
-    def test_short_snapshot_is_ocrd_without_generic_page_filter(self):
+    def test_short_snapshot_does_not_skip_delayed_board_capture(self):
         from src.pipeline.homework_visual import collect_visual_evidence
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110, 'pptimgurl': 'private'}]
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
-        result = collect_visual_evidence(client, '10', '1', candidates, intervals,
-                                        screenshot_fetcher=MagicMock(return_value=b'image'), ocr=lambda _: '第2题')
+        client.get_video_url.return_value = None
+        result = collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=180,
+                                        screenshot_fetcher=MagicMock(return_value=board_png()), ocr=lambda _: '第2题')
         self.assertEqual(result['frames'][0]['text'], '第2题')
-        self.assertNotIn('private', str(result)); client.get_video_url.assert_not_called()
+        self.assertEqual(result['reference_status'], 'unverified')  # no confidence or matching audio
+        self.assertEqual(result['capture_status'], 'partial')
+        self.assertNotIn('private', str(result)); client.get_video_url.assert_called_once()
 
-    def test_missing_snapshot_uses_three_real_aligned_frames_and_existing_fallback(self):
+    def test_delayed_board_is_captured_after_original_audio_focus(self):
         from src.pipeline.homework_visual import collect_visual_evidence
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.return_value = 'signed-private'
         client.get_stream_params.return_value = ('vpn-private', 'cookies-private')
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
-        with patch('src.pipeline.homework_visual.video_frame', return_value=b'image') as frame:
+        with patch('src.pipeline.homework_visual.video_frame', return_value=board_png()) as frame:
             result = collect_visual_evidence(client, '10', '1', candidates, intervals,
-                                            screenshot_fetcher=MagicMock(), ocr=lambda _: '作业第二题')
-        self.assertEqual(frame.call_count, 3)
-        self.assertEqual([row['seconds'] for row in result['frames']], [90, 110, 129.5])
+                                            audio_seconds=180, screenshot_fetcher=MagicMock(),
+                                            ocr=lambda _: [{'text': '作业第2题', 'confidence': .95}])
+        self.assertEqual(frame.call_count, 6)
+        self.assertEqual([row['seconds'] for row in result['frames']], [95, 115, 135, 155, 175, 179.9])
+        self.assertEqual(result['reference_status'], 'supported')
+        self.assertEqual(result['capture_status'], 'complete')
         self.assertNotIn('private', str(result)); client.get_video_url.assert_called_once_with('10', '1')
 
     def test_unaligned_quote_never_seeks_guessed_video_position(self):
@@ -170,7 +183,8 @@ class AssignmentVisualTests(unittest.TestCase):
         client = MagicMock(); client.get_ppt_list.return_value = []
         result = collect_visual_evidence(client, '10', '1', assignment_candidates(material()['full_chunks']), [],
                                         screenshot_fetcher=MagicMock(), ocr=MagicMock())
-        self.assertEqual(result['status'], 'unavailable'); client.get_video_url.assert_not_called()
+        self.assertEqual(result['reference_status'], 'unverified'); self.assertEqual(result['capture_status'], 'unavailable')
+        client.get_video_url.assert_not_called()
 
 
 class AssignmentRunnerTests(unittest.TestCase):
@@ -194,6 +208,127 @@ class AssignmentRunnerTests(unittest.TestCase):
         self.assertEqual(env['StuId'], '${{ secrets.STUID }}')
         self.assertEqual(env['UISPsw'], '${{ secrets.UISPSW }}')
         self.assertNotIn('SMTP_PASSWORD', env)
+
+
+class BoardEvidenceTests(unittest.TestCase):
+    def visual(self, texts, *, confidence=.95, candidate='cue'):
+        from src.ai.homework_visual_evidence import references
+        return {'candidate_ids': [candidate], 'frames': [
+            {'seconds': time, 'candidate_id': candidate, 'text': text,
+             'references': [{'text': ref, 'confidence': confidence} for ref in references(text)]}
+            for time, text in texts]}
+
+    def test_formula_and_example_numbers_never_count_as_exercises(self):
+        from src.ai.homework_visual_evidence import assess_visual
+        result = assess_visual(self.visual([(100, '例2.5.1 A2=4 第2章 习题二'), (120, '例2.5.1 A2=4 第2章 习题二')]))
+        self.assertEqual(result['status'], 'needs_verification')
+        self.assertEqual(result['reference_evidence'], [])
+
+    def test_single_instant_crops_and_low_confidence_are_not_corroboration(self):
+        from src.ai.homework_visual_evidence import assess_visual
+        for visual in [self.visual([(100, '第2题')]*3),
+                       self.visual([(100, '第2题'), (120, '第2题')], confidence=.4)]:
+            self.assertEqual(assess_visual(visual)['reference_status'], 'unverified')
+
+    def test_audio_must_be_completed_matching_and_from_same_reminder(self):
+        from src.ai.homework_visual_evidence import assess_visual
+        visual = self.visual([(100, '第7、9题')])
+        matching = {'candidate_id': 'cue', 'status': 'complete', 'cloud_text': '请完成第7、9题'}
+        self.assertEqual(assess_visual(visual, [matching])['reference_status'], 'supported')
+        for clip in [dict(matching, status='reserved'), dict(matching, candidate_id='other'),
+                     dict(matching, cloud_text='做第8题')]:
+            self.assertEqual(assess_visual(visual, [clip])['reference_status'], 'unverified')
+
+    def test_one_reminder_cannot_hide_another_missing_board(self):
+        from src.ai.homework_visual_evidence import assess_visual
+        visual = self.visual([(100, '习题二：1、3、5'), (120, '习题二：1、3、5')])
+        visual['candidate_ids'].append('other')
+        self.assertEqual(assess_visual(visual)['reference_status'], 'unverified')
+        self.assertTrue(assess_visual(visual)['reference_evidence'][0]['supported'])
+
+    def test_audio_conflict_overrides_repeated_visual_reference(self):
+        from src.ai.homework_visual_evidence import assess_visual
+        result = assess_visual(self.visual([(100, '第7题'), (120, '第7题')]),
+                               [{'candidate_id': 'cue', 'status': 'complete', 'cloud_text': '完成第8题'}])
+        self.assertEqual(result['reference_status'], 'unverified')
+        self.assertTrue(result['reference_evidence'][0]['audio_conflict'])
+        mixed = assess_visual(self.visual([(100, '第7题，第8题'), (120, '第7题，第8题')]),
+                               [{'candidate_id': 'cue', 'status': 'complete', 'cloud_text': '完成第8题'}])
+        self.assertEqual(mixed['reference_status'], 'unverified')
+
+    def test_strict_runtime_does_not_turn_engine_failure_into_no_text(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        from types import ModuleType
+        from src.pipeline.homework_visual import read_frame
+        fake = ModuleType('rapidocr_onnxruntime'); fake.RapidOCR = MagicMock()
+        spec = importlib.util.spec_from_file_location('_board_ocr_test',
+            Path(__file__).resolve().parents[1]/'src/ai/ocr.py')
+        runtime = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'rapidocr_onnxruntime': fake, '_board_ocr_test': runtime, 'numpy': MagicMock()}):
+            spec.loader.exec_module(runtime)
+            runtime._engine = MagicMock(side_effect=RuntimeError('private'))
+            result = read_frame(board_png(), runtime.ocr_image_strict)
+        self.assertEqual(result['status'], 'ocr_failed')
+        self.assertNotIn('private', str(result))
+
+    def test_capture_decode_no_text_and_ocr_failures_are_distinct(self):
+        from src.pipeline.homework_visual import read_frame
+        self.assertEqual(read_frame(None, MagicMock())['status'], 'capture_failed')
+        self.assertEqual(read_frame(b'not-image', MagicMock())['status'], 'image_decode_failed')
+        self.assertEqual(read_frame(board_png(), lambda _: [])['status'], 'no_text')
+        failed = read_frame(board_png(), MagicMock(side_effect=RuntimeError('private-cookie')))
+        self.assertEqual(failed['status'], 'ocr_failed')
+        self.assertNotIn('private-cookie', str(failed))
+
+    def test_original_resolution_and_overlapping_enlarged_regions(self):
+        from src.pipeline.homework_visual import image_views
+        views = image_views(board_png((1920, 1080)))
+        self.assertEqual(views[0][2], (1920, 1080))
+        self.assertEqual(len(views), 3)
+        self.assertGreater(views[1][2][0], 1280)
+        self.assertGreater(views[1][2][1], 1080)
+
+    def test_only_later_frames_with_homework_references_support_evidence(self):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110}]
+        client.get_video_url.return_value = 'private'; client.get_stream_params.return_value = ('private', 'private')
+        candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
+        ordinary, board = board_png(), board_png((650, 360))
+        def ocr(data):
+            from PIL import Image
+            w, _ = Image.open(io.BytesIO(data)).size
+            return [{'text': '第7题' if w == 650 else 'A2=4', 'confidence': .96}]
+        with patch('src.pipeline.homework_visual.video_frame', side_effect=lambda params, sec: board if sec >= 155 else ordinary) as frame:
+            result = collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=180,
+                                            screenshot_fetcher=lambda *a, **k: ordinary, ocr=ocr)
+        self.assertEqual(result['reference_status'], 'supported')
+        self.assertEqual(result['reference_evidence'][0]['seconds'], [155, 175, 179.9])
+        self.assertEqual(frame.call_count, 6)
+
+    def test_no_frame_seeks_past_end_and_four_cues_remain_bounded(self):
+        from src.pipeline.homework_visual import collect_visual_evidence
+        client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
+        client.get_stream_params.return_value = ('private', '')
+        chunks = [dict(start=i*120, end=(i+1)*120, text='今天布置作业，完成第二题。') for i in range(4)]
+        candidates = assignment_candidates(chunks)
+        intervals = [dict(chunk_id=c['id'], text=c['quote'], quote_start_ms=(i*120+10)*1000,
+                          quote_end_ms=(i*120+20)*1000) for i, c in enumerate(candidates)]
+        with patch('src.pipeline.homework_visual.video_frame', return_value=None) as frame:
+            result = collect_visual_evidence(client, '10', '1', candidates, intervals, audio_seconds=410, ocr=MagicMock())
+        self.assertLessEqual(frame.call_count, 24)
+        self.assertTrue(all(0 <= call.args[1] < 410 for call in frame.call_args_list))
+        self.assertEqual(result['capture_status'], 'unavailable')
+
+    def test_old_success_marker_does_not_satisfy_visual_acceptance(self):
+        from scripts.production_homework_validation import acceptance
+        state = {'material': {'homework': {'visual': {'status': 'ok', 'frames': [{'text': 'A=I'}]}}}}
+        self.assertFalse(acceptance(state, {'start': 0, 'end': 10}, 0, '作业与课务提醒', True)['visual_completed'])
+        summary = ensure_homework_notice('## 作业与课务提醒\n矩阵作业待核实。',
+                                        {'candidates': [{}], 'visual': {'status': 'ok'}})
+        self.assertIn('视觉核对未完成', summary)
+        self.assertEqual(ensure_homework_notice(summary, {'candidates': [{}]}), summary)
 
 
 class TailValidationTests(unittest.TestCase):

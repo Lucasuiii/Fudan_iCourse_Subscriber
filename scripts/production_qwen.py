@@ -506,6 +506,8 @@ def gather():
                 homework_deferred=review.get('homework', {}).get('deferred_count', 0),
                 homework_clips=sum(a['interval'].get('kind') == 'homework' for a in review.get('attempts', [])),
                 homework_visual_status=review.get('homework', {}).get('visual', {}).get('status'),
+                homework_visual_capture_status=review.get('homework', {}).get('visual', {}).get('capture_status'),
+                homework_visual_reference_status=review.get('homework', {}).get('visual', {}).get('reference_status'),
                 asr_complete=bool(material and material.get('complete')))
             out('validation-result.json').write_bytes(shards.encoded(audit))
     db.checkpoint = checkpoint

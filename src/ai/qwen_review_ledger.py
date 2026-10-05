@@ -41,13 +41,19 @@ def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_
             if interval.get('kind') == 'weak':
                 if segments: weak.append((interval, segments))
             elif interval.get('kind') == 'homework':
+                from src.ai.homework_visual_evidence import candidate_key
                 homework_cloud.append({'start_ms': interval['start_ms'], 'end_ms': interval['end_ms'],
+                                       'candidate_id': candidate_key(interval['chunk_id'], interval['text']),
                                        'original_quote': interval['text'], 'status': item['status'],
                                        'cloud_text': ' '.join(s['text'] for s in segments)})
             elif any(s['start_ms'] < interval['quote_end_ms'] and interval['quote_start_ms'] < s['end_ms'] for s in segments):
                 variants.append({'original_quote': interval['text'], 'cloud_text': ' '.join(s['text'] for s in segments)})
+        homework = state.get('homework', {})
+        if homework.get('visual'):
+            from src.ai.homework_visual_evidence import assess_visual
+            homework['visual'] = assess_visual(homework['visual'], homework_cloud)
         return {'variants': variants, 'weak_rescues': weak, 'unresolved': state.get('unresolved', []),
-                'homework': {**state.get('homework', {}), 'cloud': homework_cloud},
+                'homework': {**homework, 'cloud': homework_cloud},
                 'uncertain_calls': sum(i['status'] == 'reserved' for i in attempts)}
 
     def rescue(intervals):

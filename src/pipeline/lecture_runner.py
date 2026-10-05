@@ -600,7 +600,8 @@ class LectureRunner:
             from src.api.icourse import ICourseClient
             client = ICourseClient(login_with_retry())
         return collect_visual_evidence(client, self._homework_course_id, self._homework_sub_id,
-                                       candidates, intervals)
+                                       candidates, intervals,
+                                       audio_seconds=(getattr(self, '_prepared_asr', None) or {}).get('audio_seconds'))
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:
