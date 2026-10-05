@@ -488,6 +488,40 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_source_metadata_header_probe_never_decodes_or_exports_private_fields(self):
+        from scripts.production_media_inspection import probe_headers, safe_metadata
+        raw={'format':{'duration':'6565.43','filename':'private-url','tags':{'password':'secret'}},
+             'streams':[{'index':1,'codec_type':'audio','codec_name':'aac','start_time':'0',
+                'duration':'4078.527','time_base':'1/16000','tags':{'comment':'classroom'}},
+                {'index':0,'codec_type':'video','duration':'6565.43','start_time':'0'},
+                {'duration':'nan','start_time':'inf','codec_name':'private://secret','time_base':'invalid'}]}
+        result=safe_metadata(raw)
+        self.assertEqual(result['streams'][0]['end_time'],4078.527)
+        self.assertEqual(result['streams'][1]['end_time'],6565.43)
+        self.assertEqual(result['streams'][2],{})
+        self.assertNotIn('private',json.dumps(result));self.assertNotIn('classroom',json.dumps(result))
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps(raw).encode(),stderr=b'')) as run:
+            result=probe_headers('private-url','private-header')
+        command=run.call_args.args[0]
+        self.assertEqual(command[0],'ffprobe');self.assertIn('-nofind_stream_info',command)
+        self.assertNotIn('-show_packets',command);self.assertNotIn('-show_frames',command)
+        self.assertTrue(result['header_only']);self.assertEqual(result['status'],'complete')
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=1,stdout=b'',stderr=b'private-url/secret')):
+            failed=probe_headers('url','headers')
+        self.assertEqual(failed['status'],'failed');self.assertNotIn('secret',json.dumps(failed))
+
+    def test_source_metadata_workflow_has_no_models_publishers_or_mail(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/qwen_production_validation.yml').read_text())
+        job=workflow['jobs']['inspect-source-metadata']
+        self.assertEqual(job['permissions'],{'contents':'read','actions':'read'})
+        self.assertEqual({k for k,v in job['env'].items() if 'secrets.' in v},
+                         {'DB_ENCRYPTION_KEY','StuId','UISPsw'})
+        text=json.dumps(job)
+        self.assertNotIn('production_qwen prepare',text);self.assertNotIn('qwen_transcriber',text)
+        self.assertNotIn('sharded_qwen_pilot worker',text)
+
     def test_incomplete_preparation_retains_audio_durations_terms_and_refuses_refetch(self):
         import numpy as np
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {

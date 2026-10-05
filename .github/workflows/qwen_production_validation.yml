@@ -22,6 +22,10 @@ name: Qwen Production Pipeline Validation
         description: Inspect existing prepared audio and export bounded listening clips, no ASR
         type: boolean
         default: false
+      inspect_source_metadata:
+        description: Inspect stored lesson source stream headers only, without decoding or ASR
+        type: boolean
+        default: false
   push:
     branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation]
     paths:
@@ -78,7 +82,7 @@ permissions:
   contents: read
 jobs:
   export:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio && !inputs.inspect_source_metadata }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -110,7 +114,7 @@ jobs:
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   inspect-audio:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio && !inputs.inspect_source_metadata }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -142,6 +146,43 @@ jobs:
         path: ${{ runner.temp }}/qwen-shards/out/audio-inspection.enc
         retention-days: 7
         if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  inspect-source-metadata:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_source_metadata && !inputs.inspect_audio }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        python -m pip install cryptography pycryptodome requests
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    - run: python -m scripts.production_media_inspection
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-media-private-inspection
+        path: ${{ runner.temp }}/qwen-shards/out/media-inspection.enc
+        retention-days: 7
+        if-no-files-found: ignore
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   validate:
