@@ -148,11 +148,11 @@ class AutomaticGlossary:
     def terms(self, exclude_sub_id=None, before_date=None):
         return active_terms(self.records(), exclude_sub_id=exclude_sub_id, before_date=before_date)
 
-    def freeze(self, title, sub_id):
+    def freeze(self, title, sub_id, *, lecture_date=None):
         from src.ai.course_glossary import course_terms
         from scripts.qwen_sharding import fingerprint
         lecture = self.db.get_lecture(str(sub_id)) or {}
-        date = lecture.get('date')
+        date = lecture_date or lecture.get('date')
         base = course_terms(title)
         # Unknown lecture dates cannot safely choose earlier confirmed records.
         confirmed = self.terms(exclude_sub_id=sub_id, before_date=date) if date else []

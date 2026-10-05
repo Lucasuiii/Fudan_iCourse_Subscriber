@@ -260,6 +260,27 @@ def shared_results(plan):
         store.close()
 
 
+def freeze_course_terms(db, course, title, sub_id):
+    """See earlier published lessons even when the task queue was planned before them."""
+    from src.ai.automatic_glossary import AutomaticGlossary
+    if os.environ.get('PUBLISH_RESULTS') != 'true':
+        return AutomaticGlossary(db, course).freeze(title, sub_id)
+    history_path = root()/'glossary-history.db'
+    revision = load_remote(history_path)
+    if revision is None:
+        return AutomaticGlossary(db, course).freeze(title, sub_id)
+    history = Database(str(history_path))
+    try:
+        # The selected lesson may be new and absent from published history.
+        # Its immutable queue date controls which older records are eligible.
+        date = (db.get_lecture(sub_id) or {}).get('date')
+        frozen = AutomaticGlossary(history, course).freeze(title, sub_id, lecture_date=date)
+        frozen['history_revision'] = revision
+        return frozen
+    finally:
+        history.conn.close()
+
+
 def recover_preparation(db, course, sub_id):
     """Carry immutable audio and completed blocks into the next normal run."""
     raw = db.read_meta('qwen_pipeline:'+sub_id)
@@ -393,6 +414,11 @@ def prepare():
                         review['complete'] = True
                     specification.update(material=material, review=review)
             else:
+                terms = course_terms(title)
+                if os.environ.get('AUTO_COURSE_TERMS') == 'true':
+                    glossary_snapshot = freeze_course_terms(db, course, title, sub_id)
+                    terms = glossary_snapshot['terms']
+                    specification['glossary_snapshot'] = glossary_snapshot
                 scheduler.audio_downloader.schedule(client, course, sub_id)
                 handle = scheduler.audio_downloader.get(sub_id, timeout=180)
                 if handle is None: raise ValueError('No playable production audio')
@@ -410,12 +436,6 @@ def prepare():
                 media = transcriber.last_media_duration or 0
                 if media and duration < media-max(120, media*.05):
                     raise ValueError('Production audio is incomplete')
-                terms = course_terms(title)
-                if os.environ.get('AUTO_COURSE_TERMS') == 'true':
-                    from src.ai.automatic_glossary import AutomaticGlossary
-                    glossary_snapshot = AutomaticGlossary(db, course).freeze(title, sub_id)
-                    terms = glossary_snapshot['terms']
-                    specification['glossary_snapshot'] = glossary_snapshot
                 flac = root()/'lecture.flac'
                 shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'f32le', '-ar', '16000', '-ac', '1',
                                 '-i', handle.path, '-c:a', 'flac', '-y', str(flac)], timeout=300)

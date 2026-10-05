@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -186,6 +187,36 @@ class AutomaticGlossaryTests(unittest.TestCase):
             self.assertEqual(glossary.terms(), ['Householder'])
             self.assertLessEqual(len(glossary.records()[0]['keywords'][0]['evidence']), 12)
             db.conn.close()
+
+    def test_new_lesson_reads_published_confirmation_after_queue_was_planned(self):
+        from scripts import production_qwen as pipeline
+        from scripts.production_db import snapshot
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Database(str(Path(tmp)/'queued.db'))
+            local.upsert_course('10', '高代', '教师'); local.insert_lecture('2', '10', '新课次', '2026-10-04')
+            remote = Database(str(Path(tmp)/'remote.db'))
+            remote.upsert_course('10', '高代', '教师'); remote.insert_lecture('1', '10', '上一课', '2026-09-29')
+            AutomaticGlossary(remote, '10').save('1', [{'term': '镜像变换', 'source': 'ppt', 'quote': '镜像变换'}],
+                sources={'ppt': ['镜像变换'], 'cloud': ['我们采用镜像变换计算']})
+            blob = snapshot(remote, Path(tmp)/'saved.db'); remote.conn.close()
+            def load(path): path.write_bytes(blob); return 'a'*40
+            with patch.dict(os.environ, {'PUBLISH_RESULTS': 'true'}), \
+                 patch.object(pipeline, 'root', return_value=Path(tmp)), patch.object(pipeline, 'load_remote', side_effect=load), \
+                 patch('src.ai.course_glossary.course_terms', return_value=[]):
+                frozen = pipeline.freeze_course_terms(local, '10', '高代', '2')
+            self.assertEqual(frozen['terms'], ['镜像变换'])
+            self.assertEqual(frozen['lecture_date'], '2026-10-04')
+            self.assertEqual(frozen['history_revision'], 'a'*40)
+            self.assertEqual(AutomaticGlossary(local, '10').terms(), [])
+            local.conn.close()
+
+    def test_isolated_preparation_uses_its_snapshot_and_does_not_read_remote(self):
+        from scripts import production_qwen as pipeline
+        db = MagicMock(); db.get_lecture.return_value = {'date': '2026-10-04'}; db.read_meta_prefix.return_value = []
+        with patch.dict(os.environ, {'PUBLISH_RESULTS': 'false'}), \
+             patch.object(pipeline, 'load_remote') as load, patch('src.ai.course_glossary.course_terms', return_value=['矩阵']):
+            self.assertEqual(pipeline.freeze_course_terms(db, '10', '高代', '2')['terms'], ['矩阵'])
+            load.assert_not_called()
 
     def test_prepared_frozen_terms_override_current_db_for_review_and_save(self):
         from test_qwen_production_pipeline import fixture, database
