@@ -1,5 +1,19 @@
 name: Qwen Production Pipeline Validation
 'on':
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed production pilot run to export (no recognition)
+        type: string
+        required: true
+      source_slot:
+        description: Opaque lecture slot
+        type: string
+        default: '0'
+      recipient_public_key:
+        description: Ephemeral recipient X25519 public key, base64
+        type: string
+        required: true
   push:
     branches: [codex/qwen-production-pilot]
     paths:
@@ -23,7 +37,39 @@ name: Qwen Production Pipeline Validation
 permissions:
   contents: read
 jobs:
+  export:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome
+    - run: python -m scripts.production_result_export
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-summary-private-export
+        path: ${{ runner.temp }}/qwen-shards/out/summary-export.enc
+        retention-days: 7
+        if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
   validate:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

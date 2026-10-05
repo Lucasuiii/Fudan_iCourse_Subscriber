@@ -186,6 +186,44 @@ class ClassroomSelectionTests(unittest.TestCase):
             self.assertNotIn('sub_id',audit);self.assertNotIn('https:',audit)
 
 
+class PrivateSummaryExportTests(unittest.TestCase):
+    def test_summary_export_is_bound_to_recipient_and_source(self):
+        from scripts.production_result_export import encrypt,decrypt
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        private=X25519PrivateKey.generate()
+        raw=private.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption())
+        public=private.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        payload='私有摘要'.encode();blob=encrypt(payload,public,'99',0)
+        self.assertNotIn(payload,blob);self.assertEqual(decrypt(blob,raw,'99',0),payload)
+        for invalid,run,slot in [(blob,'100',0),(blob,'99',1),(blob[:-1]+bytes([blob[-1]^1]),'99',0)]:
+            with self.assertRaises(Exception):decrypt(invalid,raw,run,slot)
+
+    def test_export_reads_exact_completed_summary_without_transcript(self):
+        from scripts.production_result_export import summary_payload
+        with tempfile.TemporaryDirectory() as tmp:
+            db=database(Path(tmp)/'source.db',summary='历史摘要')
+            db.update_transcript('1','原课堂全文')
+            files={'database.db':snapshot(db,Path(tmp)/'snapshot.db'),
+                   'specification.json':pipeline.shards.encoded({'course_id':'10','course_title':'概率论',
+                    'lecture':{'sub_id':'1','date':'2026-10-04'},'plan':{'recognition_terms':['条件期望']}}),
+                   'review.json':b'{}'}
+            db.conn.close();payload=summary_payload(files)
+            self.assertEqual(payload['summary'],'历史摘要')
+            self.assertEqual(payload['recognition_terms'],['条件期望'])
+            self.assertNotIn('原课堂全文',json.dumps(payload,ensure_ascii=False))
+            spec=json.loads(files['specification.json']);spec['lecture']['sub_id']='2'
+            files['specification.json']=pipeline.shards.encoded(spec)
+            with self.assertRaises(ValueError):summary_payload(files)
+
+    def test_export_workflow_has_no_credentials_for_models_or_mail(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/qwen_production_validation.yml').read_text())
+        job=workflow['jobs']['export']
+        self.assertEqual(job['permissions'],{'contents':'read','actions':'read'})
+        self.assertEqual([k for k in job['env'] if 'secrets.' in job['env'][k]],['DB_ENCRYPTION_KEY'])
+        self.assertIn("github.event_name != 'workflow_dispatch'",workflow['jobs']['validate']['if'])
+
+
 class CloudLedgerTests(unittest.TestCase):
     def test_reserved_unknown_call_is_not_repeated_on_resume(self):
         from src.ai.qwen_review_ledger import review_prepared,validate_ledger
