@@ -131,6 +131,7 @@ class AudioHandle:
     path: str          # disk file ffmpeg writes f32le mono 16 kHz to
     process: subprocess.Popen
     stderr_chunks: list[bytes]
+    timeline_preserved: bool = False
 
 
 class _PendingSpawn:
@@ -173,7 +174,7 @@ class AudioDownloader:
                 if isinstance(h, AudioHandle)
             )
 
-    def schedule(self, client, course_id: str, sub_id: str) -> None:
+    def schedule(self, client, course_id: str, sub_id: str, *, preserve_timestamps=False) -> None:
         """Reserve a slot for sub_id and spawn ffmpeg in the background.
 
         Returns immediately. If all slots are taken the spawn blocks in its
@@ -189,7 +190,7 @@ class AudioDownloader:
 
         threading.Thread(
             target=self._spawn_when_ready,
-            args=(client, course_id, sub_id, pending),
+            args=(client, course_id, sub_id, pending, preserve_timestamps),
             name=f"audio-spawn-{sub_id}",
             daemon=True,
         ).start()
@@ -201,7 +202,7 @@ class AudioDownloader:
                 self._active.pop(sub_id, None)
 
     def _spawn_when_ready(self, client, course_id: str, sub_id: str,
-                          pending: _PendingSpawn):
+                          pending: _PendingSpawn, preserve_timestamps=False):
         try:
             self._sem.acquire()
             try:
@@ -223,6 +224,10 @@ class AudioDownloader:
                     "-reconnect_delay_max", "5",
                     "-i", vpn_url,
                     "-vn",
+                    # Raw PCM has no timestamps. Fill actual source timestamp
+                    # gaps before discarding them so later ASR/visual offsets
+                    # stay on the playback timeline. Do not invent a video tail.
+                    *(["-af", "aresample=async=1:first_pts=0"] if preserve_timestamps else []),
                     "-ar", "16000",
                     "-ac", "1",
                     "-f", "f32le",
@@ -255,6 +260,7 @@ class AudioDownloader:
                 handle = AudioHandle(
                     sub_id=sub_id, path=path,
                     process=proc, stderr_chunks=stderr_chunks,
+                    timeline_preserved=preserve_timestamps,
                 )
 
                 # Install the handle — unless release() already removed our

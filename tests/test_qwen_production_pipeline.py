@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 import yaml
 from scripts.qwen_sharding import build_audio_plan, fingerprint, validate_plan
 from scripts.production_db import snapshot, lecture_snapshot, merge_lecture
@@ -111,6 +111,63 @@ class PreparedLectureTests(unittest.TestCase):
 
 
 class ClassroomSelectionTests(unittest.TestCase):
+    def test_new_fixed_trial_reuses_exact_failed_selection_and_frozen_terms(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'100','GITHUB_REPOSITORY':'owner/repo',
+                'COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,'QWEN_PRODUCTION_TASK':'true',
+                'VALIDATION_COURSE_ID':'10','VALIDATION_LECTURE_RANK':'1',
+                'VALIDATION_BEFORE_DATE':'2026-10-05','VALIDATION_SOURCE_RUN_ID':'99',
+                'AUTO_COURSE_TERMS':'true','PUBLISH_RESULTS':'false','SEND_EMAIL':'false','COURSE_IDS':'10'}):
+            root=pipeline.root();db=database(root/'fixture.db');db_bytes=snapshot(db,root/'snapshot.db');db.conn.close()
+            lecture={'sub_id':'1','date':'2026-10-04','sub_title':'第1-2节',
+                '_validation':{'date':'2026-10-04','playable_rank':1,'before_date':'2026-10-05'}}
+            frozen={'schema':1,'course_id':'10','sub_id':'1','lecture_date':'2026-10-04',
+                    'terms':['条件期望'],'terms_sha256':fingerprint(['条件期望'])}
+            spec={'mode':'failed','course_id':'10','lecture':lecture,'glossary_snapshot':frozen}
+            with pipeline.shards.environment({'GITHUB_RUN_ID':'99'}):
+                pipeline.encode({'queue.json':pipeline.shards.encoded([['10','概率论',lecture]]),
+                    'database.db':db_bytes,'history.db':b'preserved-encrypted-history'},'queue',root/'old-queue.enc')
+                pipeline.encode({'specification.json':pipeline.shards.encoded(spec),'database.db':db_bytes},
+                    'prepared',root/'old-prepared.enc')
+            def download(name,target,**kwargs):
+                if not kwargs.get('run'):return False
+                target.mkdir(parents=True,exist_ok=True)
+                file='queue.enc' if name=='qwen-production-queue' else 'prepared.enc'
+                (target/file).write_bytes((root/('old-'+file)).read_bytes());return True
+            info={'status':'completed','conclusion':'failure','path':'.github/workflows/parallel_pilot.yml'}
+            with patch.object(pipeline,'artifact',side_effect=download), \
+                 patch.object(pipeline.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'write_outputs'), \
+                 patch.object(pipeline,'latest_validation_task') as select:
+                pipeline.plan()
+            select.assert_not_called()
+            saved=pipeline.decode(root/'out'/'queue.enc','queue');task=json.loads(saved['queue.json'])[0]
+            self.assertEqual(task[2]['sub_id'],'1');self.assertEqual(task[2]['_frozen_glossary'],frozen)
+            self.assertEqual(task[2]['_validation']['source_run_id'],'99')
+            self.assertEqual(saved['history.db'],b'preserved-encrypted-history')
+            with pipeline.shards.environment({'GITHUB_RUN_ID':'99'}):
+                with self.assertRaises(Exception):pipeline.decode(root/'out'/'queue.enc','queue')
+
+    def test_source_rejects_active_runs_success_or_existing_recognition_input(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp,
+                'GITHUB_REPOSITORY':'owner/repo','AUTO_COURSE_TERMS':'false'}):
+            for status,conclusion in [('in_progress',None),('completed','success')]:
+                with patch.object(pipeline.subprocess,'check_output',return_value=json.dumps({
+                        'status':status,'conclusion':conclusion,'path':'.github/workflows/parallel_pilot.yml'}).encode()), \
+                     patch.object(pipeline,'artifact') as fetch:
+                    with self.assertRaises(ValueError):pipeline.validation_source_queue('99')
+                    fetch.assert_not_called()
+            lecture={'sub_id':'1'};queue={'queue.json':json.dumps([['10','概率论',lecture]]).encode()}
+            for extra in ({'plan':{'blocks':[]}}, {'review':{'seconds':1}}, {'mode':'cached'}, {'audio':True}):
+                spec=dict(mode='failed',course_id='10',lecture=lecture,**{k:v for k,v in extra.items() if k!='audio' and k!='mode'})
+                spec['mode']=extra.get('mode','failed')
+                prepared={'specification.json':json.dumps(spec).encode()}
+                if extra.get('audio'):prepared['lecture.flac']=b'original'
+                with patch.object(pipeline.subprocess,'check_output',return_value=json.dumps({
+                        'status':'completed','conclusion':'failure','path':'.github/workflows/parallel_pilot.yml'}).encode()), \
+                     patch.object(pipeline,'artifact'),patch.object(pipeline,'decode',side_effect=[queue,prepared]):
+                    with self.assertRaises(ValueError):pipeline.validation_source_queue('99')
+
     def test_cutoff_selects_older_recording_and_rejects_invalid_dates(self):
         db=MagicMock();db.get_lecture.return_value=None
         client=MagicMock();client.get_course_detail.return_value={'title':'高代','lectures':[
@@ -424,6 +481,64 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_incomplete_preparation_retains_audio_durations_terms_and_refuses_refetch(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'99','COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,
+                'QWEN_PRODUCTION_TASK':'true','AUTO_COURSE_TERMS':'true','PUBLISH_RESULTS':'false',
+                'SHARD_MODE':'shared','GITHUB_ACTIONS':'false'}):
+            root=pipeline.root(); db=database(root/'fixture.db')
+            lecture={'sub_id':'1','date':'2026-10-04','_validation':{'date':'2026-10-04'}}
+            frozen={'schema':1,'course_id':'10','sub_id':'1','lecture_date':'2026-10-04',
+                    'terms':['条件期望'],'terms_sha256':fingerprint(['条件期望'])}
+            lecture['_frozen_glossary']=frozen
+            raw=root/'source.raw';raw.write_bytes(np.full(4*16000,.1,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=0;process.returncode=0
+            handle=SimpleNamespace(path=str(raw),process=process,timeline_preserved=True,
+                stderr_chunks=[b'private-url:token\n Duration: 00:06:40.00, start: 0.000000'])
+            scheduler=MagicMock();scheduler.audio_downloader.get.return_value=handle
+            transcriber=MagicMock();transcriber.prepare_pcm_stream.return_value=[(1,3)]
+            transcriber.last_audio_duration=4;transcriber.last_media_duration=400;transcriber.last_vad_windows=[(1,3)]
+            with patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'task_files',return_value=(db,'10','概率论',lecture)), \
+                 patch.dict('sys.modules',{'main':SimpleNamespace(login_with_retry=lambda:None)}), \
+                 patch('src.runtime.scheduler.Scheduler',return_value=scheduler), \
+                 patch('src.pipeline.ppt_pipeline.PPTPipeline'),patch('src.api.icourse.ICourseClient'), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber), \
+                 patch.object(pipeline,'freeze_course_terms') as freeze:
+                with self.assertRaisesRegex(ValueError,'Production audio is incomplete'):pipeline.prepare()
+            freeze.assert_not_called();transcriber.recognize_blocks.assert_not_called()
+            scheduler.audio_downloader.schedule.assert_called_once_with(ANY,'10','1',preserve_timestamps=True)
+            saved=pipeline.decode(root/'out'/'prepared.enc','prepared');spec=json.loads(saved['specification.json'])
+            self.assertEqual(spec['mode'],'failed');self.assertEqual(spec['error_code'],'incomplete_audio')
+            self.assertEqual(spec['glossary_snapshot'],frozen);self.assertEqual(spec['audio_seconds'],4)
+            self.assertEqual(spec['audio_diagnostics']['duration_gap_seconds'],396)
+            self.assertTrue(spec['audio_diagnostics']['audio_retained'])
+            self.assertEqual(hashlib.sha256(saved['lecture.flac']).hexdigest(),spec['audio_diagnostics']['audio_sha256'])
+            self.assertNotIn('private-url',json.dumps(spec))
+            (root/'inbox').mkdir();pipeline.encode(saved,'prepared',root/'inbox'/'prepared.enc')
+            with patch.object(pipeline,'artifact',return_value=False):
+                with self.assertRaisesRegex(ValueError,'Preparation failed'):pipeline.gather()
+            audit=json.loads((root/'out'/'validation-result.json').read_bytes())
+            self.assertEqual(audit['audio_seconds'],4);self.assertEqual(audit['media_seconds'],400)
+            self.assertEqual(audit['frozen_terms_count'],1);self.assertEqual(audit['asr_execution'],'not_started')
+            self.assertFalse(audit['asr_complete']);self.assertFalse(audit['processed'])
+            with patch.object(pipeline,'artifact',return_value=True),patch.object(pipeline,'decode',return_value=saved), \
+                 patch.object(pipeline,'task_files') as task:
+                with self.assertRaisesRegex(ValueError,'Production audio is incomplete'):pipeline.prepare()
+            task.assert_not_called()
+
+    def test_failed_decode_retains_actual_samples_without_claiming_success(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp}):
+            raw=pipeline.root()/'partial.raw';raw.write_bytes(np.zeros(16000,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=1;process.returncode=1
+            handle=SimpleNamespace(path=raw,process=process,stderr_chunks=[b'Duration: 00:10:00.00'])
+            spec={};files={};pipeline.retain_prepared_audio(handle,spec,files)
+            self.assertEqual(spec['audio_diagnostics']['decode_return_code'],1)
+            self.assertEqual(spec['audio_seconds'],1);self.assertEqual(spec['media_seconds'],600)
+            self.assertIn('lecture.flac',files);self.assertNotIn('plan',spec)
+
     def test_existing_audio_inspection_exports_private_clips_without_asr_or_retrieval(self):
         import base64
         import numpy as np
@@ -468,6 +583,17 @@ class EncryptedStageTests(unittest.TestCase):
             for clip in payload['clips']:
                 data = base64.b64decode(clip['mp3_base64'])
                 self.assertEqual(hashlib.sha256(data).hexdigest(),clip['sha256'])
+            spec.pop('plan');spec.update(mode='failed',audio_diagnostics={'audio_retained':True,
+                'audio_seconds':60,'audio_sha256':plan['audio_sha256']})
+            files['specification.json']=pipeline.shards.encoded(spec)
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps({
+                    'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'a'*40}).encode()), \
+                 patch.object(pipeline,'artifact'),patch.object(pipeline,'decode',return_value=files), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber):
+                inspection.inspect()
+            failed=json.loads(decrypt((root/'out'/'audio-inspection.enc').read_bytes(),raw_private,'99',0))
+            self.assertEqual(failed['preparation_mode'],'failed');self.assertEqual(failed['metrics']['audio_seconds'],60)
+            self.assertEqual(failed['original_blocks'],0);transcriber.recognize_blocks.assert_not_called()
 
     def test_isolated_no_content_trial_fails_and_retains_checkpoint(self):
         Runner = _load_runner_class(); plan, results = fixture()

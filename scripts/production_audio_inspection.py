@@ -68,15 +68,24 @@ def inspect():
     pipeline.artifact(f'qwen-production-prepare-{slot}', target, run=run, required=True)
     with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
         files = pipeline.decode(target/'prepared.enc', 'prepared')
-    spec = json.loads(files['specification.json']); plan = spec['plan']
+    spec = json.loads(files['specification.json']); plan = spec.get('plan')
     from scripts.qwen_sharding import validate_plan
-    validate_plan(plan)
+    if plan:
+        validate_plan(plan)
+        expected_hash, expected_duration = plan['audio_sha256'], plan['audio_seconds']
+    else:
+        # Preparation can fail before a plan exists. Listen only to retained,
+        # hash-bound samples; this never permits them to bypass the ASR gate.
+        evidence = spec.get('audio_diagnostics', {})
+        if spec.get('mode') != 'failed' or not evidence.get('audio_retained'):
+            raise ValueError('No retained preparation audio')
+        expected_hash, expected_duration = evidence['audio_sha256'], evidence['audio_seconds']
     blob = files['lecture.flac']; digest = hashlib.sha256(blob).hexdigest()
-    if digest != plan['audio_sha256']: raise ValueError('Prepared audio hash changed')
+    if digest != expected_hash: raise ValueError('Prepared audio hash changed')
     flac = pipeline.root()/'inspection.flac'; flac.write_bytes(blob)
     del files, blob
     metrics, levels = audio_stats(flac)
-    if abs(metrics['audio_seconds']-plan['audio_seconds']) > .1:
+    if abs(metrics['audio_seconds']-expected_duration) > .1:
         raise ValueError('Prepared audio duration changed')
     raw = pipeline.root()/'inspection.raw'
     shards.command(['ffmpeg','-nostdin','-v','error','-i',str(flac),'-f','f32le',
@@ -91,8 +100,10 @@ def inspect():
     payload = {'source_run_id':run, 'source_commit':info['head_sha'], 'source_slot':slot,
         'course_id':spec['course_id'], 'course_title':spec['course_title'],
         'date':lecture.get('date'), 'sub_title':lecture.get('sub_title'), 'sub_id':lecture['sub_id'],
-        'audio_sha256':digest, 'metrics':metrics,
-        'original_vad_windows':len(plan['vad_windows']), 'original_blocks':len(plan['blocks']),
+        'audio_sha256':digest, 'metrics':metrics, 'preparation_mode':spec.get('mode'),
+        'audio_diagnostics':spec.get('audio_diagnostics', {}),
+        'original_vad_windows':len(plan['vad_windows'] if plan else spec.get('vad_windows', [])),
+        'original_blocks':len(plan['blocks'] if plan else spec.get('full_chunks', [])),
         'repeat_vad_windows':len(transcriber.last_vad_windows), 'repeat_blocks':len(windows),
         'repeat_vad_speech_seconds':sum(b-a for a,b in transcriber.last_vad_windows),
         'repeat_vad_intervals':transcriber.last_vad_windows, 'clips':[]}

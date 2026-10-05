@@ -19,6 +19,10 @@ name: iCourse Parallel Pilot
         description: Select only recordings strictly before this date (YYYY-MM-DD)
         type: string
         default: ''
+      validation_source_run_id:
+        description: Explicitly reacquire the exact failed preparation selection and frozen glossary from this completed run
+        type: string
+        default: ''
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
@@ -48,6 +52,9 @@ name: iCourse Parallel Pilot
         type: number
         default: 1
       validation_before_date:
+        type: string
+        default: ''
+      validation_source_run_id:
         type: string
         default: ''
       automatic_terms:
@@ -146,6 +153,8 @@ jobs:
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
       VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
       VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
+      VALIDATION_SOURCE_RUN_ID: ${{ inputs.validation_source_run_id }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}
     outputs:

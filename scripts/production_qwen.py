@@ -127,7 +127,10 @@ def validate_checkpoint_age(saved, run, slot, *, prior_only=False):
 def validation_course():
     course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
     rank = validation_rank()
-    if not course and (rank != 1 or validation_before_date()):
+    source = os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip()
+    if source and (not source.isascii() or not source.isdigit()):
+        raise ValueError('Invalid validation source run')
+    if not course and (rank != 1 or validation_before_date() or source):
         raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
         if not course.isascii() or not course.isdigit():
@@ -154,6 +157,53 @@ def validation_before_date():
         try: datetime.strptime(raw, '%Y-%m-%d')
         except ValueError: raise ValueError('Invalid validation cutoff date') from None
     return raw
+
+
+def validation_source_queue(source):
+    """Explicit new-input trial, locked to a pre-ASR failure's exact lesson.
+
+    This is not ASR recovery: only a completed preparation with no retained
+    audio/plan is eligible. Completed ASR or any cloud review cannot be reset.
+    The original empty database/history and already frozen glossary are kept.
+    """
+    info = json.loads(subprocess.check_output(['gh', 'api',
+        f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{source}'],
+        stderr=subprocess.PIPE, timeout=60))
+    if (info['status'] != 'completed' or info.get('conclusion') != 'failure'
+            or info.get('path', '').split('@')[0] != '.github/workflows/parallel_pilot.yml'):
+        raise ValueError('Validation source must be a completed failed formal pilot')
+    target = root()/'validation-source'
+    artifact('qwen-production-queue', target/'queue', run=source, required=True)
+    artifact('qwen-production-prepare-0', target/'prepared', run=source, required=True)
+    with shards.environment({'GITHUB_RUN_ID': source, 'COURSE_SLOT': '0'}):
+        files = decode(target/'queue'/'queue.enc', 'queue')
+        prepared = decode(target/'prepared'/'prepared.enc', 'prepared')
+    tasks = read_json(files['queue.json'])
+    spec = read_json(prepared['specification.json'])
+    if (len(tasks) != 1 or spec.get('mode') != 'failed' or spec.get('plan')
+            or 'lecture.flac' in prepared or spec.get('material') or spec.get('review')
+            or str(tasks[0][0]) != str(spec.get('course_id')) or tasks[0][2] != spec.get('lecture')):
+        raise ValueError('Validation source is not an unrecoverable pre-ASR preparation')
+    frozen = spec.get('glossary_snapshot')
+    if (os.environ.get('AUTO_COURSE_TERMS') == 'true') != bool(frozen):
+        raise ValueError('Validation source glossary mode differs')
+    if frozen:
+        validate_frozen_terms(frozen, str(tasks[0][0]), tasks[0][2])
+        tasks[0][2]['_frozen_glossary'] = frozen
+    tasks[0][2]['_validation']['source_run_id'] = source
+    files['queue.json'] = shards.encoded(tasks)
+    return files
+
+
+def validate_frozen_terms(frozen, course, lecture):
+    terms = frozen.get('terms')
+    if (frozen.get('schema') != 1 or str(frozen.get('course_id')) != course
+            or str(frozen.get('sub_id')) != str(lecture['sub_id'])
+            or frozen.get('lecture_date') != lecture.get('date')
+            or not isinstance(terms, list) or len(terms) > 30
+            or any(not isinstance(t, str) or not 1 <= len(t) <= 80 for t in terms)
+            or frozen.get('terms_sha256') != fingerprint(terms)):
+        raise ValueError('Frozen glossary belongs to another lecture or input')
 
 
 def latest_validation_task(client, db, course, *, today=None, rank=1, before_date=''):
@@ -216,6 +266,10 @@ def plan():
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
         files = decode(root()/'previous'/'queue.enc', 'queue')
+    elif os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
+        if int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')) > 1:
+            raise ValueError('Rerun has lost its queue checkpoint; refusing a new selection')
+        files = validation_source_queue(os.environ['VALIDATION_SOURCE_RUN_ID'].strip())
     else:
         if int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')) > 1:
             raise ValueError('Rerun has lost its queue checkpoint; refusing a new selection')
@@ -259,6 +313,12 @@ def plan():
                 or tasks[0][2]['_validation'].get('before_date', '') != validation_before_date()
                 or (validation_before_date() and str(tasks[0][2].get('date', '')) >= validation_before_date())):
             raise ValueError('Validation queue does not match the requested course')
+        if tasks[0][2]['_validation'].get('source_run_id', '') != os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
+            raise ValueError('Validation queue does not match its source run')
+        from src.runtime.session_rules import lecture_is_selected
+        from src.runtime import config
+        if not lecture_is_selected(course, tasks[0][2], {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
+            raise ValueError('Frozen validation lesson is now excluded')
         out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
     write_outputs(tasks={'include': [{'task_slot': i} for i in range(len(tasks))]}, count=len(tasks))
@@ -393,11 +453,56 @@ def recover_preparation(db, course, sub_id):
     return files
 
 
+def retain_prepared_audio(handle, specification, files):
+    """Keep actual samples and safe numeric evidence before any quality gate.
+
+    A failed/timed-out decode remains a failure. Retention never pads to the
+    video duration, retries the URL, or makes this audio eligible for ASR.
+    """
+    if handle.process.poll() is None:
+        handle.process.terminate()
+        try: handle.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            handle.process.kill(); handle.process.wait(timeout=5)
+        specification['decode_interrupted'] = True
+    pcm = Path(handle.path)
+    size = pcm.stat().st_size if pcm.exists() else 0
+    stderr = b''.join(handle.stderr_chunks).decode(errors='replace')
+    match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
+    media = specification.get('media_seconds')
+    if media is None and match:
+        media = int(match[1])*3600+int(match[2])*60+float(match[3])
+    duration = size/64000
+    specification.update(audio_seconds=duration, media_seconds=media)
+    diagnostics = {'pcm_bytes': size, 'pcm_sample_aligned': size % 4 == 0,
+                   'audio_seconds': duration, 'media_seconds': media,
+                   'duration_gap_seconds': max(0, media-duration) if media else None,
+                   'decode_return_code': handle.process.returncode,
+                   'decode_interrupted': bool(specification.get('decode_interrupted')),
+                   'timeline_preserved': bool(getattr(handle, 'timeline_preserved', False)),
+                   'audio_retained': 'lecture.flac' in files}
+    specification['audio_diagnostics'] = diagnostics
+    if not size or size % 4:
+        return
+    flac = root()/'lecture.flac'
+    if 'lecture.flac' not in files:
+        shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'f32le', '-ar', '16000', '-ac', '1',
+                        '-i', str(pcm), '-c:a', 'flac', '-y', str(flac)], timeout=300)
+        files['lecture.flac'] = flac.read_bytes()
+    diagnostics.update(audio_retained=True, audio_sha256=hashlib.sha256(files['lecture.flac']).hexdigest())
+
+
 def prepare():
     slot = int(os.environ['COURSE_SLOT'])
     if artifact(f'qwen-production-prepare-{slot}', root()/'previous'):
         files = decode(root()/'previous'/'prepared.enc', 'prepared')
         specification = read_json(files['specification.json'])
+        if specification['mode'] == 'failed' and 'lecture.flac' in files:
+            # Never replace retained failed input with a silently fresh fetch.
+            encode(files, 'prepared', out('prepared.enc'))
+            if specification.get('error_code') == 'incomplete_audio':
+                raise ValueError('Production audio is incomplete')
+            raise ValueError('Retained preparation failed; explicit repair required')
         if specification['mode'] != 'failed':
             if specification.get('plan', {}).get('execution') == 'shared_queue':
                 from scripts.shared_asr_worker import initialize
@@ -408,6 +513,7 @@ def prepare():
     db, course, title, lecture = task_files()
     sub_id = str(lecture['sub_id'])
     scheduler = None
+    handle = None
     specification = {'course_id': course, 'course_title': title, 'lecture': lecture}
     files = {}
     try:
@@ -462,10 +568,11 @@ def prepare():
             else:
                 terms = course_terms(title)
                 if os.environ.get('AUTO_COURSE_TERMS') == 'true':
-                    glossary_snapshot = freeze_course_terms(db, course, title, sub_id)
+                    glossary_snapshot = lecture.get('_frozen_glossary') or freeze_course_terms(db, course, title, sub_id)
+                    validate_frozen_terms(glossary_snapshot, course, lecture)
                     terms = glossary_snapshot['terms']
                     specification['glossary_snapshot'] = glossary_snapshot
-                scheduler.audio_downloader.schedule(client, course, sub_id)
+                scheduler.audio_downloader.schedule(client, course, sub_id, preserve_timestamps=True)
                 handle = scheduler.audio_downloader.get(sub_id, timeout=180)
                 if handle is None: raise ValueError('No playable production audio')
                 began = time.monotonic()
@@ -480,19 +587,20 @@ def prepare():
                         audio_path=handle.path, timeout=2400)
                 duration = transcriber.last_audio_duration
                 media = transcriber.last_media_duration or 0
+                specification.update(audio_seconds=duration, media_seconds=media,
+                    vad_windows=transcriber.last_vad_windows, full_chunks=[{'start':a,'end':b} for a,b in windows])
+                retain_prepared_audio(handle, specification, files)
+                if abs(specification['audio_seconds']-duration) > 1/16000:
+                    raise ValueError('VAD input differs from retained PCM samples')
                 if media and duration < media-max(120, media*.05):
                     raise ValueError('Production audio is incomplete')
                 flac = root()/'lecture.flac'
-                shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'f32le', '-ar', '16000', '-ac', '1',
-                                '-i', handle.path, '-c:a', 'flac', '-y', str(flac)], timeout=300)
-                flac_bytes = flac.read_bytes()
-                digest = hashlib.sha256(flac_bytes).hexdigest()
+                digest = specification['audio_diagnostics']['audio_sha256']
                 plan = build_audio_plan({'selection': {'course_id': course, 'sub_id': sub_id},
                     'audio_seconds': duration, 'full_chunks': [{'start': a, 'end': b} for a,b in windows],
                     'vad_windows': transcriber.last_vad_windows, 'recognition_terms': terms},
                     reference={'pipeline': 'production'}, course_slot=slot, run_id=os.environ['GITHUB_RUN_ID'],
                     audio_sha256=digest, mode=os.environ.get('SHARD_MODE', '2'), production=True)
-                files['lecture.flac'] = flac_bytes
                 for block in plan['blocks']:
                     chunk = root()/f"chunk-{block['chunk_id']}.flac"
                     # atrim operates on sample indices so FLAC preserves exact
@@ -524,13 +632,16 @@ def prepare():
         write_outputs(workers={'shard_id': list(range(len(specification.get('plan', {}).get('shards', [])))) or [-1]})
     except Exception as error:
         db.update_error(sub_id, 'prepare', type(error).__name__)
+        if handle is not None:
+            try: retain_prepared_audio(handle, specification, files)
+            except Exception as retention_error:
+                specification['audio_retention_error_type'] = type(retention_error).__name__
         # A coordination/API failure after slicing must retain the acquired
         # input. Retry initializes the queue from this same immutable plan.
-        if specification.get('plan') and 'lecture.flac' in files:
+        if specification.get('mode') == 'sharded' and 'lecture.flac' in files:
             specification['prepare_error_type'] = type(error).__name__
         else:
-            specification.update(mode='failed', error_type=type(error).__name__)
-            files = {}
+            specification.update(mode='failed', error_type=type(error).__name__, error_code=failure_code(error))
         files.update({'specification.json': shards.encoded(specification),
                       'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)})
         encode(files, 'prepared', out('prepared.enc'))
@@ -639,18 +750,20 @@ def gather():
         encode(payload, 'state', out('state.enc'))
         if lecture.get('_validation'):
             plan = spec.get('plan', {})
+            frozen_terms = plan.get('recognition_terms', spec.get('glossary_snapshot', {}).get('terms', []))
             from src.ai.automatic_glossary import AutomaticGlossary
             stages = AutomaticGlossary(db, course).stages()
             audit = dict(lecture['_validation'], mode=spec['mode'],
-                asr_execution=plan.get('execution', 'fixed_shards'),
+                asr_execution=plan.get('execution', 'not_started'),
                 automatic_terms=os.environ.get('AUTO_COURSE_TERMS') == 'true',
-                frozen_terms_count=len(plan.get('recognition_terms', [])),
-                frozen_terms_sha256=fingerprint(plan.get('recognition_terms', [])),
+                frozen_terms_count=len(frozen_terms),
+                frozen_terms_sha256=fingerprint(frozen_terms),
                 glossary_saved=bool(db.read_meta('auto_glossary:'+str(course)+':'+sub_id)),
                 glossary_candidates=sum(g['stage'] == 'candidate' for g in stages),
                 glossary_confirmed=sum(g['stage'] == 'confirmed' for g in stages),
                 planned_shards=len(plan.get('shards', [])), planned_blocks=len(plan.get('blocks', [])),
-                audio_seconds=plan.get('audio_seconds'), media_seconds=spec.get('media_seconds'),
+                audio_seconds=plan.get('audio_seconds', spec.get('audio_seconds')), media_seconds=spec.get('media_seconds'),
+                audio_diagnostics=spec.get('audio_diagnostics', {}), preparation_error_code=spec.get('error_code'),
                 transcript_chars=len(row.get('transcript') or ''), summary_chars=len(row.get('summary') or ''),
                 processed=bool(row.get('processed_at')), emailed=bool(row.get('emailed_at')),
                 error_stage=row.get('error_stage'), error_count=row.get('error_count') or 0,
