@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from scripts import sharded_qwen_pilot as shards
 from scripts.qwen_sharding import build_audio_plan, validate_plan, validate_result, fingerprint, MAX_TASKS
 from scripts.parallel_courses import configured_courses
@@ -28,7 +30,9 @@ def root():
 
 
 def out(name):
-    return root()/'out'/name
+    directory = root()/'out'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    return directory/name
 
 
 def decode(path, role):
@@ -119,7 +123,54 @@ def validate_checkpoint_age(saved, run, slot, *, prior_only=False):
         raise ValueError('A later finalization lost its quota checkpoint; automatic refund forbidden')
 
 
+def validation_course():
+    course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
+    if course:
+        if not course.isascii() or not course.isdigit():
+            raise ValueError('Invalid validation course')
+        if os.environ.get('PUBLISH_RESULTS') != 'false' or os.environ.get('SEND_EMAIL') != 'false':
+            raise ValueError('Classroom validation requires publication and email disabled')
+        if course not in configured_courses(os.environ['COURSE_IDS']):
+            raise ValueError('Validation course is not subscribed')
+    return course
+
+
+def latest_validation_task(client, db, course, *, today=None):
+    """Probe actual playback, including entries with stale playback_status.
+
+    No benchmark acquisition limit or cached summary is used. Deleted lectures
+    remain excluded; an empty holiday schedule is a normal unavailable entry.
+    """
+    today = today or datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    detail = client.get_course_detail(course)
+    candidates = []
+    for lecture in detail.get('lectures', []):
+        date = str(lecture.get('date', ''))
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', date): continue
+        try: datetime.strptime(date, '%Y-%m-%d')
+        except ValueError: continue
+        sub_id = str(lecture.get('sub_id', ''))
+        if date > today or not sub_id.isascii() or not sub_id.isdigit(): continue
+        if (db.get_lecture(sub_id) or {}).get('deleted_at'): continue
+        period = re.search(r'第\s*(\d+)', str(lecture.get('sub_title', '')))
+        candidates.append((date, int(period.group(1)) if period else -1, int(sub_id), lecture))
+    seen, skipped = set(), 0
+    for _, _, _, lecture in sorted(candidates, key=lambda item: item[:3], reverse=True):
+        sub_id = str(lecture['sub_id'])
+        if sub_id in seen: continue
+        seen.add(sub_id)
+        # Use the same API resolution/fallbacks as AudioDownloader. Do not
+        # freeze an expiring private URL in the queue or print it in Actions.
+        if client.get_video_url(course, sub_id):
+            selected = dict(lecture, sub_id=sub_id,
+                            _validation={'date': lecture['date'], 'skipped_unavailable': skipped})
+            return (course, detail['title'], selected), detail.get('teacher', '')
+        skipped += 1
+    raise ValueError('No playable non-future lecture for validation')
+
+
 def plan():
+    course = validation_course()
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
         files = decode(root()/'previous'/'queue.enc', 'queue')
@@ -134,18 +185,35 @@ def plan():
             db.conn.close(); load_remote(root()/'queue.db'); db = Database(str(root()/'queue.db'))
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
-            _crawl_semester_catalog(client, db, reporter)
-            tasks = _enumerate_lectures(client, db, reporter)
-            tasks = [t for t in tasks if (db.get_lecture(str(t[2]['sub_id'])).get('error_count') or 0) < 3]
+            if course:
+                task, teacher = latest_validation_task(client, db, course)
+                history = snapshot(db, root()/'history.db')
+                # A separate scratch database forces this authorized lecture
+                # through ASR even when production already has a summary.
+                # The original encrypted history remains in the queue bundle.
+                db.conn.close(); db = Database(str(root()/'validation.db'))
+                db.upsert_course(course, task[1], teacher)
+                lecture = task[2]
+                db.insert_lecture(lecture['sub_id'], course, lecture.get('sub_title', ''), lecture['date'])
+                tasks = [task]
+            else:
+                _crawl_semester_catalog(client, db, reporter)
+                tasks = _enumerate_lectures(client, db, reporter)
+                tasks = [t for t in tasks if (db.get_lecture(str(t[2]['sub_id'])).get('error_count') or 0) < 3]
             if len(tasks) > MAX_TASKS:
                 raise ValueError('Queue exceeds 256 tasks; narrow the subscribed course scope')
             files = {'queue.json': shards.encoded(tasks), 'database.db': snapshot(db, root()/'snapshot.db')}
+            if course: files['history.db'] = history
         finally:
             db.conn.close()
     tasks = read_json(files['queue.json'])
     identities = [(str(t[0]), str(t[2]['sub_id'])) for t in tasks]
     if len(tasks) > MAX_TASKS or len(set(identities)) != len(identities):
         raise ValueError('Invalid or duplicate lecture queue')
+    if course:
+        if len(tasks) != 1 or str(tasks[0][0]) != course or not tasks[0][2].get('_validation'):
+            raise ValueError('Validation queue does not match the requested course')
+        out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
     write_outputs(tasks={'include': [{'task_slot': i} for i in range(len(tasks))]}, count=len(tasks))
     print(f'Planned {len(tasks)} lectures; at most 5 active pipelines and 15 runners', flush=True)
@@ -423,6 +491,19 @@ def gather():
                    'attempt.json': shards.encoded(int(os.environ.get('GITHUB_RUN_ATTEMPT', '1'))),
                    'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)}
         encode(payload, 'state', out('state.enc'))
+        if lecture.get('_validation'):
+            plan = spec.get('plan', {})
+            audit = dict(lecture['_validation'], mode=spec['mode'],
+                planned_shards=len(plan.get('shards', [])), planned_blocks=len(plan.get('blocks', [])),
+                audio_seconds=plan.get('audio_seconds'), media_seconds=spec.get('media_seconds'),
+                transcript_chars=len(row.get('transcript') or ''), summary_chars=len(row.get('summary') or ''),
+                processed=bool(row.get('processed_at')), emailed=bool(row.get('emailed_at')),
+                error_stage=row.get('error_stage'), error_count=row.get('error_count') or 0,
+                review_seconds=review.get('seconds', 0), review_clips=len(review.get('attempts', [])),
+                review_complete=bool(review.get('complete')), review_failed=bool(review.get('failed')),
+                review_error_type=review.get('error_type'),
+                asr_complete=bool(material and material.get('complete')))
+            out('validation-result.json').write_bytes(shards.encoded(audit))
     db.checkpoint = checkpoint
     try:
         checkpoint()

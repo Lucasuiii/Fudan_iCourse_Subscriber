@@ -110,6 +110,75 @@ class PreparedLectureTests(unittest.TestCase):
         validate_plan(plan)
 
 
+class ClassroomSelectionTests(unittest.TestCase):
+    def test_latest_real_playback_skips_holidays_future_and_deleted_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = database(Path(tmp)/'history.db', summary='历史摘要')
+            db.insert_lecture('9', '10', '删除课次', '2026-10-05')
+            with db.conn: db.conn.execute("UPDATE lectures SET deleted_at='removed' WHERE sub_id='9'")
+            client = MagicMock()
+            client.get_course_detail.return_value = {'title':'概率论', 'teacher':'教师', 'lectures':[
+                {'sub_id':'20','date':'2026-10-06'}, {'sub_id':'9','date':'2026-10-05'},
+                {'sub_id':'8','date':'2026-10-05','sub_title':'第6节','has_playback':True},
+                {'sub_id':'1','date':'2026-10-04','has_playback':False},
+                {'sub_id':'4','date':'2026-02-30'}, {'sub_id':'bad','date':'2026-10-05'}]}
+            client.get_video_url.side_effect = [None, 'https://private.example/recording']
+            task, _ = pipeline.latest_validation_task(client, db, '10', today='2026-10-05')
+            self.assertEqual(task[2]['sub_id'], '1')
+            self.assertEqual(task[2]['_validation']['skipped_unavailable'], 1)
+            self.assertEqual([c.args for c in client.get_video_url.call_args_list], [('10','8'),('10','1')])
+            self.assertNotIn('https:', json.dumps(task))
+            self.assertEqual(db.get_lecture('1')['summary'], '历史摘要')
+            db.conn.close()
+
+    def test_no_recording_is_not_an_authorization_to_process_other_courses(self):
+        client = MagicMock(); client.get_course_detail.return_value = {'title':'高代', 'lectures':[
+            {'sub_id':'1', 'date':'2026-10-01'}]}
+        client.get_video_url.return_value = None
+        db = MagicMock(); db.get_lecture.return_value = None
+        with self.assertRaises(ValueError):
+            pipeline.latest_validation_task(client, db, '38404', today='2026-10-05')
+        client.get_course_detail.assert_called_once_with('38404')
+
+    def test_validation_requires_both_side_effect_flags_disabled(self):
+        for publish, email in [('true','false'), ('false','true'), ('','false')]:
+            with patch.dict(os.environ, {'VALIDATION_COURSE_ID':'38404','COURSE_IDS':'38404,40329',
+                                         'PUBLISH_RESULTS':publish,'SEND_EMAIL':email}):
+                with self.assertRaises(ValueError): pipeline.validation_course()
+        with patch.dict(os.environ, {'VALIDATION_COURSE_ID':'38404','COURSE_IDS':'38404,40329',
+                                     'PUBLISH_RESULTS':'false','SEND_EMAIL':'false'}):
+            self.assertEqual(pipeline.validation_course(), '38404')
+
+    def test_validation_queue_forces_fresh_asr_and_retains_original_history(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'99','COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,
+            'QWEN_PRODUCTION_TASK':'true','GITHUB_RUN_ATTEMPT':'1','VALIDATION_COURSE_ID':'10',
+            'COURSE_IDS':'10','PUBLISH_RESULTS':'false','SEND_EMAIL':'false'}):
+            root=pipeline.root(); db=database(root/'original.db', summary='历史摘要')
+            original=snapshot(db,root/'original-snapshot.db'); db.conn.close()
+            def load(path): path.write_bytes(original)
+            client=MagicMock();client.get_course_detail.return_value={'title':'概率论','teacher':'教师',
+                'lectures':[{'sub_id':'1','date':'2026-10-04'}]}
+            client.get_video_url.return_value='https://private.example/recording'
+            fake_main=SimpleNamespace(login_with_retry=lambda:None, _enumerate_lectures=MagicMock(),
+                                      _crawl_semester_catalog=MagicMock())
+            with patch.dict('sys.modules', {'main':fake_main}), \
+                 patch.object(pipeline,'artifact',return_value=False), patch.object(pipeline,'load_remote',side_effect=load), \
+                 patch('src.api.icourse.ICourseClient',return_value=client), patch.object(pipeline,'write_outputs') as outputs:
+                pipeline.plan()
+            saved=pipeline.decode(root/'out'/'queue.enc','queue')
+            tasks=json.loads(saved['queue.json']);self.assertEqual(len(tasks),1)
+            self.assertEqual(tasks[0][2]['sub_id'],'1')
+            (root/'fresh.db').write_bytes(saved['database.db']);db=Database(str(root/'fresh.db'))
+            self.assertIsNone(db.get_lecture('1')['summary']);db.conn.close()
+            (root/'preserved.db').write_bytes(saved['history.db']);db=Database(str(root/'preserved.db'))
+            self.assertEqual(db.get_lecture('1')['summary'],'历史摘要');db.conn.close()
+            fake_main._enumerate_lectures.assert_not_called();fake_main._crawl_semester_catalog.assert_not_called()
+            outputs.assert_called_once_with(tasks={'include':[{'task_slot':0}]},count=1)
+            audit=(root/'out'/'validation-selection.json').read_text()
+            self.assertNotIn('sub_id',audit);self.assertNotIn('https:',audit)
+
+
 class CloudLedgerTests(unittest.TestCase):
     def test_reserved_unknown_call_is_not_repeated_on_resume(self):
         from src.ai.qwen_review_ledger import review_prepared,validate_ledger
@@ -232,7 +301,8 @@ class EncryptedStageTests(unittest.TestCase):
             interval={'start_ms':0,'end_ms':1000,'quote_start_ms':0,'quote_end_ms':1000,'text':'疑点'}
             review={'complete':True,'seconds':1,'attempts':[{'interval':interval,'seconds':1,'status':'reserved'}],
                     'material':{'variants':[],'uncertain_calls':1}}
-            spec={'course_id':'10','course_title':'概率论','lecture':{'sub_id':'1'},'mode':'cached',
+            spec={'course_id':'10','course_title':'概率论','lecture':{'sub_id':'1',
+                  '_validation':{'date':'2026-10-04','skipped_unavailable':2}},'mode':'cached',
                   'material':material,'review':review}
             pipeline.encode({'specification.json':pipeline.shards.encoded(spec),'database.db':payload},
                             'prepared',root/'inbox'/'prepared.enc')
@@ -266,6 +336,11 @@ class EncryptedStageTests(unittest.TestCase):
             self.assertIsNone(db.get_lecture('1')['emailed_at'])
             audit=json.loads(db.read_meta('qwen_pipeline:1'));self.assertTrue(audit['complete'])
             self.assertNotIn('material',audit);db.conn.close()
+            audit=json.loads((root/'out'/'validation-result.json').read_bytes())
+            self.assertTrue(audit['processed']);self.assertTrue(audit['asr_complete'])
+            self.assertFalse(audit['emailed']);self.assertEqual(audit['review_seconds'],1)
+            self.assertEqual(audit['summary_chars'],len('恢复后的摘要'))
+            self.assertNotIn('恢复后的摘要',json.dumps(audit,ensure_ascii=False))
 
     def test_missing_asr_artifact_saves_retry_state_without_constructing_summarizer(self):
         _load_runner_class();plan,_=fixture()

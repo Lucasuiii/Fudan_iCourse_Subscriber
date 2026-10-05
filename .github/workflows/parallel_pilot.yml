@@ -2,6 +2,10 @@ name: iCourse Parallel Pilot
 'on':
   workflow_dispatch:
     inputs:
+      validation_course_id:
+        description: Only validate this course's latest playable lecture (requires no publication or email)
+        type: string
+        default: ''
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
@@ -23,6 +27,9 @@ name: iCourse Parallel Pilot
         default: false
   workflow_call:
     inputs:
+      validation_course_id:
+        type: string
+        default: ''
       automatic_terms:
         type: boolean
         default: false
@@ -94,6 +101,9 @@ jobs:
       COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      SEND_EMAIL: ${{ inputs.send_email }}
     outputs:
       tasks: ${{ steps.plan.outputs.tasks }}
       count: ${{ steps.plan.outputs.count }}
@@ -112,6 +122,14 @@ jobs:
         path: ${{ runner.temp }}/qwen-shards/out/queue.enc
         retention-days: 7
         compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() && inputs.validation_course_id != '' }}
+      with:
+        name: qwen-validation-selection
+        path: ${{ runner.temp }}/qwen-shards/out/validation-selection.json
+        retention-days: 7
         overwrite: true
         if-no-files-found: ignore
     - name: clean
