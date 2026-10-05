@@ -1,8 +1,8 @@
 # 单堂课跨 Runner ASR 隔离试验
 
 手动入口：`.github/workflows/qwen_sharded_pilot.yml`。第一版用于与已完成的
-生产 Qwen 单路课堂试跑作实际业务对照，尚未接入定时订阅和 `LectureRunner`
-发布链；不发送邮件、不写正式数据库，不修改 `COURSE_IDS`。
+生产 Qwen 单路课堂试跑作实际业务对照。此对照入口继续独立保留：不发送邮件、不写正式数据库，不修改 `COURSE_IDS`。
+分支的日常订阅已经通过另一个 [正式分片入口](parallel-course-pilot.md) 接入 `LectureRunner` 保存与发布链；尚未合并 main。
 推送本分支时只运行无凭据的合成分块测试，使新工作流先被 GitHub 注册；
 课程准备、ASR、复核和摘要均仅由手动 dispatch 启动。
 这是为尚未合并 main 的入口提供注册路径，依据

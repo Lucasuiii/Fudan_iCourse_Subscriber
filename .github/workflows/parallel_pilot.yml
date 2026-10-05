@@ -3,520 +3,199 @@ name: iCourse Parallel Pilot
   workflow_dispatch:
     inputs:
       automatic_terms:
-        description: Enable automatic course glossary in this pilot
+        description: Enable evidence-bounded automatic glossary
         type: boolean
         default: false
+      shard_mode:
+        description: Two runners by default; auto uses three above 60 speech minutes
+        type: choice
+        options:
+        - '2'
+        - auto
+        default: '2'
+      publish_results:
+        description: Publish encrypted lecture results to the data branch
+        type: boolean
+        default: false
+      send_email:
+        description: Send course emails after publication (requires publish_results)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      automatic_terms:
+        type: boolean
+        default: false
+      shard_mode:
+        type: string
+        default: '2'
+      publish_results:
+        type: boolean
+        default: false
+      send_email:
+        type: boolean
+        default: false
+      caller_holds_lock:
+        type: boolean
+        default: false
+    secrets:
+      DB_ENCRYPTION_KEY:
+        required: true
+      STUID:
+        required: true
+      UISPSW:
+        required: true
+      COURSE_IDS:
+        required: true
+      DOUBAO_ASR_API_KEY:
+        required: false
+      TAVILY_API_KEY:
+        required: false
+      DASHSCOPE_API_KEY:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      COURSE_SESSION_RULES:
+        required: false
+      COURSE_SESSION_OVERRIDE_DATES:
+        required: false
+      SMTP_EMAIL:
+        required: false
+      RECEIVER_EMAILS:
+        required: false
+      RECEIVER_EMAIL:
+        required: false
 permissions:
   actions: read
   contents: write
 concurrency:
-  group: icourse-data-${{ github.repository }}
+  group: ${{ inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
+    || format('icourse-data-{0}', github.repository) }}
   cancel-in-progress: false
 jobs:
   plan:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - name: Plan opaque course slots
-      id: plan
-      env:
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-      run: python scripts/parallel_courses.py plan
-    permissions:
-      contents: read
-  course:
-    needs: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 5
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - name: Set up Node for local formula rendering
-      uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-        cache: npm
-    - name: Install formula renderer
-      run: npm ci --ignore-scripts
-    - name: Validate database encryption key
-      env:
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-      run: |
-        if [ "${#DB_ENCRYPTION_KEY}" -lt 32 ]; then
-          echo "::error::DB_ENCRYPTION_KEY must contain at least 32 characters"
-          exit 2
-        fi
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-    - name: Cache Python packages
-      id: cache-pip
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.pythonLocation }}/lib/python*/site-packages
-        key: pip-${{ hashFiles('requirements.txt') }}
-    - name: Install Python dependencies
-      if: steps.cache-pip.outputs.cache-hit != 'true'
-      run: pip install -r requirements.txt
-    - name: Install media and PDF dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg fonts-noto-cjk libpango-1.0-0 libcairo2
-    - name: Install Qwen CPU runtime
-      run: |-
-        python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install qwen-asr==0.0.6 --no-deps
-    - name: Cache ASR models
-      id: cache-models
-      uses: actions/cache@v4
-      with:
-        path: |-
-          ~/.cache/huggingface/hub/
-          silero_vad.onnx
-        key: qwen-asr-1.7b-7278e1e-forced-aligner-c7cbfc20-cpu-v1
-    - name: Download ASR models
-      if: steps.cache-models.outputs.cache-hit != 'true'
-      run: wget -q https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-    - name: Cache RapidOCR models
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/rapidocr
-        key: rapidocr-onnx-default-v1
-    - name: Fetch database from data branch
-      id: db-source
-      run: |
-        mkdir -p data
-        remote_ref=$(git ls-remote --heads origin refs/heads/data) \
-          || { echo "::error::Could not inspect the data branch."; exit 1; }
-        if [ -z "$remote_ref" ]; then
-          echo "No data branch; this is a confirmed first run."
-          echo "state=fresh" >> "$GITHUB_OUTPUT"
-          touch .db-source-ok
-          exit 0
-        fi
-        git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" \
-          || { echo "::error::Could not fetch the existing data branch."; exit 1; }
-        # Use ls-tree (reads tree directly) instead of cat-file
-        # (requires fetched blobs) in case the shallow clone hasn't
-        # fetched every blob object yet.
-        git ls-tree origin/data --name-only data/ | grep -q . \
-          || { echo "::error::Existing data branch contains no database."; exit 1; }
-        # Determine format from tree listing (ls-tree reads tree
-        # objects directly without needing the blobs fetched).
-        files=$(git ls-tree origin/data --name-only data/ | tr '\n' ' ')
-        echo "Data branch files: $files"
-        if echo "$files" | grep -q "icourse-index.enc"; then
-          mkdir -p data/sharded/shards
-          git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
-          shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
-          for path in $shard_paths; do
-            base=$(basename "$path")
-            git show "origin/data:$path" > "data/sharded/shards/$base"
-          done
-          echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
-        elif echo "$files" | grep -q "icourse.db.gz.enc"; then
-          git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
-          echo "Loaded legacy compressed database."
-        elif echo "$files" | grep -q "icourse.db.enc"; then
-          git show origin/data:data/icourse.db.enc > data/icourse.db.enc
-          echo "Loaded legacy uncompressed database."
-        else
-          echo "::error::Existing data branch has an unknown database format."
-          exit 1
-        fi
-        echo "state=existing" >> "$GITHUB_OUTPUT"
-    - name: Decode database
-      id: db-decode
-      if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
-      env:
-        STUID: ${{ secrets.STUID }}
-        UISPSW: ${{ secrets.UISPSW }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-      run: |
-        if [ -f data/sharded/icourse-index.enc ]; then
-          # Sharded format — always v2.
-          rm -f data/icourse.db.reassembled
-          python scripts/db_shard.py reassemble data/sharded data/icourse.db.reassembled
-          python scripts/validate_db.py data/icourse.db.reassembled
-          mv data/icourse.db.reassembled data/icourse.db
-          echo "Reassembled sharded database."
-          touch .db-source-ok
-          exit 0
-        fi
-
-        # Legacy single-file path (one-time migration on first sharded run).
-        if [ -n "$DB_ENCRYPTION_KEY" ]; then
-          NEW_KEY="$DB_ENCRYPTION_KEY"
-        else
-          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
-        fi
-        LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
-
-        decrypt_blob() {
-          local in_path="$1"
-          local out_path="$2"
-          if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-               -in "$in_path" -out "$out_path" \
-               -pass pass:"$NEW_KEY" 2>/dev/null; then
-            echo "v2"
-            return 0
-          fi
-          if openssl enc -aes-256-cbc -d -pbkdf2 \
-               -in "$in_path" -out "$out_path" \
-               -pass pass:"$LEGACY_KEY" 2>/dev/null; then
-            echo "legacy"
-            return 0
-          fi
-          return 1
-        }
-
-        if [ -f data/icourse.db.gz.enc ]; then
-          if VER=$(decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz); then
-            gzip -d data/icourse.db.gz
-            echo "Legacy compressed DB decrypted ($VER)."
-          else
-            echo "::error::Database decryption failed; refusing to replace existing data."
-            rm -f data/icourse.db data/icourse.db.gz
-            exit 1
-          fi
-        elif [ -f data/icourse.db.enc ]; then
-          if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
-            echo "Legacy uncompressed DB decrypted ($VER)."
-          else
-            echo "::error::Database decryption failed; refusing to replace existing data."
-            rm -f data/icourse.db
-            exit 1
-          fi
-        fi
-        python scripts/validate_db.py data/icourse.db
-        touch .db-source-ok
-    - name: Record database state
-      id: db-before
-      run: |
-        if [ -f data/icourse.db ]; then
-          echo "hash=$(md5sum data/icourse.db | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-        else
-          echo "hash=none" >> $GITHUB_OUTPUT
-        fi
-    - name: Select opaque course slot
-      env:
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        COURSE_SLOT: ${{ matrix.slot }}
-      run: python scripts/parallel_courses.py select
-    - name: Process only this course without email or publication
-      timeout-minutes: 350
-      env:
-        StuId: ${{ secrets.STUID }}
-        UISPsw: ${{ secrets.UISPSW }}
-        COURSE_IDS: ${{ env.SELECTED_COURSE_ID }}
-        COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
-        COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
-        USE_OFFICIAL_TRANSCRIPT: '1'
-        CRAWL_TERM: ''
-        DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
-        TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-        SECRETS_CONTEXT: ${{ toJSON(secrets) }}
-        PARALLEL_COURSE_WORKER: 'true'
-        PARALLEL_COURSE_SCOPE: 'true'
-        AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
-      run: |
-        eval "$(python scripts/provider_env.py)"
-        unset SECRETS_CONTEXT
-        python -u main.py
-    - name: Encrypt this course result even after a processing failure
-      if: always()
-      env:
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        COURSE_SLOT: ${{ matrix.slot }}
-      run: python scripts/parallel_courses.py pack
-    - uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: course-result-${{ matrix.slot }}
-        path: data/course-result.enc
-        if-no-files-found: ignore
-        retention-days: 1
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
-  publish:
-    needs:
-    - plan
-    - course
-    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    env:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      QWEN_PRODUCTION_TASK: 'true'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+    outputs:
+      tasks: ${{ steps.plan.outputs.tasks }}
+      count: ${{ steps.plan.outputs.count }}
     steps:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
-    - name: Set up Node for local formula rendering
-      uses: actions/setup-node@v4
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - name: plan
+      run: python -m scripts.production_qwen plan
+      id: plan
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
       with:
-        node-version: '24'
-        cache: npm
-    - name: Install formula renderer
-      run: npm ci --ignore-scripts
-    - name: Validate database encryption key
-      env:
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-      run: |
-        if [ "${#DB_ENCRYPTION_KEY}" -lt 32 ]; then
-          echo "::error::DB_ENCRYPTION_KEY must contain at least 32 characters"
-          exit 2
-        fi
-    - name: Set up Python
-      uses: actions/setup-python@v5
+        name: qwen-production-queue
+        path: ${{ runner.temp }}/qwen-shards/out/queue.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  lecture:
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.plan.outputs.tasks) }}
+    uses: ./.github/workflows/qwen_production_lecture.yml
+    with:
+      task_slot: ${{ matrix.task_slot }}
+      automatic_terms: ${{ inputs.automatic_terms }}
+      shard_mode: ${{ inputs.shard_mode }}
+      publish_results: ${{ inputs.publish_results }}
+    secrets:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      STUID: ${{ secrets.STUID }}
+      UISPSW: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      PROVIDER_CONTEXT: ${{ toJSON(secrets) }}
+  finalize:
+    needs:
+    - plan
+    - lecture
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      QWEN_PRODUCTION_TASK: 'true'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      OMP_NUM_THREADS: '4'
+      MKL_NUM_THREADS: '4'
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      SEND_EMAIL: ${{ inputs.send_email }}
+      SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+      RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+      RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+    steps:
+    - uses: actions/checkout@v4
       with:
-        python-version: '3.12'
-    - name: Cache Python packages
-      id: cache-pip
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.pythonLocation }}/lib/python*/site-packages
-        key: pip-${{ hashFiles('requirements.txt') }}
-    - name: Install Python dependencies
-      if: steps.cache-pip.outputs.cache-hit != 'true'
-      run: pip install -r requirements.txt
-    - name: Install media and PDF dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg fonts-noto-cjk libpango-1.0-0 libcairo2
-    - name: Fetch database from data branch
-      id: db-source
-      run: |
-        mkdir -p data
-        remote_ref=$(git ls-remote --heads origin refs/heads/data) \
-          || { echo "::error::Could not inspect the data branch."; exit 1; }
-        if [ -z "$remote_ref" ]; then
-          echo "No data branch; this is a confirmed first run."
-          echo "state=fresh" >> "$GITHUB_OUTPUT"
-          touch .db-source-ok
-          exit 0
-        fi
-        git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" \
-          || { echo "::error::Could not fetch the existing data branch."; exit 1; }
-        # Use ls-tree (reads tree directly) instead of cat-file
-        # (requires fetched blobs) in case the shallow clone hasn't
-        # fetched every blob object yet.
-        git ls-tree origin/data --name-only data/ | grep -q . \
-          || { echo "::error::Existing data branch contains no database."; exit 1; }
-        # Determine format from tree listing (ls-tree reads tree
-        # objects directly without needing the blobs fetched).
-        files=$(git ls-tree origin/data --name-only data/ | tr '\n' ' ')
-        echo "Data branch files: $files"
-        if echo "$files" | grep -q "icourse-index.enc"; then
-          mkdir -p data/sharded/shards
-          git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
-          shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
-          for path in $shard_paths; do
-            base=$(basename "$path")
-            git show "origin/data:$path" > "data/sharded/shards/$base"
-          done
-          echo "Loaded $(ls data/sharded/shards 2>/dev/null | wc -l) shard(s)."
-        elif echo "$files" | grep -q "icourse.db.gz.enc"; then
-          git show origin/data:data/icourse.db.gz.enc > data/icourse.db.gz.enc
-          echo "Loaded legacy compressed database."
-        elif echo "$files" | grep -q "icourse.db.enc"; then
-          git show origin/data:data/icourse.db.enc > data/icourse.db.enc
-          echo "Loaded legacy uncompressed database."
-        else
-          echo "::error::Existing data branch has an unknown database format."
-          exit 1
-        fi
-        echo "state=existing" >> "$GITHUB_OUTPUT"
-    - name: Decode database
-      id: db-decode
-      if: hashFiles('data/sharded/icourse-index.enc', 'data/icourse.db.gz.enc', 'data/icourse.db.enc') != ''
-      env:
-        STUID: ${{ secrets.STUID }}
-        UISPSW: ${{ secrets.UISPSW }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-      run: |
-        if [ -f data/sharded/icourse-index.enc ]; then
-          # Sharded format — always v2.
-          rm -f data/icourse.db.reassembled
-          python scripts/db_shard.py reassemble data/sharded data/icourse.db.reassembled
-          python scripts/validate_db.py data/icourse.db.reassembled
-          mv data/icourse.db.reassembled data/icourse.db
-          echo "Reassembled sharded database."
-          touch .db-source-ok
-          exit 0
-        fi
-
-        # Legacy single-file path (one-time migration on first sharded run).
-        if [ -n "$DB_ENCRYPTION_KEY" ]; then
-          NEW_KEY="$DB_ENCRYPTION_KEY"
-        else
-          NEW_KEY=$(printf '%s' "ICSv2:${STUID}:${UISPSW}" | sha256sum | cut -d' ' -f1)
-        fi
-        LEGACY_KEY="${STUID}${UISPSW}${DASHSCOPE_API_KEY}${SMTP_PASSWORD}"
-
-        decrypt_blob() {
-          local in_path="$1"
-          local out_path="$2"
-          if openssl enc -aes-256-cbc -d -pbkdf2 -iter 100000 \
-               -in "$in_path" -out "$out_path" \
-               -pass pass:"$NEW_KEY" 2>/dev/null; then
-            echo "v2"
-            return 0
-          fi
-          if openssl enc -aes-256-cbc -d -pbkdf2 \
-               -in "$in_path" -out "$out_path" \
-               -pass pass:"$LEGACY_KEY" 2>/dev/null; then
-            echo "legacy"
-            return 0
-          fi
-          return 1
-        }
-
-        if [ -f data/icourse.db.gz.enc ]; then
-          if VER=$(decrypt_blob data/icourse.db.gz.enc data/icourse.db.gz); then
-            gzip -d data/icourse.db.gz
-            echo "Legacy compressed DB decrypted ($VER)."
-          else
-            echo "::error::Database decryption failed; refusing to replace existing data."
-            rm -f data/icourse.db data/icourse.db.gz
-            exit 1
-          fi
-        elif [ -f data/icourse.db.enc ]; then
-          if VER=$(decrypt_blob data/icourse.db.enc data/icourse.db); then
-            echo "Legacy uncompressed DB decrypted ($VER)."
-          else
-            echo "::error::Database decryption failed; refusing to replace existing data."
-            rm -f data/icourse.db
-            exit 1
-          fi
-        fi
-        python scripts/validate_db.py data/icourse.db
-        touch .db-source-ok
-    - name: Record database state
-      id: db-before
-      run: |
-        if [ -f data/icourse.db ]; then
-          echo "hash=$(md5sum data/icourse.db | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-        else
-          echo "hash=none" >> $GITHUB_OUTPUT
-        fi
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
     - uses: actions/download-artifact@v4
       with:
-        pattern: course-result-*
-        path: data/results
-    - name: Merge authenticated per-course deltas
-      env:
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-      run: python scripts/parallel_courses.py collect
-    - name: Send per-course emails from merged state
-      env:
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
-        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
-        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-        COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
-        COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
-      run: python scripts/parallel_courses.py deliver
-    - name: Deploy database to data branch
-      if: always()
-      env:
-        STUID: ${{ secrets.STUID }}
-        UISPSW: ${{ secrets.UISPSW }}
-        DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
-        COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        SUBSCRIBED_COURSE_IDS: ${{ secrets.COURSE_IDS }}
-        DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        if [ ! -f .db-source-ok ]; then
-          echo "::error::Database source was not verified; refusing to publish."
-          exit 1
-        fi
-        if [ ! -f data/icourse.db ]; then
-          echo "No database file, skipping."
-          exit 0
-        fi
-
-        python scripts/validate_db.py data/icourse.db
-
-        AFTER=$(md5sum data/icourse.db | cut -d' ' -f1)
-        if [ "$AFTER" = "${{ steps.db-before.outputs.hash }}" ]; then
-          echo "Database unchanged, skipping commit."
-          exit 0
-        fi
-
-        # Pull the latest remote shards (a concurrent run may have written
-        # new data) and merge our local changes in before re-sharding.
-        remote_ref=$(git ls-remote --heads origin refs/heads/data) \
-          || { echo "::error::Could not inspect the data branch before publish."; exit 1; }
-        if [ -n "$remote_ref" ]; then
-          git fetch --depth=1 origin "+refs/heads/data:refs/remotes/origin/data" \
-            || { echo "::error::Could not refresh the data branch before publish."; exit 1; }
-        fi
-        DEPLOY_DB=data/icourse.db
-        if git rev-parse origin/data >/dev/null 2>&1 && \
-           git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
-          rm -rf data/remote_sharded
-          mkdir -p data/remote_sharded/shards
-          git show origin/data:data/icourse-index.enc > data/remote_sharded/icourse-index.enc
-          shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
-          for path in $shard_paths; do
-            base=$(basename "$path")
-            git show "origin/data:$path" > "data/remote_sharded/shards/$base"
-          done
-          python scripts/db_shard.py reassemble data/remote_sharded data/remote.db
-          echo "Merging local changes into latest remote..."
-          python scripts/merge_db.py data/icourse.db data/remote.db
-          DEPLOY_DB=data/remote.db
-        fi
-
-        python scripts/validate_db.py "$DEPLOY_DB"
-
-        # Re-shard the merged DB, then append a normal commit to data.  A
-        # rejected non-fast-forward push fails safely instead of overwriting.
-        rm -rf data/sharded_out
-        mkdir -p data/sharded_out
-        python scripts/db_shard.py shard "$DEPLOY_DB" data/sharded_out
-
-        rm -rf /tmp/db_deploy
-        mkdir -p /tmp/db_deploy
-        cd /tmp/db_deploy
-
-        git init -q
-        git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-        if [ -n "$remote_ref" ]; then
-          git fetch -q --depth=1 origin data
-          git checkout -q -b data FETCH_HEAD
-        else
-          git checkout -q -b data
-        fi
-        rm -rf data
-        mkdir -p data/shards
-        cp "$GITHUB_WORKSPACE/data/sharded_out/icourse-index.enc" data/
-        cp "$GITHUB_WORKSPACE"/data/sharded_out/shards/*.db.gz.enc data/shards/
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add -A data/
-        if git diff --cached --quiet; then
-          echo "Encrypted database unchanged after merge; nothing to publish."
-          exit 0
-        fi
-        git commit -q -m "chore: update encrypted database (sharded v2)"
-        git push origin data
+        name: qwen-production-queue
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - name: finalize
+      run: python -m scripts.production_qwen finalize
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-mail-receipts
+        path: ${{ runner.temp }}/qwen-shards/out/receipts.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-catalog
+        path: ${{ runner.temp }}/qwen-shards/out/catalog.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}

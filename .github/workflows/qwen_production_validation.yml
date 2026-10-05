@@ -1,0 +1,40 @@
+name: Qwen Production Pipeline Validation
+'on':
+  push:
+    branches: [codex/qwen-production-pilot]
+    paths:
+    - '.github/workflows/check.yml'
+    - '.github/workflows/parallel_pilot.yml'
+    - '.github/workflows/qwen_production_*.yml'
+    - '.github/actions/qwen-pilot-runtime/**'
+    - 'scripts/production_*.py'
+    - 'scripts/qwen_sharding.py'
+    - 'scripts/sharded_qwen_pilot.py'
+    - 'src/pipeline/**'
+    - 'src/ai/qwen_review_ledger.py'
+    - 'tests/test_qwen_production_pipeline.py'
+  pull_request:
+    paths:
+    - '.github/**'
+    - 'scripts/production_*.py'
+    - 'src/pipeline/**'
+    - 'src/ai/qwen_review_ledger.py'
+    - 'tests/test_qwen_production_pipeline.py'
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install PyYAML cryptography pycryptodome requests openai pillow
+    - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
+      run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
+    - name: Original shard invariants and independent course scheduling
+      run: PYTHONPATH=tests python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests

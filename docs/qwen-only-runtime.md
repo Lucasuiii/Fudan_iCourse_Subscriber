@@ -17,7 +17,7 @@ CPU float32 / eager / 四线程 / batch=1。VAD 仍用 sherpa-onnx 的 Silero；
 官方字幕保持辅助完整性检查与保守补空，不升为主要转写来源。
 
 新实现的模型推理仍由Actions作业总时限兜底，逐块总时限检查不是强制中断原生计算。
-目前没有跨Actions运行的ASR断点恢复；失败课次下次会重跑，不会回退SenseVoice。
+正式分片链支持同次重试及发布后的跨 Actions 检查点恢复，只解码未完成块；恢复 artifact 保留 7 天，过期时失败而不静默重置。直接调用 `main.py` 的串行入口仍没有块级恢复；不会回退 SenseVoice。
 旧数据库中的已完成摘要保留，不因识别引擎切换自动重算历史课程。
 
 Actions明确安装CPU版 `torch==2.11.0` 与 `qwen-asr==0.0.6 --no-deps`，其余依赖在requirements。
@@ -40,3 +40,5 @@ Actions明确安装CPU版 `torch==2.11.0` 与 `qwen-asr==0.0.6 --no-deps`，其�
 
 单堂课跨 Runner 试验入口见 [分片试验说明](qwen-sharded-pilot.md)。
 新提交的基准测试与分片／订阅入口共用批次并发组；已经在旧提交上运行的任务不受影响。
+
+分支日常入口已接入 [正式分片处理链](parallel-course-pilot.md)，原隔离基线试验继续保留。新入口的数据库/恢复/发布隔离测试通过，尚待真实课堂集成验证。

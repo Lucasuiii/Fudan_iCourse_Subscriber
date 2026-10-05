@@ -8,6 +8,7 @@ from src.ai.qwen_transcriber import MODEL, REVISION, RATE
 
 MAX_COURSES = 5
 MAX_RUNNERS = 15
+MAX_TASKS = 256
 
 
 def fingerprint(value):
@@ -48,7 +49,8 @@ def build_plan(baseline, *, reference, course_slot, run_id, audio_sha256, mode='
                             run_id=run_id, audio_sha256=audio_sha256, mode=mode)
 
 
-def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2', allow_partial=False):
+def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2', allow_partial=False,
+                     production=False):
     """Plan independently acquired VAD blocks without claiming ASR is complete."""
     baseline = audio
     selection = baseline.get('selection') or {}
@@ -56,11 +58,11 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
         raise ValueError('Baseline lacks an exact private lecture selection')
     duration = baseline.get('audio_seconds')
     if (not isinstance(duration, (int, float)) or not math.isfinite(duration)
-            or duration <= 0 or duration > 10800.1
-            or (reaches_acquisition_limit(duration) and not allow_partial)):
+            or duration <= 0 or (not production and duration > 10800.1)
+            or (not production and reaches_acquisition_limit(duration) and not allow_partial)):
         raise ValueError('Invalid baseline audio duration')
     rows = baseline.get('full_chunks')
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list) or (not rows and not production):
         raise ValueError('Baseline lacks original chunks')
     blocks = []
     for i, row in enumerate(rows):
@@ -92,6 +94,8 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
             'pending_audio_seconds': pending, 'strategy': mode,
             'shards': [{'shard_id': i, 'chunk_ids': sorted(ids), 'audio_seconds': loads[i]/RATE}
                        for i, ids in enumerate(groups)]}
+    if production:
+        plan['pipeline'] = 'production'
     if allow_partial:
         plan['allow_partial_comparison'] = True
     return plan
@@ -101,10 +105,13 @@ def validate_plan(plan):
     """Validate decrypted plans before trusting IDs as file names or allocations."""
     if (plan.get('schema') != 1 or plan.get('model') != MODEL or plan.get('revision') != REVISION
             or not str(plan.get('run_id', '')).isdigit()
-            or type(plan.get('course_slot')) is not int or not 0 <= plan['course_slot'] < MAX_COURSES):
+            or type(plan.get('course_slot')) is not int
+            or not 0 <= plan['course_slot'] < (MAX_TASKS if plan.get('pipeline') == 'production' else MAX_COURSES)):
         raise ValueError('Invalid plan identity')
     blocks, shards = plan['blocks'], plan['shards']
-    if not blocks or not 1 <= len(shards) <= 3:
+    if (not blocks or not shards) and plan.get('pipeline') != 'production':
+        raise ValueError('Invalid shard plan')
+    if not 0 <= len(shards) <= 3 or bool(blocks) != bool(shards):
         raise ValueError('Invalid shard plan')
     for i, block in enumerate(blocks):
         if (type(block['chunk_id']) is not int or block['chunk_id'] != i

@@ -33,6 +33,9 @@ def root():
 
 
 def key():
+    if os.environ.get('QWEN_PRODUCTION_TASK') == 'true':
+        from scripts.parallel_courses import bundle_key
+        return bundle_key(os.environ['DB_ENCRYPTION_KEY'])
     value = base64.b64decode(os.environ['QWEN_ASR_TEST_KEY'], validate=True)
     if len(value) != 32:
         raise ValueError('Invalid test encryption key')
@@ -41,9 +44,12 @@ def key():
 
 def context(role, slot=None):
     slot = int(os.environ.get('COURSE_SLOT', '0')) if slot is None else slot
-    if not 0 <= slot < MAX_COURSES or not str(os.environ['GITHUB_RUN_ID']).isdigit():
+    production = os.environ.get('QWEN_PRODUCTION_TASK') == 'true'
+    from scripts.qwen_sharding import MAX_TASKS
+    if not 0 <= slot < (MAX_TASKS if production else MAX_COURSES) or not str(os.environ['GITHUB_RUN_ID']).isdigit():
         raise ValueError('Invalid encrypted artifact identity')
-    return f"icourse-qwen-shards-v1:{os.environ['GITHUB_RUN_ID']}:{slot}:{role}".encode()
+    prefix = 'icourse-qwen-production-v1' if production else 'icourse-qwen-shards-v1'
+    return f"{prefix}:{os.environ['GITHUB_RUN_ID']}:{slot}:{role}".encode()
 
 
 def seal(files, role, path, slot=None):
@@ -369,7 +375,8 @@ def worker():
         done = validate_result(manifest, report, shard_id)
     elif 'completed.json' in files:
         report = json.loads(files['completed.json'])
-        done = validate_result(manifest, report, shard_id, require_complete=True)
+        done = validate_result(manifest, report, shard_id,
+                               require_complete=os.environ.get('QWEN_PRODUCTION_TASK') != 'true')
     else:
         report = {'plan_hash': fingerprint(manifest), 'shard_id': shard_id,
                   'complete': False, 'chunks': [], 'attempts': []}

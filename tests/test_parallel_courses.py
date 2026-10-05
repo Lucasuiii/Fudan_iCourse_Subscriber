@@ -57,7 +57,13 @@ class ParallelCourseTests(unittest.TestCase):
         self.assertIn('max-parallel: 5',text)
         self.assertIn('fail-fast: false',text)
         self.assertNotIn('schedule:',text)
-        self.assertIn('PARALLEL_COURSE_WORKER:',text)
+        import yaml
+        child=yaml.load((Path(__file__).resolve().parents[1]/'.github/workflows/qwen_production_lecture.yml').read_text(),Loader=yaml.BaseLoader)
+        worker=child['jobs']['asr']
+        self.assertEqual(worker['permissions']['contents'],'read')
+        self.assertNotIn('SMTP_EMAIL',worker['env'])
+        self.assertNotIn('PUBLISH_RESULTS',worker['env'])
+        self.assertEqual(worker['strategy']['max-parallel'],'3')
 
 
 if __name__=='__main__': unittest.main()

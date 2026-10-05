@@ -1,0 +1,241 @@
+name: Qwen Production Lecture
+'on':
+  workflow_call:
+    inputs:
+      task_slot:
+        type: number
+        required: true
+      automatic_terms:
+        type: boolean
+        default: false
+      shard_mode:
+        type: string
+        default: '2'
+      publish_results:
+        type: boolean
+        default: false
+    secrets:
+      DB_ENCRYPTION_KEY:
+        required: true
+      STUID:
+        required: true
+      UISPSW:
+        required: true
+      COURSE_IDS:
+        required: true
+      DOUBAO_ASR_API_KEY:
+        required: false
+      TAVILY_API_KEY:
+        required: false
+      DASHSCOPE_API_KEY:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      PROVIDER_CONTEXT:
+        required: false
+permissions:
+  contents: write
+  actions: read
+env:
+  DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+  GH_TOKEN: ${{ github.token }}
+  QWEN_PRODUCTION_TASK: 'true'
+  HF_HUB_DISABLE_TELEMETRY: '1'
+  TOKENIZERS_PARALLELISM: 'false'
+  OMP_NUM_THREADS: '4'
+  MKL_NUM_THREADS: '4'
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      workers: ${{ steps.prepare.outputs.workers }}
+    env:
+      COURSE_SLOT: ${{ inputs.task_slot }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
+      USE_OFFICIAL_TRANSCRIPT: '1'
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - uses: actions/download-artifact@v4
+      with:
+        name: qwen-production-queue
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - name: prepare
+      run: python -m scripts.production_qwen prepare
+      id: prepare
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-prepare-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/prepared.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  asr:
+    needs: prepare
+    if: ${{ needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.prepare.outputs.workers) }}
+    env:
+      COURSE_SLOT: ${{ inputs.task_slot }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
+      USE_OFFICIAL_TRANSCRIPT: '1'
+      SHARD_ID: ${{ matrix.shard_id }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |-
+        python -m pip install cryptography soundfile
+        if [ "$SHARD_ID" != '-1' ]; then
+          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install qwen-asr==0.0.6 --no-deps
+          python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa qwen-omni-utils sox
+        fi
+    - uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface/hub
+        key: qwen-production-asr-7278e1e-cpu-v1
+    - uses: actions/download-artifact@v4
+      with:
+        name: qwen-production-prepare-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - name: worker
+      run: python -m scripts.production_qwen worker
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-asr-${{ inputs.task_slot }}-${{ matrix.shard_id }}
+        path: ${{ runner.temp }}/qwen-shards/out/worker-result.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  gather:
+    name: finalize-${{ inputs.task_slot }}
+    needs:
+    - prepare
+    - asr
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    env:
+      COURSE_SLOT: ${{ inputs.task_slot }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
+      USE_OFFICIAL_TRANSCRIPT: '1'
+      DOUBAO_ASR_API_KEY: ${{ secrets.DOUBAO_ASR_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+      with:
+        inference: 'true'
+    - uses: actions/download-artifact@v4
+      with:
+        name: qwen-production-prepare-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        pattern: qwen-production-asr-${{ inputs.task_slot }}-*
+        path: ${{ runner.temp }}/qwen-shards/results
+    - name: Finalize through LectureRunner with saved quota
+      env:
+        SECRETS_CONTEXT: ${{ secrets.PROVIDER_CONTEXT }}
+      run: |-
+        eval "$(python scripts/provider_env.py)"
+        unset SECRETS_CONTEXT
+        python -m scripts.production_qwen gather
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-state-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/state.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  publish:
+    needs: gather
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      COURSE_SLOT: ${{ inputs.task_slot }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
+      USE_OFFICIAL_TRANSCRIPT: '1'
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      PUBLISH_RESULTS: ${{ inputs.publish_results }}
+      STUID: ${{ secrets.STUID }}
+      UISPSW: ${{ secrets.UISPSW }}
+      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome
+    - uses: actions/download-artifact@v4
+      with:
+        name: qwen-production-state-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/inbox
+    - name: publish
+      run: python -m scripts.production_qwen publish
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-published-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/published.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
