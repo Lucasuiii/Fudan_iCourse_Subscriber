@@ -488,6 +488,40 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_source_diagnostic_recovers_cold_session_with_one_fresh_session(self):
+        import base64
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from src.api.webvpn import AuthenticationError
+        from scripts import production_media_inspection as inspection
+        from scripts.production_result_export import decrypt
+        key=X25519PrivateKey.generate()
+        private=key.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption())
+        public=key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp,'SOURCE_RUN_ID':'99',
+                'SOURCE_SLOT':'0','GITHUB_REPOSITORY':'owner/repo','RECIPIENT_PUBLIC_KEY':base64.b64encode(public).decode()}):
+            info={'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'abc'}
+            spec={'course_id':'10','lecture':{'sub_id':'1'},'audio_diagnostics':{'audio_seconds':4000}}
+            first=MagicMock();first.login.side_effect=AuthenticationError('cold_session');first.auth_diagnostics=[]
+            second=MagicMock();second.auth_diagnostics=[{'stage':'api_verification','verified':True}]
+            client=MagicMock();client.get_video_url.return_value='private-url';client.get_stream_params.return_value=('url','header')
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'artifact',return_value=True), \
+                 patch.object(pipeline,'decode',return_value={'specification.json':json.dumps(spec).encode()}), \
+                 patch('src.api.webvpn.WebVPNSession',side_effect=[first,second]) as factory, \
+                 patch('src.api.icourse.ICourseClient',return_value=client), \
+                 patch.object(inspection.time,'sleep') as sleep, \
+                 patch.object(inspection,'probe_headers',return_value={'status':'complete','streams':[]}):
+                inspection.inspect()
+            self.assertEqual(factory.call_count,2);sleep.assert_called_once_with(2)
+            first.session.close.assert_called_once();second.session.close.assert_called_once()
+            second.authenticate_icourse.assert_called_once_with(strict=True)
+            audit=json.loads(decrypt((pipeline.root()/'out/media-inspection.enc').read_bytes(),private,'99',0))
+            self.assertEqual(audit['inspection_status'],'complete')
+            self.assertEqual(audit['authentication_attempts'][0]['reason'],'cold_session')
+            self.assertTrue(audit['authentication_attempts'][1]['verified'])
+            self.assertNotIn('private-url',json.dumps(audit))
+
     def test_source_probe_reason_codes_never_export_private_stderr(self):
         from scripts.production_media_inspection import safe_probe_errors
         error=safe_probe_errors(b'https://private/token HTTP error 403 Forbidden\n'

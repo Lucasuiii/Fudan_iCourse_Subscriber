@@ -18,6 +18,34 @@ def response(data=None, *, text='', url='https://private/?lck=private-context', 
 
 
 class AuthDiagnosticTests(unittest.TestCase):
+    def test_portal_timeout_does_not_replay_a_consumed_ticket(self):
+        import requests
+        vpn=WebVPNSession();vpn.session=MagicMock();vpn.session.cookies=[]
+        vpn.session.get.side_effect=[response(),requests.exceptions.ReadTimeout('private')]
+        with self.assertRaises(requests.exceptions.ReadTimeout):vpn._establish_session('private-ticket')
+        self.assertEqual(vpn.session.get.call_count,2)
+        self.assertEqual(vpn.auth_diagnostics[-1],{'stage':'webvpn_session_probe','transport_error':'timeout'})
+        vpn.session.close()
+
+    def test_ticket_200_and_cookie_after_timeout_do_not_prove_authenticated_session(self):
+        import requests
+        for first,cookies in [(response(),[]),
+                (requests.exceptions.ReadTimeout('private'),[SimpleNamespace(name='wengine_vpn_ticket')])]:
+            vpn=WebVPNSession();vpn.session=MagicMock();vpn.session.cookies=cookies
+            vpn.session.get.side_effect=[first,response(status=302)]
+            with self.assertRaises(AuthenticationError) as error:vpn._establish_session('private-ticket')
+            self.assertEqual(error.exception.reason,'cold_session')
+            self.assertEqual(vpn.auth_diagnostics[-1]['stage'],'webvpn_session_probe')
+            self.assertEqual(vpn.auth_diagnostics[-1]['http_status'],302)
+            self.assertNotIn('private',json.dumps(vpn.auth_diagnostics));vpn.session.close()
+
+    def test_ticket_success_requires_portal_200(self):
+        vpn=WebVPNSession();vpn.session=MagicMock()
+        vpn.session.get.side_effect=[response(),response()]
+        vpn._establish_session('private-ticket')
+        self.assertEqual(vpn.session.get.call_count,2)
+        self.assertEqual(vpn.auth_diagnostics[-1]['stage'],'webvpn_session_probe');vpn.session.close()
+
     def test_session_ticket_timeouts_are_bounded_and_expose_no_cookie_or_url(self):
         import requests
         vpn=WebVPNSession();vpn.session=MagicMock();vpn.session.cookies=[]

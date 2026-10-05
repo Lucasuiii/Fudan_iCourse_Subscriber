@@ -151,11 +151,29 @@ def inspect():
         lecture = spec['lecture']; course = str(spec['course_id'])
         payload.update(course_id=course, sub_id=str(lecture['sub_id']), date=lecture.get('date'),
                        sub_title=lecture.get('sub_title'), retained_audio=spec.get('audio_diagnostics', {}))
-        vpn = WebVPNSession()
-        stage = 'webvpn_login'
-        vpn.login()
-        stage = 'icourse_authentication'
-        vpn.authenticate_icourse(strict=True)
+        import requests
+        payload['authentication_attempts'] = []
+        for attempt in range(2):
+            vpn = WebVPNSession()
+            stage = 'webvpn_login'
+            try:
+                vpn.login()
+                stage = 'icourse_authentication'
+                vpn.authenticate_icourse(strict=True)
+            except Exception as error:
+                from src.api.webvpn import AuthenticationError
+                row={'attempt':attempt+1,'stage':stage,'failure_type':type(error).__name__,
+                     'diagnostics':vpn.auth_diagnostics if type(vpn.auth_diagnostics) is list else []}
+                if isinstance(error,AuthenticationError):row['reason']=error.reason
+                payload['authentication_attempts'].append(row)
+                transient=(isinstance(error,(requests.exceptions.Timeout,requests.exceptions.ConnectionError))
+                           or isinstance(error,AuthenticationError) and error.reason=='cold_session')
+                if attempt == 1 or not transient:raise
+                vpn.session.close();time.sleep(2)
+                continue
+            payload['authentication_attempts'].append({'attempt':attempt+1,'verified':True,
+                'diagnostics':vpn.auth_diagnostics if type(vpn.auth_diagnostics) is list else []})
+            break
         stage = 'playback_selection'
         client = ICourseClient(vpn)
         # Resolve exactly the stored lecture using the existing fallback chain.

@@ -629,13 +629,6 @@ class WebVPNSession:
                 resp = self.session.get(
                     ticket_url, allow_redirects=True, timeout=20
                 )
-                self._record_icourse_auth('webvpn_ticket_follow',resp)
-                if resp.status_code == 200:
-                    print("    Session established.")
-                    return
-                raise RuntimeError(
-                    f"Failed to establish WebVPN session (status={resp.status_code})"
-                )
             except requests.exceptions.Timeout:
                 has_ticket = any(
                     "wengine_vpn_ticket" in c.name
@@ -646,9 +639,32 @@ class WebVPNSession:
                     'session_cookie_present':has_ticket})
                 self.auth_diagnostics = self.auth_diagnostics[-32:]
                 if has_ticket:
+                    self._verify_webvpn_session()
                     print("    Session cookie set despite timeout.")
                     return
                 if attempt < 2:
                     print(f"    Timeout, retrying ({attempt + 2}/3)...")
                     continue
                 raise
+            self._record_icourse_auth('webvpn_ticket_follow',resp)
+            if resp.status_code == 200:
+                # A portal probe timeout must not replay an already consumed
+                # ticket; let the caller establish a fresh session instead.
+                self._verify_webvpn_session()
+                print("    Session established.")
+                return
+            raise RuntimeError(
+                f"Failed to establish WebVPN session (status={resp.status_code})"
+            )
+
+    def _verify_webvpn_session(self):
+        # A ticket endpoint may return a login page with HTTP 200. Neither
+        # that status nor the mere presence of a stale cookie proves login.
+        try:
+            resp=self.session.get(config.WEBVPN_BASE+'/',allow_redirects=False,timeout=5)
+        except requests.exceptions.Timeout:
+            self.auth_diagnostics.append({'stage':'webvpn_session_probe','transport_error':'timeout'})
+            self.auth_diagnostics=self.auth_diagnostics[-32:]
+            raise
+        self._record_icourse_auth('webvpn_session_probe',resp)
+        if resp.status_code != 200: raise AuthenticationError('cold_session')
