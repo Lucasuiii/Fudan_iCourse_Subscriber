@@ -146,7 +146,7 @@ class QwenTranscriber:
         self.last_vad_windows=[(a,min(b,self._last_duration)) for a,b in self.last_vad_windows if a<self._last_duration]
         return plan_long_chunks(self.last_vad_windows,self._last_duration)
 
-    def recognize_blocks(self, blocks, load_samples, *, checkpoint=None, timeout=18000):
+    def recognize_blocks(self, blocks, load_samples, *, checkpoint=None, timeout=18000, keep_model=False):
         """Decode immutable original blocks; leave global ordering/dedupe to caller."""
         self.last_chunks=[]
         self._last_speech_windows=[]
@@ -177,7 +177,8 @@ class QwenTranscriber:
                 print(f'[Qwen] Block {i+1}/{len(blocks)} completed.',flush=True)
                 del samples;gc.collect()
         finally:
-            self.release_model()
+            if not keep_model:
+                self.release_model()
         return self.last_chunks
 
     def _consume_pcm_stream(self, read_fn, is_eof_fn, stderr_provider, return_code_fn,

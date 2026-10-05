@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      contents: read
+      contents: write
       actions: read
     strategy:
       fail-fast: false
@@ -142,6 +142,18 @@ jobs:
       with:
         name: qwen-production-asr-${{ inputs.task_slot }}-${{ matrix.shard_id }}
         path: ${{ runner.temp }}/qwen-shards/out/worker-result.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-shared-${{ inputs.task_slot }}-${{ matrix.shard_id }}
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/shared-queue.enc
+          ${{ runner.temp }}/qwen-shards/out/shared-local.enc
+          ${{ runner.temp }}/qwen-shards/out/worker-audit.json
         retention-days: 7
         compression-level: 0
         overwrite: true

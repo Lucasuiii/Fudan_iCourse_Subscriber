@@ -233,6 +233,33 @@ def read_preparation():
     return decode(root()/'inbox'/'prepared.enc', 'prepared')
 
 
+def shared_local_checkpoints(plan):
+    """Read every prior worker before any replacement worker may claim blocks."""
+    saved = {}
+    for worker_id in range(len(plan['shards'])):
+        destination = root()/'shared-recovery'/str(worker_id)
+        if artifact(f'qwen-production-shared-{plan["course_slot"]}-{worker_id}',
+                    destination, run=str(plan['run_id'])):
+            with shards.environment({'GITHUB_RUN_ID': str(plan['run_id']),
+                                     'COURSE_SLOT': str(plan['course_slot'])}):
+                local = read_json(decode(destination/'shared-local.enc', f'shared-local-{worker_id}')['local.json'])
+            if local['plan_hash'] != fingerprint(plan) or local['worker_id'] != worker_id:
+                raise ValueError('Dynamic local checkpoint belongs to another input')
+            saved[worker_id] = local['chunks']
+    return saved
+
+
+def shared_results(plan):
+    """Read-only complete original blocks for gather and private export."""
+    from scripts.shared_asr_worker import store_for
+    from src.pipeline.asr_queue import SharedQueue
+    store = store_for(plan)
+    try:
+        return SharedQueue(plan, store).results()
+    finally:
+        store.close()
+
+
 def recover_preparation(db, course, sub_id):
     """Carry immutable audio and completed blocks into the next normal run."""
     raw = db.read_meta('qwen_pipeline:'+sub_id)
@@ -275,6 +302,25 @@ def recover_preparation(db, course, sub_id):
             result['plan_hash'] = fingerprint(plan)
             validate_result(plan, result, shard_id)
             files[f'completed-{shard_id}.json'] = shards.encoded(result)
+    if original.get('execution') == 'shared_queue':
+        from scripts.shared_asr_worker import store_for
+        from src.pipeline.asr_queue import SharedQueue
+        info = json.loads(subprocess.check_output(['gh', 'api',
+            f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{old_run}'],
+            stderr=subprocess.PIPE, timeout=60))
+        if info['status'] != 'completed':
+            raise ValueError('Cannot recover a shared queue while its source run is active')
+        store = store_for(original)
+        try:
+            queue = SharedQueue(original, store)
+            previous = shared_local_checkpoints(original)
+            queue.restore_rows([row for rows in previous.values() for row in rows], int(info['run_attempt'])+1)
+            results = queue.results(require_complete=False)
+        finally:
+            store.close()
+        for result in results:
+            result['plan_hash'] = fingerprint(plan)
+            files[f'completed-{result["shard_id"]}.json'] = shards.encoded(result)
     files['database.db'] = lecture_snapshot(db, root()/'snapshot.db', course, sub_id)
     files['specification.json'] = shards.encoded(spec)
     return files
@@ -286,6 +332,9 @@ def prepare():
         files = decode(root()/'previous'/'prepared.enc', 'prepared')
         specification = read_json(files['specification.json'])
         if specification['mode'] != 'failed':
+            if specification.get('plan', {}).get('execution') == 'shared_queue':
+                from scripts.shared_asr_worker import initialize
+                initialize(specification['plan'], files)
             encode(files, 'prepared', out('prepared.enc'))
             write_outputs(workers={'shard_id': list(range(len(specification.get('plan', {}).get('shards', [])))) or [-1]})
             return
@@ -310,6 +359,10 @@ def prepare():
             if not existing.get('transcript'):
                 recovered = recover_preparation(db, course, sub_id)
                 if recovered:
+                    recovered_plan = read_json(recovered['specification.json'])['plan']
+                    if recovered_plan.get('execution') == 'shared_queue':
+                        from scripts.shared_asr_worker import initialize
+                        initialize(recovered_plan, recovered)
                     encode(recovered, 'prepared', out('prepared.enc'))
                     plan = read_json(recovered['specification.json'])['plan']
                     write_outputs(workers={'shard_id': list(range(len(plan['shards']))) or [-1]})
@@ -360,17 +413,20 @@ def prepare():
                 terms = course_terms(title)
                 if os.environ.get('AUTO_COURSE_TERMS') == 'true':
                     from src.ai.automatic_glossary import AutomaticGlossary
-                    terms = list(dict.fromkeys(AutomaticGlossary(db, course).terms(exclude_sub_id=sub_id)+terms))[:30]
+                    glossary_snapshot = AutomaticGlossary(db, course).freeze(title, sub_id)
+                    terms = glossary_snapshot['terms']
+                    specification['glossary_snapshot'] = glossary_snapshot
                 flac = root()/'lecture.flac'
                 shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'f32le', '-ar', '16000', '-ac', '1',
                                 '-i', handle.path, '-c:a', 'flac', '-y', str(flac)], timeout=300)
-                digest = hashlib.sha256(flac.read_bytes()).hexdigest()
+                flac_bytes = flac.read_bytes()
+                digest = hashlib.sha256(flac_bytes).hexdigest()
                 plan = build_audio_plan({'selection': {'course_id': course, 'sub_id': sub_id},
                     'audio_seconds': duration, 'full_chunks': [{'start': a, 'end': b} for a,b in windows],
                     'vad_windows': transcriber.last_vad_windows, 'recognition_terms': terms},
                     reference={'pipeline': 'production'}, course_slot=slot, run_id=os.environ['GITHUB_RUN_ID'],
                     audio_sha256=digest, mode=os.environ.get('SHARD_MODE', '2'), production=True)
-                files['lecture.flac'] = flac.read_bytes()
+                files['lecture.flac'] = flac_bytes
                 for block in plan['blocks']:
                     chunk = root()/f"chunk-{block['chunk_id']}.flac"
                     # atrim operates on sample indices so FLAC preserves exact
@@ -395,13 +451,22 @@ def prepare():
             # Persist the recovery identity before any worker or cloud review
             # starts. A lost job cannot look like a brand-new lecture next run.
             publish(delta, course, sub_id)
+        if specification.get('plan', {}).get('execution') == 'shared_queue':
+            from scripts.shared_asr_worker import initialize
+            initialize(specification['plan'], files)
         encode(files, 'prepared', out('prepared.enc'))
         write_outputs(workers={'shard_id': list(range(len(specification.get('plan', {}).get('shards', [])))) or [-1]})
     except Exception as error:
         db.update_error(sub_id, 'prepare', type(error).__name__)
-        specification.update(mode='failed', error_type=type(error).__name__)
-        files = {'specification.json': shards.encoded(specification),
-                 'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)}
+        # A coordination/API failure after slicing must retain the acquired
+        # input. Retry initializes the queue from this same immutable plan.
+        if specification.get('plan') and 'lecture.flac' in files:
+            specification['prepare_error_type'] = type(error).__name__
+        else:
+            specification.update(mode='failed', error_type=type(error).__name__)
+            files = {}
+        files.update({'specification.json': shards.encoded(specification),
+                      'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)})
         encode(files, 'prepared', out('prepared.enc'))
         raise
     finally:
@@ -415,6 +480,21 @@ def worker():
         if spec['mode'] == 'failed': raise ValueError('Preparation failed')
         return
     plan = spec['plan']; validate_plan(plan)
+    if plan.get('execution') == 'shared_queue':
+        from scripts.shared_asr_worker import run_worker, store_for
+        from src.pipeline.asr_queue import SharedQueue
+        worker_id = int(os.environ['SHARD_ID'])
+        attempt = int(os.environ.get('GITHUB_RUN_ATTEMPT', '1'))
+        previous = shared_local_checkpoints(plan) if attempt > 1 else {}
+        store = store_for(plan)
+        try:
+            SharedQueue(plan, store).restore_rows([row for rows in previous.values() for row in rows], attempt)
+            report = run_worker(plan, files, store, worker_id, attempt,
+                                previous_rows=previous.get(worker_id, []))
+        finally:
+            store.close()
+        out('worker-audit.json').write_bytes(shards.encoded(report))
+        return
     shard_id = int(os.environ['SHARD_ID'])
     assigned = plan['shards'][shard_id]['chunk_ids']
     audio = {'manifest.json': shards.encoded(plan)}
@@ -517,15 +597,18 @@ def gather():
         if spec['mode'] == 'sharded':
             from src.pipeline.prepared_lecture import assemble_material
             plan = spec['plan']
-            results = []
-            for shard in plan['shards']:
-                path = root()/'results'/f'qwen-production-asr-{slot}-{shard["shard_id"]}'/'worker-result.enc'
-                result = read_json(decode(path, f'result-{shard["shard_id"]}')['result.json'])
-                validate_result(plan, result, shard['shard_id'], require_complete=True)
-                results.append(result)
-            flac = root()/'lecture.flac'; flac.write_bytes(files['lecture.flac'])
-            if hashlib.sha256(flac.read_bytes()).hexdigest() != plan['audio_sha256']:
+            if plan.get('execution') == 'shared_queue':
+                results = shared_results(plan)  # All original blocks must be complete.
+            else:
+                results = []
+                for shard in plan['shards']:
+                    path = root()/'results'/f'qwen-production-asr-{slot}-{shard["shard_id"]}'/'worker-result.enc'
+                    result = read_json(decode(path, f'result-{shard["shard_id"]}')['result.json'])
+                    validate_result(plan, result, shard['shard_id'], require_complete=True)
+                    results.append(result)
+            if hashlib.sha256(files['lecture.flac']).hexdigest() != plan['audio_sha256']:
                 raise ValueError('Prepared audio hash changed')
+            flac = root()/'lecture.flac'; flac.write_bytes(files['lecture.flac'])
             raw = root()/'audio.raw'
             shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(flac), '-f', 'f32le',
                             '-ac', '1', '-ar', '16000', '-y', str(raw)], timeout=300)

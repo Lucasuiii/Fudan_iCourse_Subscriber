@@ -8,6 +8,13 @@ from src.ai.automatic_glossary import validated_keywords, active_terms, Automati
 from src.data.database import Database
 from src.ai.summarizer import Summarizer
 from scripts.merge_db import merge
+from src.ai.automatic_glossary import term_stages
+
+
+def evidence(term, source, quote):
+    import hashlib
+    return {'term': term, 'source': source, 'quote': quote,
+            'evidence': [{'source': source, 'quote': quote, 'sha256': hashlib.sha256(quote.encode()).hexdigest()}]}
 
 
 class AutomaticGlossaryTests(unittest.TestCase):
@@ -21,7 +28,8 @@ class AutomaticGlossaryTests(unittest.TestCase):
                         'keywords': [{'term': '坏记录', 'source': 'ppt'}]})
             for stamp in (None, [], {}, 123)
         ]
-        self.assertEqual(AutomaticGlossary(db, '10').terms(), ['Householder'])
+        self.assertEqual(AutomaticGlossary(db, '10').terms(), [])
+        self.assertEqual([r['sub_id'] for r in AutomaticGlossary(db, '10').records()], ['1'])
 
     def test_merge_preserves_newer_glossary_and_unrelated_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,9 +60,9 @@ class AutomaticGlossaryTests(unittest.TestCase):
         one={'sub_id':'1','keywords':[{'term':'镜像变换','source':'asr'}]}
         self.assertEqual(active_terms([one,one]),[])
         two={**one,'sub_id':'2'}
-        self.assertEqual(active_terms([one,two]),['镜像变换'])
+        self.assertEqual(active_terms([one,two]),[])
         self.assertEqual(active_terms([one,two],exclude_sub_id='2'),[])
-        self.assertEqual(active_terms([{'sub_id':'3','keywords':[{'term':'Householder','source':'ppt'}]}]),['Householder'])
+        self.assertEqual(active_terms([{'sub_id':'3','keywords':[{'term':'Householder','source':'ppt'}]}]),[])
 
     def test_persistence_course_isolation_and_deleted_lecture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,7 +71,8 @@ class AutomaticGlossaryTests(unittest.TestCase):
                 db.upsert_course(cid,'同名课','教师')
                 db.insert_lecture(sid,cid,'课次','2026-09-29')
             store=AutomaticGlossary(db,'10')
-            store.save('1',[{'term':'Householder','source':'ppt','quote':'Householder'}])
+            store.save('1',[{'term':'Householder','source':'ppt','quote':'Householder'}],
+                       sources={'ppt':['Householder'], 'cloud':['使用Householder变换']})
             self.assertEqual(store.terms(),['Householder'])
             self.assertEqual(AutomaticGlossary(db,'20').terms(),[])
             self.assertEqual(store.terms(exclude_sub_id='1'),[])
@@ -89,6 +98,114 @@ class AutomaticGlossaryTests(unittest.TestCase):
         self.assertEqual(client.chat.completions.create.call_args.kwargs['extra_body']['thinking']['type'],'enabled')
         payload=json.loads(client.chat.completions.create.call_args.kwargs['messages'][1]['content'])
         self.assertIsInstance(payload['evidence_sources']['ppt'],str)
+
+    def test_only_new_cross_source_evidence_promotes_not_two_asr_or_legacy_flags(self):
+        term = '镜像变换'
+        def record(sid, source, quote, frozen=()):
+            return {'schema': 2, 'sub_id': sid, 'lecture_date': '2026-09-01',
+                    'frozen_terms': list(frozen), 'keywords': [evidence(term, source, quote)]}
+        asr1 = record('1', 'asr', '使用镜像变换。')
+        asr2 = record('2', 'asr', '再讨论镜像变换。')
+        self.assertEqual(active_terms([asr1, asr2]), [])
+        ppt1 = record('1', 'ppt', '镜像变换定义')
+        cloud = record('1', 'cloud', '现在介绍镜像变换')
+        self.assertEqual(active_terms([ppt1, cloud]), [term])
+        self.assertEqual(active_terms([ppt1, cloud], exclude_sub_id='1'), [])
+        same = record('2', 'ppt', '镜像变换定义')
+        self.assertEqual(active_terms([ppt1, same]), [])
+        other = record('2', 'ppt', '应用镜像变换构造正交矩阵')
+        self.assertEqual(active_terms([ppt1, other]), [term])
+        hinted = record('2', 'ppt', '应用镜像变换构造正交矩阵', [term])
+        self.assertEqual(active_terms([ppt1, hinted]), [])
+        wrong = record('2', 'cloud', '不是镜像变换')
+        self.assertEqual(active_terms([ppt1, wrong]), [])
+        tampered = record('2', 'ppt', '应用镜像变换构造正交矩阵')
+        tampered['keywords'][0]['evidence'][0]['sha256'] = 'wrong'
+        self.assertEqual(active_terms([ppt1, tampered]), [])
+
+    def test_future_same_date_deleted_and_foreign_lessons_do_not_feed_frozen_terms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(str(Path(tmp)/'terms.db')); db.upsert_course('10', '课', '老师')
+            for sid, date in [('1', '2026-09-01'), ('2', '2026-09-02'), ('3', '2026-09-03')]:
+                db.insert_lecture(sid, '10', '课次', date)
+            store = AutomaticGlossary(db, '10')
+            keyword = {'term': 'Householder', 'source': 'ppt', 'quote': 'Householder变换'}
+            store.save('1', [keyword], sources={'ppt': ['Householder变换'], 'cloud': ['使用Householder变换']})
+            with patch('src.ai.course_glossary.course_terms', return_value=['基础词']):
+                snapshot = store.freeze('课', '2')
+                self.assertEqual(snapshot['terms'], ['基础词', 'Householder'])
+                self.assertEqual(store.freeze('课', '1')['terms'], ['基础词'])
+                db.conn.execute("UPDATE lectures SET date='2026-09-02' WHERE sub_id='1'"); db.conn.commit()
+                self.assertEqual(store.freeze('课', '2')['terms'], ['基础词'])
+            before = snapshot['terms'][:]
+            db.conn.execute("UPDATE lectures SET deleted_at='now' WHERE sub_id='1'"); db.conn.commit()
+            self.assertEqual(store.terms(), [])
+            self.assertEqual(snapshot['terms'], before)
+            db.conn.close()
+
+    def test_save_requires_raw_source_and_preserves_candidates_without_auto_activation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(str(Path(tmp)/'terms.db')); db.upsert_course('10', '课', '老师')
+            db.insert_lecture('1', '10', '课次', '2026-09-01')
+            store = AutomaticGlossary(db, '10')
+            keyword = {'term': 'Householder', 'source': 'asr', 'quote': '使用Householder变换'}
+            store.save('1', [keyword], sources={'asr': ['使用Householder变换']})
+            record = json.loads(db.read_meta('auto_glossary:10:1'))
+            self.assertEqual(record['keywords'][0]['stage'], 'candidate')
+            self.assertEqual(store.terms(), [])
+            self.assertEqual(store.stages()[0]['term'], 'Householder')
+            self.assertTrue(record['keywords'][0]['evidence'][0]['sha256'])
+            store.save('1', [keyword], sources={'asr': ['另一个词']})
+            self.assertEqual(json.loads(db.read_meta('auto_glossary:10:1'))['keywords'], [])
+            with self.assertRaises(ValueError): AutomaticGlossary(db, '20').save('1', [keyword])
+            db.conn.close()
+
+    def test_same_lecture_rerun_does_not_count_as_independent_evidence(self):
+        term = '条件期望'
+        one = {'schema': 2, 'sub_id': '1', 'keywords': [evidence(term, 'ppt', '条件期望定义')]}
+        replay = {'schema': 2, 'sub_id': '1', 'keywords': [evidence(term, 'ppt', '条件期望再次讨论')]}
+        self.assertEqual(active_terms([one, replay]), [])
+        self.assertEqual(term_stages([one, replay])[0]['stage'], 'candidate')
+
+    def test_malformed_proof_or_prompting_history_never_confirms(self):
+        term = 'Householder'
+        for bad in (None, {}, 'invalid'):
+            item = evidence(term, 'ppt', term); item['evidence'] = bad
+            self.assertEqual(active_terms([{'schema': 2, 'sub_id': '1', 'keywords': [item]}]), [])
+            item = evidence(term, 'ppt', term)
+            self.assertEqual(active_terms([{'schema': 2, 'sub_id': '1', 'keywords': [item], 'frozen_terms': bad}]), [])
+
+    def test_long_asr_evidence_does_not_displace_visual_and_cloud_corroboration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(str(Path(tmp)/'db.sqlite'))
+            db.upsert_course('10', '课程', '教师'); db.insert_lecture('1', '10', '课次', '2026-09-29')
+            glossary = AutomaticGlossary(db, '10')
+            glossary.save('1', [{'term': 'Householder', 'source': 'asr', 'quote': 'Householder'}], sources={
+                'asr': ['Householder变换'+str(i) for i in range(40)],
+                'ppt': ['Householder正交变换'], 'cloud': ['讨论Householder变换']})
+            self.assertEqual(glossary.terms(), ['Householder'])
+            self.assertLessEqual(len(glossary.records()[0]['keywords'][0]['evidence']), 12)
+            db.conn.close()
+
+    def test_prepared_frozen_terms_override_current_db_for_review_and_save(self):
+        from test_qwen_production_pipeline import fixture, database
+        from src.pipeline.prepared_lecture import assemble_material
+        from test_lecture_quality_gate import _load_runner_class
+        plan, results = fixture(); prepared = assemble_material(plan, results)
+        with tempfile.TemporaryDirectory() as tmp:
+            db = database(Path(tmp)/'db.sqlite'); llm = MagicMock()
+            llm.summarize_with_keywords.return_value = ('完整摘要', 'test', [])
+            Runner = _load_runner_class(); transcriber = MagicMock()
+            runner = Runner(None, db, MagicMock(), transcriber, llm, MagicMock())
+            with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'true'}), \
+                 patch('src.ai.automatic_glossary.AutomaticGlossary') as glossary, \
+                 patch('src.runtime.config.DOUBAO_ASR_API_KEY', ''):
+                glossary.return_value.freeze.return_value = {'terms': ['更晚的新词']}
+                runner.run('10', '概率论', {'sub_id': '1'}, prepared_asr=prepared, review_state={}, checkpoint=lambda: None)
+                self.assertEqual(runner._historical_terms, ['条件期望'])
+                self.assertEqual(llm.summarize_with_keywords.call_args.args[3], ['条件期望'])
+                self.assertEqual(glossary.return_value.save.call_args.kwargs['frozen_terms'], ['条件期望'])
+            db.conn.close()
 
 
 if __name__=='__main__':

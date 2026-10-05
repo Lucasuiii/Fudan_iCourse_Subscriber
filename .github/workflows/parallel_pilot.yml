@@ -16,11 +16,12 @@ name: iCourse Parallel Pilot
         type: boolean
         default: false
       shard_mode:
-        description: Two runners by default; auto uses three above 60 speech minutes
+        description: Fixed two/auto shards, or shared dynamic block queue (1-3 workers by pending audio)
         type: choice
         options:
         - '2'
         - auto
+        - shared
         default: '2'
       publish_results:
         description: Publish encrypted lecture results to the data branch
