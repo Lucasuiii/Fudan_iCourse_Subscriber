@@ -19,7 +19,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
@@ -32,9 +32,11 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/qwen_review_ledger.py'
     - 'src/ai/homework_review.py'
     - 'src/ai/homework_visual_evidence.py'
+    - 'src/ai/homework_vision.py'
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
     - 'tests/test_homework_review.py'
+    - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
   pull_request:
@@ -45,9 +47,11 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/qwen_review_ledger.py'
     - 'src/ai/homework_review.py'
     - 'src/ai/homework_visual_evidence.py'
+    - 'src/ai/homework_vision.py'
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
     - 'tests/test_homework_review.py'
+    - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
 permissions:
@@ -102,4 +106,4 @@ jobs:
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
-      run: PYTHONPATH=tests python -m unittest test_homework_review test_doubao_asr
+      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr

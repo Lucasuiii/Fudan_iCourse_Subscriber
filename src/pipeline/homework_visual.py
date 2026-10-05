@@ -8,13 +8,13 @@ import tempfile
 from src.ai.homework_review import MAX_FOCUS, nearby_pages
 from src.ai.homework_visual_evidence import assess_visual, candidate_key, references
 
-MAX_VIDEO_FRAMES = 24
-FRAMES_PER_CUE = 6
+MAX_VIDEO_FRAMES = 48
+FRAMES_PER_CUE = 12
 
 
-def visual_window(candidate, interval, audio_seconds=None):
+def visual_window(candidate, interval, audio_seconds=None, *, delay_seconds=180):
     start = max(0, interval['quote_start_ms']/1000-10)
-    end = interval['quote_end_ms']/1000+90
+    end = interval['quote_end_ms']/1000+delay_seconds
     limit = audio_seconds if isinstance(audio_seconds, (int, float)) and math.isfinite(audio_seconds) else candidate['block_end']
     end = min(end, limit)
     if end <= start:
@@ -22,11 +22,12 @@ def visual_window(candidate, interval, audio_seconds=None):
     return {'start_ms': round(start*1000), 'end_ms': round(end*1000)}
 
 
-def frame_times(interval, window):
+def frame_times(interval, window, count=FRAMES_PER_CUE):
     start, end = window['start_ms']/1000, window['end_ms']/1000
     anchor_end = interval['quote_end_ms']/1000
+    offsets = [20, 40, 60, 90] if count == 6 else [10, 20, 35, 50, 70, 90, 110, 130, 155, 180]
     times = {min(max(start, t), max(start, end-.1))
-             for t in [start, anchor_end, anchor_end+20, anchor_end+40, anchor_end+60, anchor_end+90]}
+             for t in [start, anchor_end]+[anchor_end+offset for offset in offsets]}
     return sorted(times)
 
 
@@ -87,13 +88,18 @@ def read_frame(image, ocr):
 
 
 def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *, audio_seconds=None,
-                            screenshot_fetcher=None, ocr=None, frame_observer=None):
+                            screenshot_fetcher=None, ocr=None, frame_observer=None, vision_reader=None,
+                            frames_per_cue=FRAMES_PER_CUE, delay_seconds=180):
+    if frames_per_cue not in (6, 12) or delay_seconds not in (90, 180):
+        raise ValueError('Unsupported bounded visual profile')
     if screenshot_fetcher is None:
         from src.api.icourse import fetch_ppt_image
         screenshot_fetcher = fetch_ppt_image
     if ocr is None:
-        from src.ai.ocr import ocr_image_strict
-        ocr = ocr_image_strict
+        # A successful direct image read never initializes the local OCR engine.
+        def ocr(image):
+            from src.ai.ocr import ocr_image_strict
+            return ocr_image_strict(image)
     try:
         pages = client.get_ppt_list(course_id, sub_id)
     except Exception:
@@ -104,60 +110,70 @@ def collect_visual_evidence(client, course_id, sub_id, candidates, intervals, *,
         cid = candidate_key(candidate['id'], candidate['quote']); ids.append(cid)
         interval = next((row for row in intervals if row.get('chunk_id') == candidate['id']
                          and row.get('text') == candidate['quote']), None)
-        window = visual_window(candidate, interval, audio_seconds) if interval else None
+        window = visual_window(candidate, interval, audio_seconds, delay_seconds=delay_seconds) if interval else None
         windows.append({'candidate_id': cid, 'range': window, 'aligned': bool(interval)})
         shots = nearby_pages(pages, window or candidate)
         if isinstance(audio_seconds, (int, float)) and math.isfinite(audio_seconds):
             shots = [shot for shot in shots if 0 <= shot['created_sec'] <= audio_seconds]
+        captured = []
         for shot in shots:
             identity = (cid, shot.get('id'), shot['created_sec'])
             if identity in seen:
                 continue
             seen.add(identity)
-            image = None
+            image, error = None, None
             try:
                 image = screenshot_fetcher(client, shot, max_attempts=1, timeout=15)
-                row = read_frame(image, ocr)
-            except Exception as error:
-                row = {'status': 'capture_failed', 'error_type': type(error).__name__, 'text': '', 'references': [], 'views': []}
-            results.append(dict(row, source='platform_screenshot', seconds=shot['created_sec'], candidate_id=cid))
-            if callable(frame_observer):
-                frame_observer(image, results[-1])
-        # Ordinary formula OCR is never a reason to skip delayed board frames.
-        # Unaligned keywords cannot create a guessed video seek position.
+            except Exception as exc:
+                error = type(exc).__name__
+            captured.append({'image': image, 'source': 'platform_screenshot',
+                             'seconds': shot['created_sec'], 'candidate_id': cid, 'capture_error_code': error})
         if window:
-            # Separate ffmpeg processes must not reuse a signed transport
-            # identity. The real CDN accepted the first seek but returned 403
-            # for all later processes using that same URL, even before OCR.
-            times = frame_times(interval, window)[:FRAMES_PER_CUE]
-            captured = []
-            for seconds in times:
+            for seconds in frame_times(interval, window, frames_per_cue)[:frames_per_cue]:
                 if video_count >= MAX_VIDEO_FRAMES:
                     break
                 video_count += 1
-                video_params = None
+                params = None
                 try:
-                    url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain
+                    url = client.get_video_url(course_id, sub_id)  # unchanged fallback chain; fresh signature per seek
                     if url:
-                        video_params = client.get_stream_params(url)
+                        params = client.get_stream_params(url)
                 except Exception:
                     pass
-                response = video_frame(video_params, seconds, diagnostic=True) if video_params else None
+                response = video_frame(params, seconds, diagnostic=True) if params else None
                 image = response.get('image') if isinstance(response, dict) else response
                 error = response.get('error_code') if isinstance(response, dict) else None
-                captured.append((seconds, image, error))
-            for seconds, image, error in captured:
-                row = read_frame(image, ocr)
-                if error:
-                    row['capture_error_code'] = error
-                results.append(dict(row, source='video_frame', seconds=seconds, candidate_id=cid))
-                if callable(frame_observer):
-                    frame_observer(image, results[-1])
+                captured.append({'image': image, 'source': 'video_frame', 'seconds': seconds,
+                                 'candidate_id': cid, 'capture_error_code': error})
+        valid = [row for row in captured if row['image']]
+        readings, vision_error = None, None
+        if callable(vision_reader) and valid:
+            try:
+                readings = vision_reader(valid)
+                if not isinstance(readings, list) or len(readings) != len(valid):
+                    raise ValueError('Incomplete image readings')
+            except Exception as error:
+                readings = None; vision_error = type(error).__name__
+        index = 0
+        for capture in captured:
+            image = capture['image']
+            if image and readings is not None:
+                row = readings[index]; index += 1
+                row = dict(row, vision_status='complete')
+            else:
+                row = dict(read_frame(image, ocr), reader='local_ocr',
+                           vision_status='failed' if vision_error else 'unavailable')
+                if vision_error:
+                    row['vision_error_type'] = vision_error
+            row.update({k: v for k, v in capture.items() if k != 'image' and v is not None})
+            results.append(row)
+            if callable(frame_observer):
+                frame_observer(image, row)
     valid = [r for r in results if r['status'] in ('ok', 'no_text')]
     complete = results and len(valid) == len(results) and all(
         all(v['status'] in ('ok', 'no_text') for v in r['views']) for r in valid)
     capture = 'complete' if complete else 'partial' if valid else 'unavailable'
-    return assess_visual({'schema_version': 2, 'capture_status': capture, 'candidate_ids': ids,
+    return assess_visual({'schema_version': 3, 'capture_status': capture, 'candidate_ids': ids,
                           'windows': windows, 'frames': results})
 
 

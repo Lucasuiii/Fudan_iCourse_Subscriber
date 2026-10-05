@@ -508,6 +508,8 @@ def gather():
                 homework_visual_status=review.get('homework', {}).get('visual', {}).get('status'),
                 homework_visual_capture_status=review.get('homework', {}).get('visual', {}).get('capture_status'),
                 homework_visual_reference_status=review.get('homework', {}).get('visual', {}).get('reference_status'),
+                homework_vision_calls=len(review.get('homework', {}).get('vision_calls', [])),
+                homework_vision_call_statuses=[c['status'] for c in review.get('homework', {}).get('vision_calls', [])],
                 asr_complete=bool(material and material.get('complete')))
             out('validation-result.json').write_bytes(shards.encoded(audit))
     db.checkpoint = checkpoint

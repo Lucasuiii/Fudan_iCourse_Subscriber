@@ -2,6 +2,7 @@
 import copy
 import io
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 from src.ai.homework_review import (assignment_candidates, prioritize_candidates, focus_intervals,
@@ -151,7 +152,8 @@ def board_png(size=(640, 360)):
 
 class AssignmentVisualTests(unittest.TestCase):
     def test_short_snapshot_does_not_skip_delayed_board_capture(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110, 'pptimgurl': 'private'}]
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
         client.get_video_url.return_value = None
@@ -163,7 +165,8 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_delayed_board_is_captured_after_original_audio_focus(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.return_value = 'signed-private'
         client.get_stream_params.return_value = ('vpn-private', 'cookies-private')
@@ -179,7 +182,8 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_unaligned_quote_never_seeks_guessed_video_position(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         result = collect_visual_evidence(client, '10', '1', assignment_candidates(material()['full_chunks']), [],
                                         screenshot_fetcher=MagicMock(), ocr=MagicMock())
@@ -291,7 +295,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertGreater(views[1][2][1], 1080)
 
     def test_transport_finishes_before_video_ocr_and_new_cue_refreshes_source(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
         client.get_stream_params.return_value = ('private', '')
         candidates = assignment_candidates([dict(start=0, end=120, text='作业完成第二题。'),
@@ -308,7 +313,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertEqual(client.get_video_url.call_count, 12)
 
     def test_independent_seeks_never_reuse_signed_transport_identity(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.side_effect = [f'signed-{i}' for i in range(6)]
         client.get_stream_params.side_effect = lambda url: (url, 'private')
@@ -332,7 +338,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertNotIn('secret', str(result))
 
     def test_only_later_frames_with_homework_references_support_evidence(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110}]
         client.get_video_url.return_value = 'private'; client.get_stream_params.return_value = ('private', 'private')
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
@@ -349,7 +356,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertEqual(frame.call_count, 6)
 
     def test_no_frame_seeks_past_end_and_four_cues_remain_bounded(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
         client.get_stream_params.return_value = ('private', '')
         chunks = [dict(start=i*120, end=(i+1)*120, text='今天布置作业，完成第二题。') for i in range(4)]

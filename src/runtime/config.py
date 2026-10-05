@@ -74,6 +74,10 @@ MODEL_PROVIDERS: list[dict] = [
     }
 ]
 
+# Vision is deliberately separate from text-provider fallback: V4 Pro and
+# third-party text endpoints must never silently receive images.
+HOMEWORK_VISION_MODEL = 'deepseek-flash'
+
 
 def resolve_model_providers() -> list[dict]:
     """Resolve MODEL_PROVIDERS into runtime configs.
