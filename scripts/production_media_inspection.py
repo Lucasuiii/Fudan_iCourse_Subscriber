@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import time
+import uuid
+from urllib.parse import parse_qsl,urlsplit,urlunsplit,urlencode
 
 
 ENTRIES = ('format=start_time,duration,size:'
@@ -59,7 +61,7 @@ def safe_probe_errors(stderr):
     return result
 
 
-def probe_byte_ranges(session, url, headers, total_bytes):
+def probe_byte_ranges(session, url, headers, total_bytes, *, starts=None,open_ended=False):
     """Five 4-KiB samples only; close ignored ranges without downloading media.
 
     No response body, URL, cookies or redirect destinations are exported.
@@ -75,15 +77,19 @@ def probe_byte_ranges(session, url, headers, total_bytes):
     width = 4096
     starts = sorted({0, min(1024**2,total_bytes-width),
                      min(1024**3-width,total_bytes-width),
-                     min(1024**3,total_bytes-width),total_bytes-width})
+                     min(1024**3,total_bytes-width),total_bytes-width}) if starts is None else starts
+    if (not isinstance(starts,list) or not 1<=len(starts)<=5
+            or any(type(n) is not int or not 0<=n<=total_bytes-width for n in starts)):
+        raise ValueError('Invalid diagnostic byte ranges')
     rows = []
     for start in starts:
         end = start+width-1
-        row = {'start':start, 'end':end, 'read_limit':width+1, 'range_valid':False}
+        row = {'start':start, 'end':None if open_ended else end,
+               'read_limit':width+1, 'range_valid':False,'bounded_sample_only':True}
         response = None
         began = time.monotonic()
         try:
-            response = session.get(url, headers={**request_headers,'Range':f'bytes={start}-{end}'},
+            response = session.get(url, headers={**request_headers,'Range':f'bytes={start}-'+('' if open_ended else str(end))},
                 stream=True, allow_redirects=False, timeout=(10,15))
             row['http_status'] = response.status_code
             row['redirect_present'] = 'Location' in response.headers
@@ -100,8 +106,9 @@ def probe_byte_ranges(session, url, headers, total_bytes):
             body = response.raw.read(width+1, decode_content=False)
             row['bytes_read'] = len(body)
             row['range_valid'] = (response.status_code == 206
-                and row.get('content_range') == {'start':start,'end':end,'total':total_bytes}
-                and len(body) == width and row['content_class'] != 'html')
+                and row.get('content_range') == {'start':start,'end':total_bytes-1 if open_ended else end,'total':total_bytes}
+                and len(body) == (min(width+1,total_bytes-start) if open_ended else width)
+                and row['content_class'] != 'html')
             if row['range_valid']: row['sample_sha256'] = hashlib.sha256(body).hexdigest()
         except Exception as error:
             row['failure_type'] = type(error).__name__
@@ -112,6 +119,29 @@ def probe_byte_ranges(session, url, headers, total_bytes):
     return {'status':'complete' if all(r['range_valid'] for r in rows) else 'failed',
             'maximum_requests':5, 'maximum_body_bytes':5*(width+1), 'payload_exported':False,
             'same_source_bytes_verified':False, 'requests':rows}
+
+
+def probe_initial_range_reuse(session,url,headers,total_bytes):
+    """Four bounded samples distinguish range shape from initial UUID reuse.
+
+    Only clientUUID changes, preserving the path, t signature and timestamp.
+    This is a diagnostic contrast, never a downloader authentication fallback.
+    """
+    parts=urlsplit(url);query=parse_qsl(parts.query,keep_blank_values=True)
+    if sum(k=='clientUUID' for k,v in query)!=1:
+        return {'status':'uuid_unavailable','requests':[]}
+    def fresh():
+        items=[(k,str(uuid.uuid4()) if k=='clientUUID' else v) for k,v in query]
+        return urlunsplit((parts.scheme,parts.netloc,parts.path,urlencode(items),parts.fragment))
+    first=fresh();rows=[]
+    variants=[('fresh_uuid_closed_first',first,False),('same_uuid_open_first',first,True),
+              ('same_uuid_open_repeat',first,True),('another_fresh_uuid_open_first',fresh(),True)]
+    for label,target,open_ended in variants:
+        result=probe_byte_ranges(session,target,headers,total_bytes,starts=[0],open_ended=open_ended)
+        rows.append({'variant':label,**result})
+    return {'status':'complete','maximum_requests':4,'maximum_body_bytes':4*4097,
+            'changed_query_keys':['clientUUID'],'signature_and_timestamp_preserved':True,
+            'payload_exported':False,'requests':rows}
 
 
 def safe_metadata(raw):
@@ -265,6 +295,9 @@ def inspect():
         stage = 'byte_ranges'
         payload['current_source_byte_ranges'] = probe_byte_ranges(
             vpn.session, vpn_url, headers, metadata.get('format',{}).get('size'))
+        stage = 'initial_range_reuse'
+        payload['initial_range_reuse'] = probe_initial_range_reuse(
+            vpn.session,vpn_url,headers,metadata.get('format',{}).get('size'))
         audio = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'audio']
         retained = spec.get('audio_diagnostics', {}).get('audio_seconds')
         stage = 'late_packets'

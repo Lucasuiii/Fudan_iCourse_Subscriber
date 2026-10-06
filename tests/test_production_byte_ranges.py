@@ -3,10 +3,27 @@ import io
 import json
 import unittest
 from unittest.mock import MagicMock
-from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors
+from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors,probe_initial_range_reuse
+from urllib.parse import parse_qs,urlsplit
 
 
 class SourceByteRangeTests(unittest.TestCase):
+    def test_uuid_contrast_preserves_signature_timestamp_and_auth_headers(self):
+        session,responses=self.session('valid')
+        result=probe_initial_range_reuse(session,'https://private/source?t=secret&clientUUID=old&now=123',
+                                        'Cookie: private-cookie\r\n',1808388390)
+        urls=[call.args[0] for call in session.get.call_args_list]
+        parsed=[parse_qs(urlsplit(url).query) for url in urls]
+        self.assertEqual(urls[0],urls[1]);self.assertEqual(urls[1],urls[2]);self.assertNotEqual(urls[2],urls[3])
+        for row in parsed:
+            self.assertEqual(row['t'],['secret']);self.assertEqual(row['now'],['123'])
+        for index,call in enumerate(session.get.call_args_list):
+            self.assertEqual(call.kwargs['headers']['Cookie'],'private-cookie')
+            self.assertEqual(call.kwargs['headers']['Range'],'bytes=0-4095' if index==0 else 'bytes=0-')
+        self.assertEqual(result['maximum_requests'],4)
+        for secret in ('private','secret','123','old'):
+            self.assertNotIn(secret,json.dumps(result))
+
     def test_http_trace_exports_offsets_and_statuses_but_not_private_headers(self):
         text=(b'GET /signed/private?key=secret HTTP/1.1\nCookie: private-cookie\n'
               b'Range: bytes=1138114319-\nHTTP/1.1 403 Forbidden\n'
@@ -29,14 +46,15 @@ class SourceByteRangeTests(unittest.TestCase):
         session = MagicMock()
         responses = []
         def get(url, **kwargs):
-            start,end = map(int,kwargs['headers']['Range'][6:].split('-'))
+            start,end = kwargs['headers']['Range'][6:].split('-')
+            start=int(start);open_ended=not end;end=int(end) if end else 1808388389
             response = MagicMock()
             response.status_code = 200 if mode == 'ignored' else 206
             response.headers = {'Content-Type':'video/mp4','Content-Length':'4096',
                 'Content-Range':f'bytes {start}-{end}/1808388390','Accept-Ranges':'bytes'}
             if mode == 'wrong': response.headers['Content-Range'] = 'bytes 0-4095/1808388390'
             if mode == 'ignored': response.headers.pop('Content-Range')
-            body=io.BytesIO(b'x'*(8192 if mode=='ignored' else 4096))
+            body=io.BytesIO(b'x'*(8192 if mode=='ignored' or open_ended else 4096))
             response.raw = MagicMock()
             response.raw.read.side_effect=lambda size,**unused:body.read(size)
             responses.append(response)
