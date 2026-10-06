@@ -9,15 +9,15 @@ class CourseEnumerationError(RuntimeError):
 
 @dataclass
 class EnumerationResult:
-    lectures: list = field(default_factory=list)
+    lectures: list[tuple[str, str, dict]] = field(default_factory=list)
     successful_courses: list[str] = field(default_factory=list)
     failed_courses: list[str] = field(default_factory=list)
 
-    def public_audit(self):
+    def public_audit(self) -> dict:
         return {'schema': 1, 'status': 'degraded' if self.failed_courses else 'complete',
                 'successful_course_count': len(self.successful_courses),
                 'failed_course_count': len(self.failed_courses)}
 
-    def require_success(self):
+    def require_success(self) -> None:
         if self.failed_courses:
             raise CourseEnumerationError()

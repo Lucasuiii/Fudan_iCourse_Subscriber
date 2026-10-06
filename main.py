@@ -19,6 +19,7 @@ import os
 from collections import OrderedDict
 
 from src.runtime import config
+from src.runtime.enumeration import EnumerationResult
 from src.runtime.session_rules import lecture_is_selected
 from src.data.database import Database
 from src.api.emailer import Emailer
@@ -86,11 +87,12 @@ def _in_run_scope(course_id: str, lecture: dict) -> bool:
 
 
 def _enumerate_lectures(client: ICourseClient, db: Database,
-                        reporter: Reporter):
-    """Sync, fast: list every (course_id, course_title, lecture) we'll
+                        reporter: Reporter) -> EnumerationResult:
+    """Return tasks plus explicit successful/failed course scan outcomes.
+
+    Sync, fast: list every (course_id, course_title, lecture) we'll
     process this run.  Done up-front so the prefetch loop can see across
     course boundaries when picking the "next" lecture."""
-    from src.runtime.enumeration import EnumerationResult
     result = EnumerationResult()
     for course_id in config.COURSE_IDS:
         try:
