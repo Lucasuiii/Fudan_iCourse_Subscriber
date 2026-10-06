@@ -491,6 +491,9 @@ def retain_prepared_audio(handle, specification, files):
                        if code in {'premature_eof', 'input_read_error', 'decode_error', 'stderr_read_error'}
                        and type(count) is int and 0 < count <= 1_000_000},
                    'audio_retained': 'lecture.flac' in files}
+    transport = getattr(handle, 'media_transport', None)
+    if transport is not None:
+        diagnostics['source_transport'] = transport.audit()
     specification['audio_diagnostics'] = diagnostics
     if not size or size % 4:
         return
@@ -508,7 +511,8 @@ def validate_prepared_audio(specification):
     if not diagnostics.get('stderr_complete', True):
         raise ValueError('Production audio diagnostics are incomplete')
     if (diagnostics.get('decode_error_counts') or diagnostics.get('decode_return_code') != 0
-            or diagnostics.get('decode_interrupted')):
+            or diagnostics.get('decode_interrupted')
+            or diagnostics.get('source_transport',{}).get('terminal_error_code')):
         raise ValueError('Production audio has read or decode errors')
     duration, media = specification['audio_seconds'], specification.get('media_seconds')
     if media and duration < media-max(120, media*.05):

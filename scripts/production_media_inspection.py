@@ -252,6 +252,23 @@ def probe_fresh_late_packets(client, signed_url, retained_seconds, stream):
     return result
 
 
+def probe_relay_late_packets(client, signed_url, retained_seconds, stream):
+    """Exercise production range transport within a 16-MiB read budget."""
+    from src.runtime.media_transport import SignedRangeRelay, MediaTransportError
+    relay = SignedRangeRelay(client,signed_url,chunk_bytes=256*1024,
+                             max_upstream_bytes=16*1024*1024)
+    try:
+        relay.start()
+        result = probe_late_packets(relay.url,'',retained_seconds,stream)
+    except MediaTransportError as error:
+        result = {'status':'failed','failure_code':error.code,'packets':[]}
+    finally:
+        relay.close()
+    result.update(source_transport=relay.audit(), maximum_upstream_bytes=16*1024*1024,
+                  decoding=False, payload_exported=False)
+    return result
+
+
 def inspect():
     import base64
     from scripts import production_qwen as pipeline, sharded_qwen_pilot as shards
@@ -333,6 +350,11 @@ def inspect():
         payload['fresh_source_late_packets'] = (
             probe_fresh_late_packets(client, url, retained, audio[0])
             if len(audio) == 1 and isinstance(retained, (int,float))
+            else {'status':'ambiguous_or_unavailable','packets':[]})
+        stage = 'relay_late_packets'
+        payload['transport_source_late_packets'] = (
+            probe_relay_late_packets(client,url,retained,audio[0])
+            if len(audio) == 1 and isinstance(retained,(int,float))
             else {'status':'ambiguous_or_unavailable','packets':[]})
         stage = 'late_packets'
         if late['status'] == 'failed': raise ValueError('Source late packet probe failed')

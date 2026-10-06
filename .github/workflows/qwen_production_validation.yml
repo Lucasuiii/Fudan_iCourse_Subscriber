@@ -23,7 +23,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
       inspect_source_metadata:
-        description: Inspect stored lesson headers, nine 4-KiB HTTP samples and two probes of at most 128 late packets each, without decoding or ASR
+        description: Inspect stored lesson headers, nine 4-KiB samples, three probes of up to 128 packets; relay limited to 16 MiB; no decoding or ASR
         type: boolean
         default: false
       inspect_authentication:
@@ -52,6 +52,9 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
     - 'src/runtime/scheduler.py'
+    - 'src/runtime/media_transport.py'
+    - 'src/api/icourse.py'
+    - 'tests/test_media_transport.py'
     - 'src/api/webvpn.py'
     - 'tests/test_webvpn_auth_diagnostics.py'
     - 'tests/test_production_byte_ranges.py'
@@ -67,6 +70,9 @@ name: Qwen Production Pipeline Validation
     - '.github/**'
     - 'scripts/production_*.py'
     - 'src/runtime/scheduler.py'
+    - 'src/runtime/media_transport.py'
+    - 'src/api/icourse.py'
+    - 'tests/test_media_transport.py'
     - 'src/api/webvpn.py'
     - 'tests/test_webvpn_auth_diagnostics.py'
     - 'tests/test_production_byte_ranges.py'
@@ -245,6 +251,6 @@ jobs:
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Authentication verification and bounded HTTP source diagnostics
-      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges
+      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary

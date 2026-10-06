@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from src.runtime import config
+from src.runtime.media_transport import SignedRangeRelay
 from src.api import icourse
 
 
@@ -134,6 +135,7 @@ class AudioHandle:
     timeline_preserved: bool = False
     decode_error_counts: dict[str, int] = field(default_factory=dict)
     stderr_done: Optional[threading.Event] = None
+    media_transport: Optional[SignedRangeRelay] = None
 
 
 def record_decode_errors(chunk: bytes, counts: dict[str, int]) -> None:
@@ -221,6 +223,7 @@ class AudioDownloader:
 
     def _spawn_when_ready(self, client, course_id: str, sub_id: str,
                           pending: _PendingSpawn, preserve_timestamps=False):
+        transport = None
         try:
             self._sem.acquire()
             try:
@@ -229,7 +232,15 @@ class AudioDownloader:
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
-                vpn_url, headers = client.get_stream_params(url)
+                if preserve_timestamps:
+                    transport = SignedRangeRelay(client,url).start()
+                    vpn_url, headers = transport.url, ''
+                    # Three bounded upstream connect/read attempts can take
+                    # about 77s; allow them to finish before FFmpeg gives up.
+                    network_options = ['-rw_timeout','90000000']
+                else:
+                    vpn_url, headers = client.get_stream_params(url)
+                    network_options = ['-reconnect','1','-reconnect_streamed','1','-reconnect_delay_max','5']
                 path = os.path.join(self._dir, f"{sub_id}.raw")
                 if os.path.exists(path):
                     os.remove(path)
@@ -237,9 +248,7 @@ class AudioDownloader:
                 cmd = [
                     "ffmpeg", "-y",
                     "-headers", headers,
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
+                    *network_options,
                     "-i", vpn_url,
                     "-vn",
                     # Raw PCM has no timestamps. Fill actual source timestamp
@@ -274,7 +283,11 @@ class AudioDownloader:
                     except Exception:
                         decode_error_counts['stderr_read_error'] = 1
                     finally:
-                        stderr_done.set()
+                        try:
+                            close = getattr(proc.stderr, 'close', None)
+                            if callable(close): close()
+                        finally:
+                            stderr_done.set()
 
                 threading.Thread(
                     target=_drain, name=f"audio-stderr-{sub_id}",
@@ -287,6 +300,7 @@ class AudioDownloader:
                     timeline_preserved=preserve_timestamps,
                     decode_error_counts=decode_error_counts,
                     stderr_done=stderr_done,
+                    media_transport=transport,
                 )
 
                 # Install the handle — unless release() already removed our
@@ -305,6 +319,7 @@ class AudioDownloader:
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
+                    if transport is not None: transport.close()
                     self._sem.release()
                     if os.path.exists(path):
                         try:
@@ -324,6 +339,7 @@ class AudioDownloader:
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
             except Exception:
+                if transport is not None: transport.close()
                 self._pop_if_mine(sub_id, pending)
                 self._sem.release()
                 raise
@@ -332,8 +348,13 @@ class AudioDownloader:
                 self._reporter.audio_prefetch_failed(sub_id, e)
 
     def _monitor(self, handle: AudioHandle):
-        handle.process.wait()
-        self._sem.release()
+        try:
+            handle.process.wait()
+        finally:
+            try:
+                if handle.media_transport is not None: handle.media_transport.close()
+            finally:
+                self._sem.release()
 
     def get(self, sub_id: str, timeout: float = 120.0) -> AudioHandle | None:
         """Block until ffmpeg has been spawned for sub_id; return its handle.
@@ -379,6 +400,7 @@ class AudioDownloader:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        if handle.media_transport is not None: handle.media_transport.close()
         # The monitor thread releases the semaphore on its own.
         if os.path.exists(handle.path):
             try:

@@ -10,7 +10,7 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 from src.runtime import config
 from src.api.webvpn import WebVPNSession, get_vpn_url
@@ -116,6 +116,18 @@ class ICourseClient:
         client_uuid = str(uuid.uuid4())
         sep = "&" if "?" in video_url else "?"
         return f"{video_url}{sep}clientUUID={client_uuid}&t={t_param}"
+
+    def renew_video_url(self, video_url: str, now: int | None = None) -> str:
+        """Renew both authentication fields without reselecting the lesson."""
+        parts = urlsplit(video_url)
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        if (parts.scheme not in ('http','https') or not parts.netloc
+                or sum(k == 't' for k,_ in query) != 1
+                or sum(k == 'clientUUID' for k,_ in query) != 1):
+            raise ValueError('Invalid existing media signature')
+        base = urlunsplit(parts._replace(query=urlencode([(k,v) for k,v in query
+                                                        if k not in ('t','clientUUID')])))
+        return self.sign_video_url(base, now=now)
 
     def get_course_detail(self, course_id: str) -> dict:
         """Get course details including title, teacher, and lecture list.

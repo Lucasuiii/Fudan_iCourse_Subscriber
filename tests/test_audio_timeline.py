@@ -17,7 +17,9 @@ class AudioTimelineTests(unittest.TestCase):
             client.get_stream_params.return_value=('private-url','private-header')
             process=MagicMock();process.poll.return_value=0
             process.stderr=[b'Duration: 00:10:00.00\n',b'Stream ends prematurely: private-url\n']+[b'frame=10\n']*3000
-            with patch('src.runtime.scheduler.subprocess.Popen',return_value=process):
+            with patch('src.runtime.scheduler.SignedRangeRelay') as relay, patch('src.runtime.scheduler.subprocess.Popen',return_value=process):
+                relay.return_value.start.return_value=relay.return_value
+                relay.return_value.url='http://127.0.0.1:1234/opaque'
                 downloader._spawn_when_ready(client,'10','1',pending,True)
             handle=downloader.get('1');self.assertTrue(handle.stderr_done.wait(5))
             self.assertLessEqual(len(handle.stderr_chunks),2048)
@@ -41,12 +43,19 @@ class AudioTimelineTests(unittest.TestCase):
             client=MagicMock();client.get_video_url.return_value='selected-private-url'
             client.get_stream_params.return_value=('authenticated-private-url','private-header')
             process=MagicMock();process.stderr=[];process.poll.return_value=0
-            with patch('src.runtime.scheduler.subprocess.Popen',return_value=process) as spawn:
+            with patch('src.runtime.scheduler.SignedRangeRelay') as relay, patch('src.runtime.scheduler.subprocess.Popen',return_value=process) as spawn:
+                relay.return_value.start.return_value=relay.return_value
+                relay.return_value.url='http://127.0.0.1:1234/opaque'
                 downloader._spawn_when_ready(client,'10','1',pending,preserve)
             cmd=spawn.call_args.args[0]
             self.assertEqual(downloader.get('1').timeline_preserved,preserve)
             client.get_video_url.assert_called_once_with('10','1')
-            client.get_stream_params.assert_called_once_with('selected-private-url')
+            if preserve:
+                relay.assert_called_once_with(client,'selected-private-url')
+                self.assertNotIn('-reconnect_streamed',cmd)
+                client.get_stream_params.assert_not_called()
+            else:
+                client.get_stream_params.assert_called_once_with('selected-private-url')
             downloader.shutdown()
             return cmd
 
@@ -54,8 +63,10 @@ class AudioTimelineTests(unittest.TestCase):
         legacy=self.extraction_command(False);pilot=self.extraction_command(True)
         self.assertNotIn('-af',legacy)
         self.assertEqual(pilot[pilot.index('-af')+1],'aresample=async=1:first_pts=0')
-        self.assertEqual(pilot[pilot.index('-i')+1],legacy[legacy.index('-i')+1])
-        self.assertEqual(pilot[pilot.index('-headers')+1],legacy[legacy.index('-headers')+1])
+        self.assertEqual(legacy[legacy.index('-i')+1],'authenticated-private-url')
+        self.assertEqual(legacy[legacy.index('-headers')+1],'private-header')
+        self.assertEqual(pilot[pilot.index('-i')+1],'http://127.0.0.1:1234/opaque')
+        self.assertEqual(pilot[pilot.index('-headers')+1],'')
 
     @unittest.skipUnless(shutil.which('ffmpeg'),'FFmpeg required')
     def test_real_timestamp_gap_is_silence_and_does_not_shift_later_speech(self):
