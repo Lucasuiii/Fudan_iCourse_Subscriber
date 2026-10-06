@@ -23,7 +23,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
       inspect_source_metadata:
-        description: Inspect stored lesson headers and at most 128 late packet timestamps, without decoding or ASR
+        description: Inspect stored lesson headers, five 4-KiB HTTP ranges and at most 128 late packet timestamps, without decoding or ASR
         type: boolean
         default: false
       inspect_authentication:
@@ -54,6 +54,7 @@ name: Qwen Production Pipeline Validation
     - 'src/runtime/scheduler.py'
     - 'src/api/webvpn.py'
     - 'tests/test_webvpn_auth_diagnostics.py'
+    - 'tests/test_production_byte_ranges.py'
     - 'tests/test_audio_timeline.py'
     - 'tests/test_homework_review.py'
     - 'tests/test_shared_asr_queue.py'
@@ -68,6 +69,7 @@ name: Qwen Production Pipeline Validation
     - 'src/runtime/scheduler.py'
     - 'src/api/webvpn.py'
     - 'tests/test_webvpn_auth_diagnostics.py'
+    - 'tests/test_production_byte_ranges.py'
     - 'tests/test_audio_timeline.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'
@@ -242,7 +244,7 @@ jobs:
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
-    - name: Authentication stage diagnostics and strict verification
-      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics
+    - name: Authentication verification and bounded HTTP source diagnostics
+      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary

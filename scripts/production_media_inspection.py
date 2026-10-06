@@ -1,11 +1,12 @@
-"""Read source headers and bounded late packet timestamps without decoding.
+"""Read source headers, five small byte ranges and late packet timestamps.
 
-No media file, packet payload export, frames, ASR or publisher are used.
+No media file, body/packet payload export, decoding, ASR or publisher are used.
 The current source's metadata is diagnostic evidence, not proof that a previous
 download of that lecture had the same bytes or was complete.
 """
 from contextlib import redirect_stdout, redirect_stderr
 import io
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,61 @@ def safe_probe_errors(stderr):
         if any(marker in lowered for marker in markers): counts[code] = 1
     statuses = sorted({int(code) for code in re.findall(rb'http error ([45]\d\d)', lowered)})
     return {'error_counts':counts, 'http_error_statuses':statuses}
+
+
+def probe_byte_ranges(session, url, headers, total_bytes):
+    """Five 4-KiB samples only; close ignored ranges without downloading media.
+
+    No response body, URL, cookies or redirect destinations are exported.
+    Matching Content-Range is required; HTTP 200 alone is not a successful seek.
+    """
+    if (not isinstance(total_bytes, (int, float)) or not math.isfinite(total_bytes)
+            or total_bytes != int(total_bytes) or not 4096 <= total_bytes <= 2**53):
+        return {'status':'size_unavailable', 'requests':[]}
+    total_bytes = int(total_bytes)
+    request_headers = dict(line.split(':', 1) for line in headers.split('\r\n') if ':' in line)
+    request_headers = {k.strip():v.strip() for k,v in request_headers.items()}
+    request_headers['Accept-Encoding'] = 'identity'
+    width = 4096
+    starts = sorted({0, min(1024**2,total_bytes-width),
+                     min(1024**3-width,total_bytes-width),
+                     min(1024**3,total_bytes-width),total_bytes-width})
+    rows = []
+    for start in starts:
+        end = start+width-1
+        row = {'start':start, 'end':end, 'read_limit':width+1, 'range_valid':False}
+        response = None
+        began = time.monotonic()
+        try:
+            response = session.get(url, headers={**request_headers,'Range':f'bytes={start}-{end}'},
+                stream=True, allow_redirects=False, timeout=(10,15))
+            row['http_status'] = response.status_code
+            row['redirect_present'] = 'Location' in response.headers
+            row['accept_ranges_bytes'] = response.headers.get('Accept-Ranges','').lower() == 'bytes'
+            content_type = response.headers.get('Content-Type','').lower()
+            row['content_class'] = ('html' if 'text/html' in content_type else
+                                    'media' if content_type.startswith(('video/','audio/','application/octet-stream')) else 'other')
+            length = response.headers.get('Content-Length','')
+            if re.fullmatch(r'\d{1,16}',length): row['content_length'] = int(length)
+            match = re.fullmatch(r'bytes (\d{1,16})-(\d{1,16})/(\d{1,16})',
+                                 response.headers.get('Content-Range',''))
+            if match:
+                row['content_range'] = dict(zip(('start','end','total'),map(int,match.groups())))
+            body = response.raw.read(width+1, decode_content=False)
+            row['bytes_read'] = len(body)
+            row['range_valid'] = (response.status_code == 206
+                and row.get('content_range') == {'start':start,'end':end,'total':total_bytes}
+                and len(body) == width and row['content_class'] != 'html')
+            if row['range_valid']: row['sample_sha256'] = hashlib.sha256(body).hexdigest()
+        except Exception as error:
+            row['failure_type'] = type(error).__name__
+        finally:
+            if response is not None: response.close()
+            row['seconds'] = time.monotonic()-began
+            rows.append(row)
+    return {'status':'complete' if all(r['range_valid'] for r in rows) else 'failed',
+            'maximum_requests':5, 'maximum_body_bytes':5*(width+1), 'payload_exported':False,
+            'same_source_bytes_verified':False, 'requests':rows}
 
 
 def safe_metadata(raw):
@@ -185,6 +241,9 @@ def inspect():
         metadata = probe_headers(vpn_url, headers)
         payload['current_source_metadata'] = metadata
         if metadata['status'] != 'complete': raise ValueError('Source metadata probe failed')
+        stage = 'byte_ranges'
+        payload['current_source_byte_ranges'] = probe_byte_ranges(
+            vpn.session, vpn_url, headers, metadata.get('format',{}).get('size'))
         audio = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'audio']
         retained = spec.get('audio_diagnostics', {}).get('audio_seconds')
         stage = 'late_packets'
@@ -193,6 +252,9 @@ def inspect():
                 else {'status':'ambiguous_or_unavailable','packets':[]})
         payload['current_source_late_packets'] = late
         if late['status'] == 'failed': raise ValueError('Source late packet probe failed')
+        if payload['current_source_byte_ranges']['status'] == 'failed':
+            stage = 'byte_ranges'
+            raise ValueError('Source byte range probe failed')
         payload['inspection_status'] = 'complete'
     except Exception as error:
         # Do not serialize provider messages: they can contain signed URLs,
