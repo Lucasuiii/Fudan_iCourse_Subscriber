@@ -1,11 +1,11 @@
 /**
- * MIRRORS src/schema.py — keep in sync.
+ * MIRRORS src/data/schema.py — keep in sync; columns checked by regression tests.
  *
  * When you change SCHEMA_SQL or add a migration column on the Python side,
  * update the same content here.  There is no automated sync; the browser
  * builds an in-memory shard set from the same shape the CI runner ships.
  *
- * Differences from src/schema.py: foreign-key clauses and the
+ * Differences from src/data/schema.py: foreign-key clauses and the
  * idx_ppt_pages_sub_status index are dropped because sql.js does not
  * enforce FKs by default and the frontend's row counts are too small for
  * the index to matter.

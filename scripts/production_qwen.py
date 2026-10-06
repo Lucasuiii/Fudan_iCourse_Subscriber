@@ -62,6 +62,7 @@ def failure_code(error):
         'Production audio is incomplete': 'incomplete_audio',
         'Production audio has read or decode errors': 'audio_decode_errors',
         'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
+        'Subscribed course enumeration incomplete': 'course_enumeration_failed',
         'Audio preparation deadline exceeded': 'preparation_deadline',
         'Audio preparation stalled': 'preparation_stalled',
         'Encrypted bundle too large': 'bundle_size_limit',
@@ -306,12 +307,14 @@ def plan():
                 tasks = [task]
             else:
                 _crawl_semester_catalog(client, db, reporter)
-                tasks = _enumerate_lectures(client, db, reporter)
+                enumeration = _enumerate_lectures(client, db, reporter)
+                tasks = enumeration.lectures
                 tasks = [t for t in tasks if (db.get_lecture(str(t[2]['sub_id'])).get('error_count') or 0) < 3]
             if len(tasks) > MAX_TASKS:
                 raise ValueError('Queue exceeds 256 tasks; narrow the subscribed course scope')
             files = {'queue.json': shards.encoded(tasks), 'database.db': snapshot(db, root()/'snapshot.db')}
             if course: files['history.db'] = history
+            else: files['enumeration.json'] = shards.encoded(enumeration.public_audit())
         finally:
             db.conn.close()
     tasks = read_json(files['queue.json'])
@@ -332,6 +335,8 @@ def plan():
             raise ValueError('Frozen validation lesson is now excluded')
         out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
+    if 'enumeration.json' in files:
+        out('plan-audit.json').write_bytes(files['enumeration.json'])
     write_outputs(tasks={'include': [{'task_slot': i} for i in range(len(tasks))]}, count=len(tasks))
     print(f'Planned {len(tasks)} lectures; at most 5 active pipelines and 15 runners', flush=True)
 
@@ -1076,7 +1081,7 @@ def finalize():
     db = Database(str(delta))
     try:
         with db.conn:
-            for table in ('courses', 'lectures', 'ppt_pages'):
+            for table in ('ppt_pages', 'lectures', 'courses'):
                 db.conn.execute('DELETE FROM '+table)
             db.conn.execute('DELETE FROM meta')
         snapshot(db, root()/'catalog-snapshot.db')
@@ -1088,6 +1093,11 @@ def finalize():
             deliver()
     else:
         encode({'database.db': (root()/'catalog-snapshot.db').read_bytes()}, 'catalog', out('catalog.enc'))
+    # Process successfully enumerated courses first, but do not report an
+    # incomplete scan as a clean empty/successful run. Old queues stay readable.
+    if read_json(queue.get('enumeration.json', b'{}')).get('failed_course_count', 0):
+        from src.runtime.enumeration import CourseEnumerationError
+        raise CourseEnumerationError()
 
 
 def main():

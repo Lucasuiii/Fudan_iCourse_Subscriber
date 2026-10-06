@@ -103,8 +103,12 @@ def _build_plain(course_title: str, teacher: str, lectures: list[dict]) -> str:
 
 def _smtp_connect():
     """Return an authenticated SMTP_SSL connection."""
-    server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT)
-    server.login(config.SMTP_EMAIL, config.SMTP_PASSWORD)
+    server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT, timeout=30)
+    try:
+        server.login(config.SMTP_EMAIL, config.SMTP_PASSWORD)
+    except Exception:
+        server.close()
+        raise
     return server
 
 

@@ -1,7 +1,9 @@
 import email
+import io
+from contextlib import redirect_stdout
 import unittest
 from email.header import decode_header, make_header
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.api.emailer import (
     Emailer,
@@ -16,7 +18,9 @@ from src.runtime.config import parse_receiver_emails
 class _FakeSMTP:
     calls = []
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, timeout=None):
+        if timeout != 30:
+            raise AssertionError('SMTP connection must have a bounded timeout')
         self.host = host
         self.port = port
 
@@ -52,6 +56,35 @@ class _FakePDFRenderer:
 class EmailDeliveryTests(unittest.TestCase):
     def setUp(self):
         _FakeSMTP.calls.clear()
+
+    def test_timeout_phase_diagnostics_retry_without_sensitive_exception_text(self):
+        for phase in ['connect', 'login', 'send']:
+            with self.subTest(phase=phase):
+                smtp = MagicMock()
+                server = smtp.return_value.__enter__.return_value
+                failure = TimeoutError('private address, credential, signed URL')
+                if phase == 'connect': smtp.side_effect = failure
+                elif phase == 'login': server.login.side_effect = failure
+                else: server.sendmail.side_effect = failure
+                output = io.StringIO()
+                with patch('src.api.emailer.smtplib.SMTP_SSL', smtp), \
+                     patch('src.api.emailer.time.sleep') as sleep, redirect_stdout(output):
+                    self.assertFalse(self._emailer()._deliver(MagicMock()))
+                self.assertEqual(smtp.call_count, 3)
+                self.assertEqual(sleep.call_count, 2)
+                self.assertEqual(smtp.call_args.kwargs['timeout'], 30)
+                self.assertEqual(output.getvalue().count(f'(phase={phase})'), 3)
+                self.assertNotIn('private', output.getvalue())
+                self.assertNotIn('sender@example.com', output.getvalue())
+
+    def test_export_smtp_login_failure_closes_connection(self):
+        from scripts.export_course import _smtp_connect
+        smtp = MagicMock()
+        smtp.return_value.login.side_effect = TimeoutError('private')
+        with patch('scripts.export_course.smtplib.SMTP_SSL', smtp):
+            with self.assertRaises(TimeoutError): _smtp_connect()
+        self.assertEqual(smtp.call_args.kwargs['timeout'], 30)
+        smtp.return_value.close.assert_called_once()
 
     def test_recipient_list_parsing(self):
         self.assertEqual(
