@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 import yaml
 from scripts.qwen_sharding import build_audio_plan, fingerprint, validate_plan
 from scripts.production_db import snapshot, lecture_snapshot, merge_lecture
@@ -111,6 +111,143 @@ class PreparedLectureTests(unittest.TestCase):
 
 
 class ClassroomSelectionTests(unittest.TestCase):
+    def test_new_fixed_trial_reuses_exact_failed_selection_and_frozen_terms(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'100','GITHUB_REPOSITORY':'owner/repo',
+                'GITHUB_RUN_ATTEMPT':'1',
+                'COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,'QWEN_PRODUCTION_TASK':'true',
+                'VALIDATION_COURSE_ID':'10','VALIDATION_LECTURE_RANK':'1',
+                'VALIDATION_BEFORE_DATE':'2026-10-05','VALIDATION_SOURCE_RUN_ID':'99',
+                'AUTO_COURSE_TERMS':'true','PUBLISH_RESULTS':'false','SEND_EMAIL':'false','COURSE_IDS':'10'}):
+            root=pipeline.root();db=database(root/'fixture.db');db_bytes=snapshot(db,root/'snapshot.db');db.conn.close()
+            lecture={'sub_id':'1','date':'2026-10-04','sub_title':'第1-2节',
+                '_validation':{'date':'2026-10-04','playable_rank':1,'before_date':'2026-10-05'}}
+            frozen={'schema':1,'course_id':'10','sub_id':'1','lecture_date':'2026-10-04',
+                    'terms':['条件期望'],'terms_sha256':fingerprint(['条件期望'])}
+            spec={'mode':'failed','course_id':'10','lecture':lecture,'glossary_snapshot':frozen}
+            with pipeline.shards.environment({'GITHUB_RUN_ID':'99'}):
+                pipeline.encode({'queue.json':pipeline.shards.encoded([['10','概率论',lecture]]),
+                    'database.db':db_bytes,'history.db':b'preserved-encrypted-history'},'queue',root/'old-queue.enc')
+                pipeline.encode({'specification.json':pipeline.shards.encoded(spec),'database.db':db_bytes},
+                    'prepared',root/'old-prepared.enc')
+            def download(name,target,**kwargs):
+                if not kwargs.get('run'):return False
+                target.mkdir(parents=True,exist_ok=True)
+                file='queue.enc' if name=='qwen-production-queue' else 'prepared.enc'
+                (target/file).write_bytes((root/('old-'+file)).read_bytes());return True
+            info={'status':'completed','conclusion':'failure','path':'.github/workflows/parallel_pilot.yml'}
+            with patch.object(pipeline,'artifact',side_effect=download), \
+                 patch.object(pipeline.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'write_outputs'), \
+                 patch.object(pipeline,'latest_validation_task') as select:
+                pipeline.plan()
+            select.assert_not_called()
+            saved=pipeline.decode(root/'out'/'queue.enc','queue');task=json.loads(saved['queue.json'])[0]
+            self.assertEqual(task[2]['sub_id'],'1');self.assertEqual(task[2]['_frozen_glossary'],frozen)
+            self.assertEqual(task[2]['_validation']['source_run_id'],'99')
+            self.assertEqual(saved['history.db'],b'preserved-encrypted-history')
+            with pipeline.shards.environment({'GITHUB_RUN_ID':'99'}):
+                with self.assertRaises(Exception):pipeline.decode(root/'out'/'queue.enc','queue')
+            with patch.dict(os.environ,{'GITHUB_RUN_ATTEMPT':'2'}), \
+                 patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'validation_source_queue') as source:
+                with self.assertRaisesRegex(ValueError,'Rerun has lost its queue checkpoint'):
+                    pipeline.plan()
+                source.assert_not_called()
+
+    def test_source_rejects_active_runs_success_or_existing_recognition_input(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp,
+                'GITHUB_REPOSITORY':'owner/repo','AUTO_COURSE_TERMS':'false'}):
+            for status,conclusion in [('in_progress',None),('completed','success')]:
+                with patch.object(pipeline.subprocess,'check_output',return_value=json.dumps({
+                        'status':status,'conclusion':conclusion,'path':'.github/workflows/parallel_pilot.yml'}).encode()), \
+                     patch.object(pipeline,'artifact') as fetch:
+                    with self.assertRaises(ValueError):pipeline.validation_source_queue('99')
+                    fetch.assert_not_called()
+            lecture={'sub_id':'1'};queue={'queue.json':json.dumps([['10','概率论',lecture]]).encode()}
+            for extra in ({'plan':{'blocks':[]}}, {'review':{'seconds':1}}, {'mode':'cached'}, {'audio':True}):
+                spec=dict(mode='failed',course_id='10',lecture=lecture,**{k:v for k,v in extra.items() if k!='audio' and k!='mode'})
+                spec['mode']=extra.get('mode','failed')
+                prepared={'specification.json':json.dumps(spec).encode()}
+                if extra.get('audio'):prepared['lecture.flac']=b'original'
+                with patch.object(pipeline.subprocess,'check_output',return_value=json.dumps({
+                        'status':'completed','conclusion':'failure','path':'.github/workflows/parallel_pilot.yml'}).encode()), \
+                     patch.object(pipeline,'artifact'),patch.object(pipeline,'decode',side_effect=[queue,prepared]):
+                    with self.assertRaises(ValueError):pipeline.validation_source_queue('99')
+
+    def test_cutoff_selects_older_recording_and_rejects_invalid_dates(self):
+        db=MagicMock();db.get_lecture.return_value=None
+        client=MagicMock();client.get_course_detail.return_value={'title':'高代','lectures':[
+            {'sub_id':'7','date':'2026-09-29'}, {'sub_id':'6','date':'2026-09-28'},
+            {'sub_id':'5','date':'2026-09-22'}]}
+        client.get_video_url.return_value='private-url'
+        task,_=pipeline.latest_validation_task(client,db,'38404',before_date='2026-09-28')
+        self.assertEqual(task[2]['sub_id'],'5')
+        self.assertEqual(task[2]['_validation']['before_date'],'2026-09-28')
+        client.get_video_url.assert_called_once_with('38404','5')
+        for cutoff in ('2026-02-30','2026-9-28','bad'):
+            with patch.dict(os.environ,{'VALIDATION_BEFORE_DATE':cutoff}):
+                with self.assertRaises(ValueError):pipeline.validation_before_date()
+        with patch.dict(os.environ,{'VALIDATION_BEFORE_DATE':'2026-09-28','VALIDATION_COURSE_ID':''}):
+            with self.assertRaises(ValueError):pipeline.validation_course()
+
+    def test_excluded_exercise_session_is_not_probed_or_counted_in_rank(self):
+        from src.runtime.session_rules import parse_course_session_exclusions
+        db=MagicMock();db.get_lecture.return_value=None
+        client=MagicMock();client.get_course_detail.return_value={'title':'高代','lectures':[
+            {'sub_id':'7','date':'2026-09-29','sub_title':'第1-2节'},
+            {'sub_id':'6','date':'2026-09-28','sub_title':'第9-10节'},
+            {'sub_id':'6','date':'2026-09-28','sub_title':'第9-10节'},
+            {'sub_id':'5','date':'2026-09-22','sub_title':'第1-2节'},
+            {'sub_id':'4','date':'2026-09-21','sub_title':'第9-10节'}]}
+        client.get_video_url.return_value='private-url'
+        with patch('src.runtime.config.COURSE_SESSION_EXCLUSIONS',parse_course_session_exclusions('38404=周一第6-10节')):
+            task,_=pipeline.latest_validation_task(client,db,'38404',today='2026-10-05',rank=2)
+        self.assertEqual(task[2]['sub_id'],'5')
+        self.assertEqual(task[2]['_validation']['skipped_excluded'],2)
+        self.assertEqual([c.args for c in client.get_video_url.call_args_list],[('38404','7'),('38404','5')])
+
+    def test_penultimate_actual_recording_skips_empty_holidays_and_duplicates(self):
+        db = MagicMock(); db.get_lecture.return_value = None
+        client = MagicMock(); client.get_course_detail.return_value = {'title': '高代', 'lectures': [
+            {'sub_id': '9', 'date': '2026-10-06'},
+            {'sub_id': '8', 'date': '2026-10-05'},
+            {'sub_id': '7', 'date': '2026-09-29'},
+            {'sub_id': '7', 'date': '2026-09-29'},
+            {'sub_id': '6', 'date': '2026-09-27'},
+            {'sub_id': '5', 'date': '2026-09-22'}]}
+        client.get_video_url.side_effect = [None, 'latest-private-url', None, 'penultimate-private-url']
+        task, _ = pipeline.latest_validation_task(client, db, '38404', today='2026-10-05', rank=2)
+        self.assertEqual(task[2]['sub_id'], '5')
+        self.assertEqual(task[2]['_validation'], {'date': '2026-09-22', 'skipped_unavailable': 2, 'playable_rank': 2})
+        self.assertEqual([c.args for c in client.get_video_url.call_args_list],
+                         [('38404', '8'), ('38404', '7'), ('38404', '6'), ('38404', '5')])
+
+    def test_rank_does_not_fall_back_to_latest_if_only_one_recording_exists(self):
+        db = MagicMock(); db.get_lecture.return_value = None
+        client = MagicMock(); client.get_course_detail.return_value = {'title': '高代',
+            'lectures': [{'sub_id': '1', 'date': '2026-09-29'}]}
+        client.get_video_url.return_value = 'private-url'
+        with self.assertRaises(ValueError):
+            pipeline.latest_validation_task(client, db, '38404', today='2026-10-05', rank=2)
+
+    def test_rank_requires_isolated_validation_and_bounded_integer(self):
+        for raw in ('0', '11', '2.0', '-1', 'oops'):
+            with patch.dict(os.environ, {'VALIDATION_LECTURE_RANK': raw}):
+                with self.assertRaises(ValueError): pipeline.validation_rank()
+        with patch.dict(os.environ, {'VALIDATION_LECTURE_RANK': '2', 'VALIDATION_COURSE_ID': ''}):
+            with self.assertRaises(ValueError): pipeline.validation_course()
+
+    def test_rerun_cannot_change_the_selected_recording_rank(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            'RUNNER_TEMP': tmp, 'VALIDATION_COURSE_ID': '38404', 'VALIDATION_LECTURE_RANK': '2',
+            'PUBLISH_RESULTS': 'false', 'SEND_EMAIL': 'false', 'COURSE_IDS': '38404'}), \
+             patch.object(pipeline, 'artifact', return_value=True), \
+             patch.object(pipeline, 'decode', return_value={'queue.json': json.dumps([
+                 ['38404', '高代', {'sub_id': '1', '_validation': {'date': '2026-09-29', 'playable_rank': 1}}]
+             ]).encode()}):
+            with self.assertRaises(ValueError): pipeline.plan()
+
     def test_latest_real_playback_skips_holidays_future_and_deleted_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = database(Path(tmp)/'history.db', summary='历史摘要')
@@ -351,6 +488,327 @@ class FormalWorkflowTests(unittest.TestCase):
 
 
 class EncryptedStageTests(unittest.TestCase):
+    def test_source_diagnostic_recovers_cold_session_with_one_fresh_session(self):
+        import base64
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from src.api.webvpn import AuthenticationError
+        from scripts import production_media_inspection as inspection
+        from scripts.production_result_export import decrypt
+        key=X25519PrivateKey.generate()
+        private=key.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption())
+        public=key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp,'SOURCE_RUN_ID':'99',
+                'SOURCE_SLOT':'0','GITHUB_REPOSITORY':'owner/repo','RECIPIENT_PUBLIC_KEY':base64.b64encode(public).decode()}):
+            info={'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'abc'}
+            spec={'course_id':'10','lecture':{'sub_id':'1'},'audio_diagnostics':{'audio_seconds':4000}}
+            first=MagicMock();first.login.side_effect=AuthenticationError('cold_session');first.auth_diagnostics=[]
+            second=MagicMock();second.auth_diagnostics=[{'stage':'api_verification','verified':True}]
+            client=MagicMock();client.get_video_url.return_value='private-url';client.get_stream_params.return_value=('url','header')
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'artifact',return_value=True), \
+                 patch.object(pipeline,'decode',return_value={'specification.json':json.dumps(spec).encode()}), \
+                 patch('src.api.webvpn.WebVPNSession',side_effect=[first,second]) as factory, \
+                 patch('src.api.icourse.ICourseClient',return_value=client), \
+                 patch.object(inspection.time,'sleep') as sleep, \
+                 patch.object(inspection,'probe_headers',return_value={'status':'complete','streams':[]}):
+                inspection.inspect()
+            self.assertEqual(factory.call_count,2);sleep.assert_called_once_with(2)
+            first.session.close.assert_called_once();second.session.close.assert_called_once()
+            second.authenticate_icourse.assert_called_once_with(strict=True)
+            audit=json.loads(decrypt((pipeline.root()/'out/media-inspection.enc').read_bytes(),private,'99',0))
+            self.assertEqual(audit['inspection_status'],'complete')
+            self.assertEqual(audit['authentication_attempts'][0]['reason'],'cold_session')
+            self.assertTrue(audit['authentication_attempts'][1]['verified'])
+            self.assertNotIn('private-url',json.dumps(audit))
+
+    def test_source_probe_reason_codes_never_export_private_stderr(self):
+        from scripts.production_media_inspection import safe_probe_errors
+        error=safe_probe_errors(b'https://private/token HTTP error 403 Forbidden\n'
+                               b'Could not seek to position: private-cookie\n'
+                               b'Input/output error\n')
+        self.assertEqual(error,{'error_counts':{'input_read_error':1,'seek_failed':1},
+                               'http_error_statuses':[403]})
+        self.assertNotIn('private',json.dumps(error))
+
+    def test_source_inspection_auth_failure_keeps_encrypted_stage_without_private_message(self):
+        import base64
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from scripts import production_media_inspection as inspection
+        from scripts.production_result_export import decrypt
+        private=X25519PrivateKey.generate()
+        private_bytes=private.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,
+                                           serialization.NoEncryption())
+        public=private.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{
+                'RUNNER_TEMP':tmp,'SOURCE_RUN_ID':'99','SOURCE_SLOT':'0','GITHUB_REPOSITORY':'owner/repo',
+                'RECIPIENT_PUBLIC_KEY':base64.b64encode(public).decode()}):
+            info={'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'abc'}
+            spec={'course_id':'10','lecture':{'sub_id':'1','date':'2026-09-24'},'audio_diagnostics':{'audio_seconds':4000}}
+            vpn=MagicMock();vpn.login.side_effect=RuntimeError('private-password-and-signed-url')
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+                 patch.object(pipeline,'artifact',return_value=True), \
+                 patch.object(pipeline,'decode',return_value={'specification.json':json.dumps(spec).encode()}), \
+                 patch('src.api.webvpn.WebVPNSession',return_value=vpn), \
+                 patch.object(inspection,'probe_headers') as probe:
+                with self.assertRaises(RuntimeError):inspection.inspect()
+            payload=json.loads(decrypt((pipeline.root()/'out'/'media-inspection.enc').read_bytes(),private_bytes,'99',0))
+            self.assertEqual(payload['failure_stage'],'webvpn_login')
+            self.assertEqual(payload['failure_type'],'RuntimeError')
+            self.assertEqual(payload['inspection_status'],'failed')
+            self.assertNotIn('private-password',json.dumps(payload));probe.assert_not_called()
+            vpn.session.close.assert_called_once()
+
+    def test_zero_exit_with_read_errors_cannot_create_asr_plan(self):
+        spec={'audio_seconds':600,'media_seconds':600,'audio_diagnostics':{
+            'decode_return_code':0,'stderr_complete':True,'decode_error_counts':{'premature_eof':1}}}
+        with self.assertRaisesRegex(ValueError,'read or decode errors'):
+            pipeline.validate_prepared_audio(spec)
+        self.assertEqual(pipeline.failure_code(ValueError('Production audio has read or decode errors')),
+                         'audio_decode_errors')
+        spec['audio_diagnostics']['decode_error_counts']={}
+        spec['audio_diagnostics']['stderr_complete']=False
+        with self.assertRaisesRegex(ValueError,'diagnostics are incomplete'):
+            pipeline.validate_prepared_audio(spec)
+        spec['audio_diagnostics']['stderr_complete']=True
+        pipeline.validate_prepared_audio(spec)
+        spec['audio_seconds']=400
+        with self.assertRaisesRegex(ValueError,'audio is incomplete'):pipeline.validate_prepared_audio(spec)
+
+    def test_retention_waits_for_final_stderr_without_persisting_private_text(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp}):
+            raw=pipeline.root()/'partial.raw';raw.write_bytes(np.zeros(16000,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=0;process.returncode=0
+            counts={};done=MagicMock()
+            def drained(timeout):
+                counts.update(premature_eof=1);return True
+            done.wait.side_effect=drained
+            handle=SimpleNamespace(path=raw,process=process,stderr_chunks=[b'private-cookie'],
+                                   decode_error_counts=counts,stderr_done=done)
+            spec={};files={};pipeline.retain_prepared_audio(handle,spec,files)
+            done.wait.assert_called_once_with(timeout=5)
+            self.assertEqual(spec['audio_diagnostics']['decode_error_counts'],{'premature_eof':1})
+            self.assertNotIn('private',json.dumps(spec));self.assertIn('lecture.flac',files)
+            with self.assertRaisesRegex(ValueError,'read or decode errors'):pipeline.validate_prepared_audio(spec)
+
+    def test_source_metadata_header_probe_never_decodes_or_exports_private_fields(self):
+        from scripts.production_media_inspection import probe_headers, safe_metadata
+        raw={'format':{'duration':'6565.43','filename':'private-url','tags':{'password':'secret'}},
+             'streams':[{'index':1,'codec_type':'audio','codec_name':'aac','start_time':'0',
+                'duration':'4078.527','time_base':'1/16000','tags':{'comment':'classroom'}},
+                {'index':0,'codec_type':'video','duration':'6565.43','start_time':'0'},
+                {'duration':'nan','start_time':'inf','codec_name':'private://secret','time_base':'invalid'}]}
+        result=safe_metadata(raw)
+        self.assertEqual(result['streams'][0]['end_time'],4078.527)
+        self.assertEqual(result['streams'][1]['end_time'],6565.43)
+        self.assertEqual(result['streams'][2],{})
+        self.assertNotIn('private',json.dumps(result));self.assertNotIn('classroom',json.dumps(result))
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps(raw).encode(),stderr=b'')) as run:
+            result=probe_headers('private-url','private-header')
+        command=run.call_args.args[0]
+        self.assertEqual(command[0],'ffprobe');self.assertIn('-nofind_stream_info',command)
+        self.assertNotIn('-show_packets',command);self.assertNotIn('-show_frames',command)
+        self.assertTrue(result['header_only']);self.assertEqual(result['status'],'complete')
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=1,stdout=b'',stderr=b'private-url/secret')):
+            failed=probe_headers('url','headers')
+        self.assertEqual(failed['status'],'failed');self.assertNotIn('secret',json.dumps(failed))
+
+    def test_source_metadata_workflow_has_no_models_publishers_or_mail(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/qwen_production_validation.yml').read_text())
+        job=workflow['jobs']['inspect-source-metadata']
+        self.assertEqual(job['permissions'],{'contents':'read','actions':'read'})
+        self.assertEqual({k for k,v in job['env'].items() if 'secrets.' in v},
+                         {'DB_ENCRYPTION_KEY','StuId','UISPsw'})
+        text=json.dumps(job)
+        self.assertNotIn('production_qwen prepare',text);self.assertNotIn('qwen_transcriber',text)
+        self.assertNotIn('sharded_qwen_pilot worker',text)
+        uploads=[s['with']['name'] for s in job['steps'] if s.get('uses')=='actions/upload-artifact@v4']
+        self.assertEqual(uploads,['qwen-media-private-inspection-${{ github.run_attempt }}'])
+
+    def test_late_audio_packet_diagnostic_is_bounded_and_never_decodes_payload(self):
+        from scripts.production_media_inspection import probe_late_packets
+        packets={'packets':[{'stream_index':1,'pts_time':'6500.1','duration_time':'0.021',
+                            'data':'private audio','tags':{'secret':'not exported'}}]}
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps(packets).encode(),stderr=b'')) as run:
+            result=probe_late_packets('private-url','header',4078,{'end_time':6565})
+        command=run.call_args.args[0]
+        self.assertEqual(command[0],'ffprobe');self.assertIn('-nofind_stream_info',command)
+        self.assertEqual(command[command.index('-read_intervals')+1],'4088.000%+#64,6555.000%+#64')
+        self.assertNotIn('-show_data',command);self.assertNotIn('-show_frames',command)
+        self.assertEqual(result['packets'][0]['pts_time'],6500.1)
+        self.assertNotIn('private',json.dumps(result));self.assertFalse(result['decoding'])
+        with patch('scripts.production_media_inspection.subprocess.run') as run:
+            self.assertEqual(probe_late_packets('url','head',4078,{'end_time':4080})['status'],'not_needed')
+            run.assert_not_called()
+        with patch('scripts.production_media_inspection.subprocess.run',return_value=SimpleNamespace(
+                returncode=0,stdout=json.dumps({'packets':[{}]*129}).encode(),stderr=b'')):
+            with self.assertRaises(ValueError):probe_late_packets('url','header',4078,{'end_time':6565})
+
+    def test_incomplete_preparation_retains_audio_durations_terms_and_refuses_refetch(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'99','COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,
+                'QWEN_PRODUCTION_TASK':'true','AUTO_COURSE_TERMS':'true','PUBLISH_RESULTS':'false',
+                'SHARD_MODE':'shared','GITHUB_ACTIONS':'false'}):
+            root=pipeline.root(); db=database(root/'fixture.db')
+            lecture={'sub_id':'1','date':'2026-10-04','_validation':{'date':'2026-10-04'}}
+            frozen={'schema':1,'course_id':'10','sub_id':'1','lecture_date':'2026-10-04',
+                    'terms':['条件期望'],'terms_sha256':fingerprint(['条件期望'])}
+            lecture['_frozen_glossary']=frozen
+            raw=root/'source.raw';raw.write_bytes(np.full(4*16000,.1,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=0;process.returncode=0
+            handle=SimpleNamespace(path=str(raw),process=process,timeline_preserved=True,
+                stderr_chunks=[b'private-url:token\n Duration: 00:06:40.00, start: 0.000000'])
+            scheduler=MagicMock();scheduler.audio_downloader.get.return_value=handle
+            transcriber=MagicMock();transcriber.prepare_pcm_stream.return_value=[(1,3)]
+            transcriber.last_audio_duration=4;transcriber.last_media_duration=400;transcriber.last_vad_windows=[(1,3)]
+            with patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'task_files',return_value=(db,'10','概率论',lecture)), \
+                 patch.dict('sys.modules',{'main':SimpleNamespace(login_with_retry=lambda:None),
+                    'src.pipeline.ppt_pipeline':SimpleNamespace(PPTPipeline=MagicMock()),
+                    'src.api.icourse':SimpleNamespace(ICourseClient=MagicMock())}), \
+                 patch('src.runtime.scheduler.Scheduler',return_value=scheduler), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber), \
+                 patch.object(pipeline,'freeze_course_terms') as freeze:
+                with self.assertRaisesRegex(ValueError,'Production audio is incomplete'):pipeline.prepare()
+            freeze.assert_not_called();transcriber.recognize_blocks.assert_not_called()
+            scheduler.audio_downloader.schedule.assert_called_once_with(ANY,'10','1',preserve_timestamps=True)
+            saved=pipeline.decode(root/'out'/'prepared.enc','prepared');spec=json.loads(saved['specification.json'])
+            self.assertEqual(spec['mode'],'failed');self.assertEqual(spec['error_code'],'incomplete_audio')
+            self.assertEqual(spec['glossary_snapshot'],frozen);self.assertEqual(spec['audio_seconds'],4)
+            self.assertEqual(spec['audio_diagnostics']['duration_gap_seconds'],396)
+            self.assertTrue(spec['audio_diagnostics']['audio_retained'])
+            self.assertEqual(hashlib.sha256(saved['lecture.flac']).hexdigest(),spec['audio_diagnostics']['audio_sha256'])
+            self.assertNotIn('private-url',json.dumps(spec))
+            (root/'inbox').mkdir();pipeline.encode(saved,'prepared',root/'inbox'/'prepared.enc')
+            with patch.object(pipeline,'artifact',return_value=False):
+                with self.assertRaisesRegex(ValueError,'Preparation failed'):pipeline.gather()
+            audit=json.loads((root/'out'/'validation-result.json').read_bytes())
+            self.assertEqual(audit['audio_seconds'],4);self.assertEqual(audit['media_seconds'],400)
+            self.assertEqual(audit['frozen_terms_count'],1);self.assertEqual(audit['asr_execution'],'not_started')
+            self.assertFalse(audit['asr_complete']);self.assertFalse(audit['processed'])
+            with patch.object(pipeline,'artifact',return_value=True),patch.object(pipeline,'decode',return_value=saved), \
+                 patch.object(pipeline,'task_files') as task:
+                with self.assertRaisesRegex(ValueError,'Production audio is incomplete'):pipeline.prepare()
+            task.assert_not_called()
+
+    def test_failed_decode_retains_actual_samples_without_claiming_success(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'RUNNER_TEMP':tmp}):
+            raw=pipeline.root()/'partial.raw';raw.write_bytes(np.zeros(16000,dtype=np.float32).tobytes())
+            process=MagicMock();process.poll.return_value=1;process.returncode=1
+            handle=SimpleNamespace(path=raw,process=process,stderr_chunks=[b'Duration: 00:10:00.00'])
+            spec={};files={};pipeline.retain_prepared_audio(handle,spec,files)
+            self.assertEqual(spec['audio_diagnostics']['decode_return_code'],1)
+            self.assertEqual(spec['audio_seconds'],1);self.assertEqual(spec['media_seconds'],600)
+            self.assertIn('lecture.flac',files);self.assertNotIn('plan',spec)
+
+    def test_existing_audio_inspection_exports_private_clips_without_asr_or_retrieval(self):
+        import base64
+        import numpy as np
+        import soundfile as sf
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from scripts import production_audio_inspection as inspection
+        from scripts.production_result_export import decrypt
+        private = X25519PrivateKey.generate()
+        public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP': tmp, 'GITHUB_RUN_ID': '100', 'GITHUB_REPOSITORY': 'owner/repo',
+                'SOURCE_RUN_ID': '99', 'SOURCE_SLOT': '0', 'QWEN_PRODUCTION_TASK': 'true',
+                'RECIPIENT_PUBLIC_KEY': base64.b64encode(public).decode()}):
+            root = pipeline.root(); flac = root/'fixture.flac'
+            sf.write(flac, np.zeros(60*16000, dtype='float32'), 16000, subtype='PCM_24')
+            stats, levels = inspection.audio_stats(flac)
+            self.assertEqual(stats['peak'], 0); self.assertEqual(stats['rms'], 0)
+            self.assertEqual(stats['seconds_below_rms_1e_5'], 60)
+            offsets = inspection.listening_offsets(levels, 60)
+            self.assertTrue(all(0 <= n <= 50 for n in offsets)); self.assertLessEqual(len(offsets), 8)
+            plan = build_audio_plan({'selection': {'course_id':'10','sub_id':'1'}, 'audio_seconds':60,
+                'full_chunks':[], 'recognition_terms':[], 'vad_windows':[]}, reference={'pipeline':'production'},
+                course_slot=0, run_id='99', audio_sha256=hashlib.sha256(flac.read_bytes()).hexdigest(),
+                production=True, mode='shared')
+            spec = {'plan':plan, 'course_id':'10','course_title':'高等代数',
+                    'lecture':{'sub_id':'1','date':'2026-09-28','sub_title':'2026-09-28第1-2节'}}
+            files = {'specification.json':pipeline.shards.encoded(spec),'lecture.flac':flac.read_bytes()}
+            transcriber = MagicMock(); transcriber._model = None
+            transcriber.prepare_pcm_stream.return_value = []; transcriber.last_vad_windows = []
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps({
+                    'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'a'*40}).encode()), \
+                 patch.object(pipeline,'artifact') as artifact, patch.object(pipeline,'decode',return_value=files), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber):
+                inspection.inspect()
+            artifact.assert_called_once_with('qwen-production-prepare-0',root/'audio-inspection-source',run='99',required=True)
+            transcriber._init.assert_not_called(); transcriber.recognize_blocks.assert_not_called()
+            raw_private = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+            payload = json.loads(decrypt((root/'out'/'audio-inspection.enc').read_bytes(),raw_private,'99',0))
+            self.assertEqual(payload['sub_title'],spec['lecture']['sub_title'])
+            self.assertEqual(payload['original_blocks'],0); self.assertTrue(payload['clips'])
+            for clip in payload['clips']:
+                data = base64.b64decode(clip['mp3_base64'])
+                self.assertEqual(hashlib.sha256(data).hexdigest(),clip['sha256'])
+            spec.pop('plan');spec.update(mode='failed',audio_diagnostics={'audio_retained':True,
+                'audio_seconds':60,'audio_sha256':plan['audio_sha256']})
+            files['specification.json']=pipeline.shards.encoded(spec)
+            with patch.object(inspection.subprocess,'check_output',return_value=json.dumps({
+                    'status':'completed','path':'.github/workflows/parallel_pilot.yml','head_sha':'a'*40}).encode()), \
+                 patch.object(pipeline,'artifact'),patch.object(pipeline,'decode',return_value=files), \
+                 patch('src.ai.qwen_transcriber.QwenTranscriber',return_value=transcriber):
+                inspection.inspect()
+            failed=json.loads(decrypt((root/'out'/'audio-inspection.enc').read_bytes(),raw_private,'99',0))
+            self.assertEqual(failed['preparation_mode'],'failed');self.assertEqual(failed['metrics']['audio_seconds'],60)
+            self.assertEqual(failed['original_blocks'],0);transcriber.recognize_blocks.assert_not_called()
+
+    def test_isolated_no_content_trial_fails_and_retains_checkpoint(self):
+        Runner = _load_runner_class(); plan, results = fixture()
+        plan['audio_seconds'] = 1800
+        for result in results:
+            result['plan_hash'] = fingerprint(plan)
+            for row in result['chunks']: row['text'] = ''
+        material = assemble_material(plan, results, media_seconds=1800)
+        for isolated in (True, False):
+            with self.subTest(isolated=isolated), tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                    'RUNNER_TEMP': tmp, 'GITHUB_RUN_ID': '99', 'COURSE_SLOT': '0',
+                    'DB_ENCRYPTION_KEY': 'k'*32, 'GITHUB_ACTIONS': 'false',
+                    'QWEN_PRODUCTION_TASK': 'true', 'AUTO_COURSE_TERMS': 'false'}):
+                root = pipeline.root(); (root/'inbox').mkdir()
+                db = database(root/'fixture.db'); payload = snapshot(db, root/'snapshot.db'); db.conn.close()
+                lecture = {'sub_id': '1'}
+                if isolated: lecture['_validation'] = {'date': '2026-10-04', 'playable_rank': 2}
+                spec = {'course_id': '10', 'course_title': '概率论', 'lecture': lecture,
+                        'mode': 'cached', 'material': material, 'review': {'complete': True}}
+                pipeline.encode({'specification.json': pipeline.shards.encoded(spec), 'database.db': payload},
+                                'prepared', root/'inbox'/'prepared.enc')
+                llm = MagicMock()
+                with patch.dict('sys.modules', {'src.pipeline.lecture_runner': SimpleNamespace(LectureRunner=Runner)}), \
+                     patch.object(pipeline, 'artifact', return_value=False), \
+                     patch('src.ai.summarizer.Summarizer', return_value=llm), \
+                     patch('src.runtime.config.DOUBAO_ASR_API_KEY', ''), \
+                     patch.object(pipeline.shards, 'command') as commands:
+                    if isolated:
+                        with self.assertRaisesRegex(ValueError, 'Isolated validation produced no transcript or summary'):
+                            pipeline.gather()
+                    else:
+                        pipeline.gather()
+                commands.assert_not_called(); llm.summarize.assert_not_called()
+                saved = pipeline.decode(root/'out'/'state.enc', 'state')
+                self.assertEqual(json.loads(saved['review.json']), {'complete': True})
+                (root/'saved.db').write_bytes(saved['database.db']); db = Database(str(root/'saved.db'))
+                row = db.get_lecture('1')
+                self.assertTrue(row['processed_at']); self.assertFalse(row['summary']); self.assertFalse(row['emailed_at'])
+                self.assertEqual(row['error_count'], int(isolated))
+                if isolated:
+                    self.assertEqual(row['error_stage'], 'sharded_finalize')
+                    audit = json.loads((root/'out'/'validation-result.json').read_bytes())
+                    self.assertEqual(audit['transcript_chars'], 0); self.assertEqual(audit['summary_chars'], 0)
+                    self.assertEqual(audit['error_count'], 1)
+                db.conn.close()
+
     def test_encrypted_finalization_retries_summary_without_decoding_or_resetting_quota(self):
         Runner=_load_runner_class();plan,results=fixture();material=assemble_material(plan,results,media_seconds=600)
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,{

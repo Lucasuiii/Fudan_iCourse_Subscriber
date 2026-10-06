@@ -8,7 +8,19 @@ name: iCourse Parallel Pilot
   workflow_dispatch:
     inputs:
       validation_course_id:
-        description: Only validate this course's latest playable lecture (requires no publication or email)
+        description: Validate one playable lecture from this course (requires no publication or email)
+        type: string
+        default: ''
+      validation_lecture_rank:
+        description: Reverse rank among actual playable recordings (1 latest, 2 penultimate)
+        type: number
+        default: 1
+      validation_before_date:
+        description: Select only recordings strictly before this date (YYYY-MM-DD)
+        type: string
+        default: ''
+      validation_source_run_id:
+        description: Explicitly reacquire the exact failed preparation selection and frozen glossary from this completed run
         type: string
         default: ''
       automatic_terms:
@@ -16,11 +28,12 @@ name: iCourse Parallel Pilot
         type: boolean
         default: false
       shard_mode:
-        description: Two runners by default; auto uses three above 60 speech minutes
+        description: Fixed two/auto shards, or shared dynamic block queue (1-3 workers by pending audio)
         type: choice
         options:
         - '2'
         - auto
+        - shared
         default: '2'
       publish_results:
         description: Publish encrypted lecture results to the data branch
@@ -33,6 +46,15 @@ name: iCourse Parallel Pilot
   workflow_call:
     inputs:
       validation_course_id:
+        type: string
+        default: ''
+      validation_lecture_rank:
+        type: number
+        default: 1
+      validation_before_date:
+        type: string
+        default: ''
+      validation_source_run_id:
         type: string
         default: ''
       automatic_terms:
@@ -79,6 +101,8 @@ name: iCourse Parallel Pilot
         required: false
       COURSE_SESSION_RULES:
         required: false
+      COURSE_SESSION_EXCLUSIONS:
+        required: false
       COURSE_SESSION_OVERRIDE_DATES:
         required: false
       SMTP_EMAIL:
@@ -122,10 +146,15 @@ jobs:
       UISPsw: ${{ secrets.UISPSW }}
       COURSE_IDS: ${{ secrets.COURSE_IDS }}
       COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
       COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
+      VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
+      VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
+      VALIDATION_SOURCE_RUN_ID: ${{ inputs.validation_source_run_id }}
+      AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}
     outputs:
@@ -205,6 +234,7 @@ jobs:
       UISPsw: ${{ secrets.UISPSW }}
       COURSE_IDS: ${{ secrets.COURSE_IDS }}
       COURSE_SESSION_RULES: ${{ secrets.COURSE_SESSION_RULES }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
       COURSE_SESSION_OVERRIDE_DATES: ${{ secrets.COURSE_SESSION_OVERRIDE_DATES }}
       DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}

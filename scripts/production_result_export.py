@@ -123,11 +123,14 @@ def export():
     if os.environ.get('INCLUDE_TRANSCRIPT') == 'true':
         spec = json.loads(files['specification.json'])
         results = []
-        for shard in spec['plan']['shards']:
-            shard_id = shard['shard_id']; destination = target/str(shard_id)
-            pipeline.artifact(f'qwen-production-asr-{slot}-{shard_id}', destination, run=run, required=True)
-            with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
-                results.append(json.loads(pipeline.decode(destination/'worker-result.enc', f'result-{shard_id}')['result.json']))
+        if spec['plan'].get('execution') == 'shared_queue':
+            results = pipeline.shared_results(spec['plan'])
+        else:
+            for shard in spec['plan']['shards']:
+                shard_id = shard['shard_id']; destination = target/str(shard_id)
+                pipeline.artifact(f'qwen-production-asr-{slot}-{shard_id}', destination, run=run, required=True)
+                with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
+                    results.append(json.loads(pipeline.decode(destination/'worker-result.enc', f'result-{shard_id}')['result.json']))
         payload['raw_qwen'] = raw_qwen_payload(spec, results)
     payload = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()
     pipeline.out('summary-export.enc').write_bytes(encrypt(payload, recipient, run, slot))

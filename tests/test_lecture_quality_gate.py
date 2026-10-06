@@ -41,8 +41,8 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
         runner = LectureRunner(MagicMock(), db, MagicMock(), transcriber,
                                MagicMock(), MagicMock())
         with patch('src.ai.automatic_glossary.AutomaticGlossary') as glossary, \
-             patch('src.ai.course_glossary.course_terms', side_effect=[['甲人工词'], ['乙人工词']]):
-            glossary.return_value.terms.return_value = ['甲自动词']
+             patch('src.ai.course_glossary.course_terms', return_value=['乙人工词']):
+            glossary.return_value.freeze.return_value = {'terms': ['甲自动词', '甲人工词']}
             with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'true'}):
                 runner.run('10', '课程甲', {'sub_id': '1'})
             with patch.dict('os.environ', {'AUTO_COURSE_TERMS': 'false'}):

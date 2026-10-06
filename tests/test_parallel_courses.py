@@ -60,7 +60,8 @@ class ParallelCourseTests(unittest.TestCase):
         import yaml
         child=yaml.load((Path(__file__).resolve().parents[1]/'.github/workflows/qwen_production_lecture.yml').read_text(),Loader=yaml.BaseLoader)
         worker=child['jobs']['asr']
-        self.assertEqual(worker['permissions']['contents'],'read')
+        self.assertEqual(worker['permissions']['contents'],'write')  # encrypted coordination ref only
+        self.assertNotIn('production_qwen publish', str(worker['steps']))
         self.assertNotIn('SMTP_EMAIL',worker['env'])
         self.assertNotIn('PUBLISH_RESULTS',worker['env'])
         self.assertEqual(worker['strategy']['max-parallel'],'3')

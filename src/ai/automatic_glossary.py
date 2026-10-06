@@ -45,21 +45,78 @@ def validated_keywords(items, sources, summary):
     return selected
 
 
-def active_terms(records, *, exclude_sub_id=None):
+def _verified_evidence(item):
+    """Stored citations are rechecked; old source labels are not proof."""
+    import hashlib
+    result = []
+    values = item.get('evidence')
+    if not isinstance(values, list):
+        return result
+    for proof in values:
+        if not isinstance(proof, dict):
+            continue
+        source, quote, digest = proof.get('source'), proof.get('quote'), proof.get('sha256')
+        if (source in ('asr', 'ppt', 'cloud') and isinstance(quote, str)
+                and 2 <= len(quote) <= 180 and normalize(item['term']) in normalize(quote)
+                and hashlib.sha256(quote.encode()).hexdigest() == digest):
+            result.append(proof)
+    return result
+
+
+def term_stages(records, *, exclude_sub_id=None, before_date=None):
     groups = {}
     for record in records:
+        if not isinstance(record, dict):
+            continue
         if str(record.get('sub_id')) == str(exclude_sub_id):
             continue
-        values=record.get('keywords', [])
-        if not isinstance(values,list):
+        if before_date and (not record.get('lecture_date') or record['lecture_date'] >= before_date):
+            continue  # A future/parallel lecture cannot feed an earlier lesson.
+        values = record.get('keywords', [])
+        if not isinstance(values, list):
             continue
         for item in values:
-            if not isinstance(item,dict) or not isinstance(item.get('term'),str):
+            if not isinstance(item, dict) or not isinstance(item.get('term'), str):
                 continue
-            group = groups.setdefault(normalize(item['term']), {'term':item['term'], 'lessons':set(), 'supported':False})
-            group['lessons'].add(str(record.get('sub_id')))
-            group['supported'] |= item.get('source') in ('ppt','cloud')
-    return [g['term'] for g in groups.values() if g['supported'] or len(g['lessons']) >= 2][:30]
+            key = normalize(item['term'])
+            group = groups.setdefault(key, {'term': item['term'], 'stage': 'candidate', 'evidence': [],
+                                            'lesson_ids': set(), 'eligible': []})
+            sid = str(record.get('sub_id'))
+            group['lesson_ids'].add(sid)
+            if record.get('schema') != 2:
+                continue  # Legacy PPT/cloud flags and repeated ASR stay candidates.
+            proofs = _verified_evidence(item)
+            group['evidence'].extend(dict(p, sub_id=sid) for p in proofs)
+            # Recognition prompted with this word is not fresh corroboration.
+            frozen = record.get('frozen_terms', [])
+            if not isinstance(frozen, list):
+                continue  # Unknown prompting history cannot corroborate a word.
+            if key in {normalize(t) for t in frozen if isinstance(t, str)}:
+                continue
+            for proof in proofs:
+                if not any(marker in proof['quote'] for marker in ('待核', '疑点', '不清晰', '不确定', '误写', '不是', '不叫', '错写')):
+                    group['eligible'].append(dict(proof, sub_id=sid))
+    output = []
+    for group in groups.values():
+        proofs = group.pop('eligible')
+        sources = {p['source'] for p in proofs}
+        independent = {(p['sub_id'], p['sha256']) for p in proofs if p['source'] in ('ppt', 'cloud')}
+        # One classroom needs both visible text and completed cloud speech.
+        # Across classrooms, at least two different quotations/lesson IDs and
+        # an external-to-Qwen source are required. Pure ASR repetition never
+        # promotes, even if it appears in many generated summaries.
+        distinct_lessons = {sid for sid, _ in independent}
+        distinct_quotes = {digest for _, digest in independent}
+        confirmed = ('ppt' in sources and 'cloud' in sources) or (len(distinct_lessons) >= 2 and len(distinct_quotes) >= 2)
+        group['stage'] = 'confirmed' if confirmed else 'candidate'
+        group['lesson_ids'] = sorted(group['lesson_ids'])
+        output.append(group)
+    return output
+
+
+def active_terms(records, *, exclude_sub_id=None, before_date=None):
+    return [g['term'] for g in term_stages(records, exclude_sub_id=exclude_sub_id, before_date=before_date)
+            if g['stage'] == 'confirmed'][:30]
 
 
 class AutomaticGlossary:
@@ -68,25 +125,84 @@ class AutomaticGlossary:
             raise ValueError('Invalid course ID')
         self.db, self.course_id = db, str(course_id)
 
-    def terms(self, exclude_sub_id=None):
-        records=[]
+    def records(self):
+        records = []
         for value in self.db.read_meta_prefix('auto_glossary:'+self.course_id+':'):
             try:
-                record=json.loads(value)
-                lecture=self.db.get_lecture(str(record.get('sub_id'))) if isinstance(record,dict) else None
-                if (isinstance(record,dict) and record.get('course_id')==self.course_id
+                record = json.loads(value)
+                lecture = self.db.get_lecture(str(record.get('sub_id'))) if isinstance(record, dict) else None
+                if (isinstance(record, dict) and record.get('course_id') == self.course_id
                         and isinstance(record.get('updated_at', ''), str)
                         and lecture and not lecture.get('deleted_at')
-                        and str(lecture.get('course_id'))==self.course_id):
+                        and str(lecture.get('course_id')) == self.course_id):
+                    record['lecture_date'] = lecture.get('date') or ''
                     records.append(record)
-            except (ValueError,TypeError):
+            except (ValueError, TypeError):
                 continue
-        records.sort(key=lambda r:r.get('updated_at',''), reverse=True)
-        return active_terms(records[:100],exclude_sub_id=exclude_sub_id)
+        records.sort(key=lambda r: r.get('updated_at', ''), reverse=True)
+        return records[:100]
 
-    def save(self, sub_id, keywords):
+    def stages(self, exclude_sub_id=None, before_date=None):
+        return term_stages(self.records(), exclude_sub_id=exclude_sub_id, before_date=before_date)
+
+    def terms(self, exclude_sub_id=None, before_date=None):
+        return active_terms(self.records(), exclude_sub_id=exclude_sub_id, before_date=before_date)
+
+    def freeze(self, title, sub_id, *, lecture_date=None):
+        from src.ai.course_glossary import course_terms
+        from scripts.qwen_sharding import fingerprint
+        lecture = self.db.get_lecture(str(sub_id)) or {}
+        date = lecture_date or lecture.get('date')
+        base = course_terms(title)
+        # Unknown lecture dates cannot safely choose earlier confirmed records.
+        confirmed = self.terms(exclude_sub_id=sub_id, before_date=date) if date else []
+        terms = list(dict.fromkeys(base+confirmed))[:30]
+        return {'schema': 1, 'course_id': self.course_id, 'sub_id': str(sub_id),
+                'lecture_date': date or '', 'base_terms': base, 'confirmed_terms': confirmed,
+                'terms': terms, 'terms_sha256': fingerprint(terms)}
+
+    def save(self, sub_id, keywords, *, sources=None, frozen_terms=()):
+        import hashlib
         if not str(sub_id).isdigit():
             raise ValueError('Invalid lecture ID')
-        record={'course_id':self.course_id,'sub_id':str(sub_id),'keywords':keywords[:15],
-                'updated_at':datetime.now(timezone.utc).isoformat()}
-        self.db.write_meta('auto_glossary:'+self.course_id+':'+str(sub_id),json.dumps(record,ensure_ascii=False))
+        lecture = self.db.get_lecture(str(sub_id))
+        if not lecture or str(lecture.get('course_id')) != self.course_id or lecture.get('deleted_at'):
+            raise ValueError('Keyword evidence belongs to another or deleted lecture')
+        sources = sources if isinstance(sources, dict) else {}
+        accepted = validated_keywords(keywords, sources, ' '.join(
+            k['term'] for k in keywords if isinstance(k, dict) and isinstance(k.get('term'), str))) if isinstance(keywords, list) else []
+        values = []
+        for item in accepted:
+            evidence = []
+            for source in ('ppt', 'cloud', 'asr'):
+                texts = sources.get(source, [])
+                if not isinstance(texts, list):
+                    continue
+                source_count = 0
+                for text in texts:
+                    if not isinstance(text, str) or item['term'] not in text:
+                        continue
+                    index = text.index(item['term']); start = max(0, index-40)
+                    quote = text[start:start+180]
+                    # If the exact source quote is available, keep it for audit.
+                    if source == item['source'] and item['quote'] in text:
+                        quote = item['quote']
+                    proof = {'source': source, 'quote': quote,
+                             'sha256': hashlib.sha256(quote.encode()).hexdigest()}
+                    if proof not in evidence:
+                        evidence.append(proof)
+                        source_count += 1
+                    if source_count >= 4:
+                        break
+            values.append(dict(item, evidence=evidence, stage='candidate'))
+        record = {'schema': 2, 'course_id': self.course_id, 'sub_id': str(sub_id),
+                  'lecture_date': lecture.get('date') or '', 'keywords': values,
+                  'frozen_terms': list(frozen_terms)[:30],
+                  'updated_at': datetime.now(timezone.utc).isoformat()}
+        # Persist each candidate's current stage for inspection; recognition
+        # always re-evaluates citations and chronology instead of trusting it.
+        others = [r for r in self.records() if r['sub_id'] != str(sub_id)]
+        stages = {normalize(g['term']): g['stage'] for g in term_stages(others+[record])}
+        for item in values:
+            item['stage'] = stages[normalize(item['term'])]
+        self.db.write_meta('auto_glossary:'+self.course_id+':'+str(sub_id), json.dumps(record, ensure_ascii=False))

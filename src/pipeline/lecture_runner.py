@@ -138,12 +138,15 @@ class LectureRunner:
         self._transcriber.reset_lecture_state()
         if os.environ.get('AUTO_COURSE_TERMS','').lower() == 'true':
             from src.ai.automatic_glossary import AutomaticGlossary
-            from src.ai.course_glossary import course_terms
             self._automatic_glossary = AutomaticGlossary(self._db,course_id)
-            automatic = self._automatic_glossary.terms(exclude_sub_id=sub_id)
-            self._historical_terms = list(dict.fromkeys(automatic+course_terms(course_title)))[:30]
+            self._historical_terms = self._automatic_glossary.freeze(course_title, sub_id)['terms']
+        if prepared_asr is not None:
+            # The prepare job's immutable snapshot wins over later DB changes,
+            # for Qwen, Doubao and suspicious-window selection alike.
+            self._historical_terms = list(prepared_asr['recognition_terms'])
         from src.ai.course_glossary import course_terms
-        self._transcriber.set_terms(self._historical_terms or course_terms(course_title))
+        self._transcriber.set_terms(self._historical_terms if prepared_asr is not None
+                                   else self._historical_terms or course_terms(course_title))
         sub_title = lecture.get("sub_title", sub_id)
         date = lecture.get("date", "")
         t_start = time.time()
@@ -592,6 +595,11 @@ class LectureRunner:
 
     def _homework_visual(self, candidates, intervals):
         from src.pipeline.homework_visual import collect_visual_evidence
+        reader = None
+        state, checkpoint = self._review_state, self._checkpoint
+        if isinstance(state, dict) and callable(checkpoint):
+            ledger = state.setdefault('homework', {}).setdefault('vision_calls', [])
+            reader = self._summarizer.homework_image_reader(ledger, checkpoint)
         client = self._client
         if client is None:
             # The gather runner normally needs no login. Create a scoped
@@ -601,6 +609,7 @@ class LectureRunner:
             client = ICourseClient(login_with_retry())
         return collect_visual_evidence(client, self._homework_course_id, self._homework_sub_id,
                                        candidates, intervals,
+                                       vision_reader=reader,
                                        audio_seconds=(getattr(self, '_prepared_asr', None) or {}).get('audio_seconds'))
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
@@ -644,7 +653,8 @@ class LectureRunner:
             self._db.update_summary(sub_id, summary, model_used)
             if self._automatic_glossary:
                 try:
-                    self._automatic_glossary.save(sub_id,keywords)
+                    self._automatic_glossary.save(sub_id, keywords, sources=sources,
+                                                  frozen_terms=self._historical_terms)
                 except Exception as error:
                     self._reporter.info(f'    [WARN] Keyword metadata not saved: {type(error).__name__}')
             return summary

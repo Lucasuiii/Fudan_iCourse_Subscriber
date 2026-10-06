@@ -76,9 +76,12 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
             raise ValueError('Empty original audio block')
         blocks.append({'chunk_id': i, 'start': start, 'end': end, 'samples': samples})
     pending = sum(b['samples'] for b in blocks)/RATE
-    if mode not in ('2', 'auto'):
+    if mode not in ('2', 'auto', 'shared'):
         raise ValueError('Unknown shard strategy')
-    count = min(len(blocks), 2 if mode == '2' or pending <= 3600 else 3)
+    # Shared workers target <=30 speech minutes each, bounded by the per-course
+    # reservation (3) and five active courses: total <=15 across all phases.
+    requested = min(3, max(1, math.ceil(pending/1800))) if mode == 'shared' else (2 if mode == '2' or pending <= 3600 else 3)
+    count = min(len(blocks), requested)
     groups, loads = [[] for _ in range(count)], [0]*count
     for block in sorted(blocks, key=lambda b: (-b['samples'], b['chunk_id'])):
         index = min(range(count), key=lambda i: (loads[i], i))
@@ -96,6 +99,10 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
                        for i, ids in enumerate(groups)]}
     if production:
         plan['pipeline'] = 'production'
+    if mode == 'shared':
+        if not production:
+            raise ValueError('Shared queue requires the production checkpoint boundary')
+        plan['execution'] = 'shared_queue'
     if allow_partial:
         plan['allow_partial_comparison'] = True
     return plan

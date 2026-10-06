@@ -2,6 +2,7 @@
 import copy
 import io
 import unittest
+from functools import partial
 from unittest.mock import MagicMock, patch
 
 from src.ai.homework_review import (assignment_candidates, prioritize_candidates, focus_intervals,
@@ -38,12 +39,77 @@ class AssignmentEvidenceTests(unittest.TestCase):
         self.assertFalse(candidates[1]['alignable'])
         prompt = homework_prompt({'candidates': candidates})
         self.assertIn('取消要求必须保留', prompt)
+        self.assertIn('今天没有作业', prompt)
         summary = ensure_homework_notice('矩阵知识摘要', {'candidates': candidates})
-        self.assertIn('作业与课务提醒', summary)
-        self.assertIn('待核实', summary)
-        self.assertIn('今天没有作业', summary)
+        self.assertIn('### 课程事项提醒', summary)
+        self.assertNotIn('不清楚', summary)
+        self.assertNotIn('原始转写块', summary)
+        self.assertNotIn('今天没有作业', summary)  # Unverified raw quotes are not reader-facing facts.
         self.assertEqual(ensure_homework_notice(summary, {'candidates': candidates}), summary)
         self.assertEqual(ensure_homework_notice('摘要', {'candidates': []}), '摘要')
+
+    def test_generated_course_heading_does_not_duplicate_homework_notice(self):
+        summary = ('### 课程事项提醒\n\n#### 作业与课务\n\n'
+                   '作业题号和提交方式尚未确认。\n\n### 矩阵的定义\n\n定义内容。')
+        evidence = {'candidates': [{}], 'visual': {'reference_status': 'unverified'}}
+        self.assertEqual(ensure_homework_notice(summary, evidence), summary)
+        self.assertEqual(ensure_homework_notice(summary, {'candidates': [{}]}), summary)
+
+    def test_global_image_status_does_not_override_existing_speech_requirements(self):
+        later = '### 矩阵乘法\n\n公式条件待确认。'
+        summary = '### **课程事项提醒**\n\n#### 作业安排\n\n完成第3题和第4题。\n\n'+later
+        for visual in ({}, {'status': 'ok'}, {'reference_status': 'unverified'}, {'status': 'failed'}):
+            with self.subTest(visual=visual):
+                evidence = {'candidates': [{}], 'visual': visual,
+                            'cloud': [{'status': 'complete', 'cloud_text': '完成第3题和第4题。'}]}
+                result = ensure_homework_notice(summary, evidence)
+                self.assertEqual(result, summary)
+                self.assertNotIn('题号和页码尚未确认', result)
+                self.assertEqual(ensure_homework_notice(result, evidence), result)
+
+    def test_body_mentions_and_fenced_headings_cannot_hide_missing_reminder(self):
+        for source in ['正文中提到作业与课务提醒。',
+                       '```markdown\n### 作业与课务提醒\n```',
+                       '~~~\n### 课程事项提醒\n~~~']:
+            with self.subTest(source=source):
+                result = ensure_homework_notice(source, {'candidates': [{}]})
+                self.assertTrue(result.endswith('作业与课务安排请参阅课程通知。'))
+                self.assertEqual(ensure_homework_notice(result, {'candidates': [{}]}), result)
+
+    def test_technical_audit_and_raw_numbers_never_leak_from_fallback(self):
+        import json
+        evidence = {'candidates': [{'block_start': 2610.5, 'block_end': 2716.7,
+                                   'quote': '乱码和候选题号P69 1 3 7，以及私密课堂内容'}],
+                    'visual': {'reference_status': 'unverified', 'status': 'needs_verification'},
+                    'vision_calls': [{'status': 'complete', 'model': 'internal-model'}]}
+        before = json.dumps(evidence, ensure_ascii=False)
+        result = ensure_homework_notice('### 矩阵运算\n\n知识内容。', evidence)
+        for value in ['2610.5', '2716.7', 'P69', '乱码', '私密课堂内容', 'needs_verification',
+                      'internal-model', '原始转写块', 'ASR', 'OCR']:
+            self.assertNotIn(value, result)
+        self.assertEqual(json.dumps(evidence, ensure_ascii=False), before)
+
+    def test_verified_homework_and_cancellation_are_not_rewritten(self):
+        summary = '### 课程事项提醒\n\n今天没有新作业，完成上次未完成的练习即可。'
+        for status in ('supported', 'unverified'):
+            evidence = {'candidates': [{}], 'visual': {'reference_status': status}}
+            self.assertEqual(ensure_homework_notice(summary, evidence), summary)
+        unverified = '### 作业与课务\n\n题号待核实，提交方式尚未明确。'
+        self.assertEqual(ensure_homework_notice(unverified, {'candidates': [{}]}), unverified)
+
+    def test_unfinished_exercises_do_not_mean_uncertain_identification(self):
+        summary = '### 课程事项提醒\n\n完成上次未完成的作业。'
+        result = ensure_homework_notice(summary, {'candidates': [{}]})
+        self.assertEqual(result, summary)
+
+    def test_partial_requirements_keep_known_items_and_local_uncertainty(self):
+        summary = '### 作业安排\n\n完成矩阵乘法的第2题，其余题号待确认。'
+        evidence = {'candidates': [{}], 'visual': {'reference_status': 'unverified'}}
+        self.assertEqual(ensure_homework_notice(summary, evidence), summary)
+        prompt = homework_prompt(evidence)
+        self.assertIn('先写已有证据支持的具体要求', prompt)
+        self.assertIn('可靠语音可独立支持作业要求', prompt)
+        self.assertIn('仅对有缺失或冲突的具体项', prompt)
 
     def test_context_crosses_block_edge_without_changing_original_clock(self):
         raw, *_ = aligned({}, assignment_candidates(material()['full_chunks']))
@@ -151,7 +217,8 @@ def board_png(size=(640, 360)):
 
 class AssignmentVisualTests(unittest.TestCase):
     def test_short_snapshot_does_not_skip_delayed_board_capture(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110, 'pptimgurl': 'private'}]
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
         client.get_video_url.return_value = None
@@ -163,7 +230,8 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_delayed_board_is_captured_after_original_audio_focus(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.return_value = 'signed-private'
         client.get_stream_params.return_value = ('vpn-private', 'cookies-private')
@@ -179,7 +247,8 @@ class AssignmentVisualTests(unittest.TestCase):
         self.assertNotIn('private', str(result)); self.assertEqual(client.get_video_url.call_count, 6)
 
     def test_unaligned_quote_never_seeks_guessed_video_position(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         result = collect_visual_evidence(client, '10', '1', assignment_candidates(material()['full_chunks']), [],
                                         screenshot_fetcher=MagicMock(), ocr=MagicMock())
@@ -188,6 +257,31 @@ class AssignmentVisualTests(unittest.TestCase):
 
 
 class AssignmentRunnerTests(unittest.TestCase):
+    def test_corroborated_vision_subquestions_reach_saved_summary(self):
+        from test_lecture_quality_gate import _load_runner_class
+        from src.ai.homework_vision import validated_frames
+        from src.ai.homework_visual_evidence import assess_visual
+        Runner = _load_runner_class(); db = MagicMock(); db.get_done_ppt_pages.return_value = []
+        llm = MagicMock(); llm.summarize.return_value = ('### 作业安排\n\n矩阵运算要多练习。', 'test')
+        runner = Runner(None, db, MagicMock(), MagicMock(), llm, MagicMock())
+        data = material(); runner._prepared_asr = data
+        raw = copy.deepcopy(data)
+        frames = validated_frames({'frames': [
+            {'frame_index': i, 'text': 'P69 1(1)(3)', 'references': [
+                {'raw': 'P69 1(1)(3)', 'page': 69, 'exercises': ['1(1)(3)'], 'legible': True}]}
+            for i in range(2)]}, 2)
+        for frame, seconds in zip(frames, [100, 120]):
+            frame.update(seconds=seconds, candidate_id='cue')
+        evidence = {'candidates': [{}], 'visual': assess_visual({
+            'candidate_ids': ['cue', 'missing'], 'frames': frames})}
+        runner._qwen_review_material = {'homework': evidence}
+        summary = runner._summarize('1', '高等代数', data['transcript'], [])
+        self.assertIn('板书列出的练习：第69页：1(1)(3)', summary)
+        self.assertEqual(summary.count('作业安排'), 1)
+        self.assertNotIn('必须完成', summary)
+        self.assertEqual(db.update_summary.call_args.args[1], summary)
+        self.assertEqual(data, raw)
+
     def test_saved_summary_contains_notice_without_mutating_raw_transcript(self):
         from test_lecture_quality_gate import _load_runner_class
         Runner = _load_runner_class(); db = MagicMock(); db.get_done_ppt_pages.return_value = []
@@ -196,7 +290,7 @@ class AssignmentRunnerTests(unittest.TestCase):
         data = material(); runner._prepared_asr = data
         raw = copy.deepcopy(data)
         summary = runner._summarize('1', '高等代数', data['transcript'], [])
-        self.assertIn('作业与课务提醒', summary)
+        self.assertIn('课程事项提醒', summary)
         self.assertIn('题号', llm.summarize.call_args.args[1])
         self.assertEqual(data, raw); self.assertEqual(db.update_summary.call_args.args[1], summary)
 
@@ -211,6 +305,36 @@ class AssignmentRunnerTests(unittest.TestCase):
 
 
 class BoardEvidenceTests(unittest.TestCase):
+    def test_summary_retains_supported_items_despite_global_unverified_status(self):
+        evidence = {'candidates': [{}], 'visual': {'reference_status': 'unverified',
+            'reference_evidence': [
+                {'text': '第1(1)(3)题', 'page': 69, 'supported': True},
+                {'text': '第2题', 'page': 69, 'supported': False},
+                {'text': '第3题', 'page': 69, 'supported': True, 'audio_conflict': True}]}}
+        source = '### 课程事项提醒\n\n完成上次未完成的练习。\n\n### 矩阵\n\n知识。'
+        result = ensure_homework_notice(source, evidence)
+        self.assertIn('- 板书列出的练习：第69页：1(1)(3)。', result)
+        self.assertLess(result.index('板书列出的练习'), result.index('### 矩阵'))
+        self.assertNotIn('第2题', result); self.assertNotIn('第3题', result)
+        self.assertEqual(result.count('课程事项提醒'), 1)
+        self.assertEqual(ensure_homework_notice(result, evidence), result)
+        missing_section = ensure_homework_notice('矩阵知识。', evidence)
+        self.assertIn('1(1)(3)', missing_section)
+        self.assertNotIn('请参阅', missing_section)
+        self.assertEqual(ensure_homework_notice(missing_section, evidence), missing_section)
+
+    def test_existing_numbers_require_correct_page_and_full_subquestion(self):
+        evidence = {'candidates': [{}], 'visual': {'reference_evidence': [
+            {'text': '第1(1)(3)题', 'page': 69, 'supported': True},
+            {'text': '第11题', 'page': 69, 'supported': True}]}}
+        for text in ['第69页：1（1）（3）、11。', 'P69 1(1)(3)、11。']:
+            existing = '### 作业与课务\n\n' + text
+            self.assertEqual(ensure_homework_notice(existing, evidence), existing)
+        for source in ['第70页：1(1)(3)、11。', '第69页：1(1)、111。']:
+            result = ensure_homework_notice('### 作业安排\n\n' + source, evidence)
+            self.assertIn('板书列出的练习：第69页：1(1)(3)、11。', result)
+            self.assertEqual(ensure_homework_notice(result, evidence), result)
+
     def visual(self, texts, *, confidence=.95, candidate='cue'):
         from src.ai.homework_visual_evidence import references
         return {'candidate_ids': [candidate], 'frames': [
@@ -291,7 +415,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertGreater(views[1][2][1], 1080)
 
     def test_transport_finishes_before_video_ocr_and_new_cue_refreshes_source(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
         client.get_stream_params.return_value = ('private', '')
         candidates = assignment_candidates([dict(start=0, end=120, text='作业完成第二题。'),
@@ -308,7 +433,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertEqual(client.get_video_url.call_count, 12)
 
     def test_independent_seeks_never_reuse_signed_transport_identity(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.side_effect = [f'signed-{i}' for i in range(6)]
         client.get_stream_params.side_effect = lambda url: (url, 'private')
@@ -332,7 +458,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertNotIn('secret', str(result))
 
     def test_only_later_frames_with_homework_references_support_evidence(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = [{'id': 1, 'created_sec': 110}]
         client.get_video_url.return_value = 'private'; client.get_stream_params.return_value = ('private', 'private')
         candidates = assignment_candidates(material()['full_chunks']); intervals = focus_intervals(aligned({}, candidates)[0], 180)
@@ -349,7 +476,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertEqual(frame.call_count, 6)
 
     def test_no_frame_seeks_past_end_and_four_cues_remain_bounded(self):
-        from src.pipeline.homework_visual import collect_visual_evidence
+        from src.pipeline.homework_visual import collect_visual_evidence as collect
+        collect_visual_evidence = partial(collect, frames_per_cue=6, delay_seconds=90)
         client = MagicMock(); client.get_ppt_list.return_value = []; client.get_video_url.return_value = 'private'
         client.get_stream_params.return_value = ('private', '')
         chunks = [dict(start=i*120, end=(i+1)*120, text='今天布置作业，完成第二题。') for i in range(4)]
@@ -368,7 +496,8 @@ class BoardEvidenceTests(unittest.TestCase):
         self.assertFalse(acceptance(state, {'start': 0, 'end': 10}, 0, '作业与课务提醒', True)['visual_completed'])
         summary = ensure_homework_notice('## 作业与课务提醒\n矩阵作业待核实。',
                                         {'candidates': [{}], 'visual': {'status': 'ok'}})
-        self.assertIn('视觉核对未完成', summary)
+        self.assertIn('待核实', summary)
+        self.assertNotIn('视觉核对未完成', summary)
         self.assertEqual(ensure_homework_notice(summary, {'candidates': [{}]}), summary)
 
 

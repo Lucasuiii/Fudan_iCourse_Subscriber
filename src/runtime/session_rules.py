@@ -34,7 +34,7 @@ class SessionRulesError(ValueError):
     """Raised for malformed rules without echoing their secret contents."""
 
 
-def parse_course_session_rules(raw: str) -> SessionRules:
+def parse_course_session_rules(raw: str, *, setting: str = 'COURSE_SESSION_RULES') -> SessionRules:
     """Parse private rules such as ``12345=周一第1-2节|周三第6-8节``.
 
     Blank input means no filtering.  ``全部`` (also ``ALL`` or ``*``) keeps
@@ -48,18 +48,18 @@ def parse_course_session_rules(raw: str) -> SessionRules:
             continue
         if line.count("=") != 1:
             raise SessionRulesError(
-                f"Invalid COURSE_SESSION_RULES at line {line_number}"
+                f"Invalid {setting} at line {line_number}"
             )
         course_id, selection = (part.strip() for part in line.split("=", 1))
         if not course_id or not selection or course_id in parsed:
             raise SessionRulesError(
-                f"Invalid COURSE_SESSION_RULES at line {line_number}"
+                f"Invalid {setting} at line {line_number}"
             )
 
         tokens = [part.strip() for part in re.split(r"[|｜]", selection)]
         if any(not token for token in tokens):
             raise SessionRulesError(
-                f"Invalid COURSE_SESSION_RULES at line {line_number}"
+                f"Invalid {setting} at line {line_number}"
             )
         if len(tokens) == 1 and tokens[0].upper() in {"全部", "ALL", "*"}:
             parsed[course_id] = None
@@ -70,17 +70,22 @@ def parse_course_session_rules(raw: str) -> SessionRules:
             match = _RULE_RE.fullmatch(token)
             if not match:
                 raise SessionRulesError(
-                    f"Invalid COURSE_SESSION_RULES at line {line_number}"
+                    f"Invalid {setting} at line {line_number}"
                 )
             start = int(match.group(2))
             end = int(match.group(3) or start)
             if start < 1 or end < start:
                 raise SessionRulesError(
-                    f"Invalid COURSE_SESSION_RULES at line {line_number}"
+                    f"Invalid {setting} at line {line_number}"
                 )
             rules.add((_WEEKDAYS[match.group(1)], start, end))
         parsed[course_id] = frozenset(rules)
     return parsed
+
+
+def parse_course_session_exclusions(raw: str) -> SessionRules:
+    """Private recurring exclusions, independent of existing allowlists."""
+    return parse_course_session_rules(raw, setting='COURSE_SESSION_EXCLUSIONS')
 
 
 def parse_session_override_dates(raw: str) -> SessionOverrideDates:
@@ -111,6 +116,7 @@ def parse_session_override_dates(raw: str) -> SessionOverrideDates:
 def lecture_is_selected(
     course_id: str, lecture: dict, rules: SessionRules,
     override_dates: SessionOverrideDates = frozenset(),
+    *, exclusions: SessionRules | None = None,
 ) -> bool:
     """Return whether a lecture matches its course's configured allowlist.
 
@@ -119,6 +125,21 @@ def lecture_is_selected(
     cannot be parsed, preventing an unexpected model call.
     """
     course_id = str(course_id)
+    if exclusions and course_id in exclusions:
+        excluded = exclusions[course_id]
+        if excluded is None: return False
+        sub_title = str(lecture.get('sub_title') or '')
+        date_match = _DATE_RE.search(str(lecture.get('date') or '')) or _DATE_RE.search(sub_title)
+        period_match = _PERIOD_RE.search(sub_title)
+        if not date_match or not period_match: return False
+        try: lecture_date = date(*(int(part) for part in date_match.groups()))
+        except ValueError: return False
+        start = int(period_match.group(1)); end = int(period_match.group(2) or start)
+        if start < 1 or end < start: return False
+        # Exclude any overlapping period; date allowlist overrides cannot
+        # silently re-enable a session the user explicitly excluded.
+        if any(day == lecture_date.weekday() and start <= b and end >= a
+               for day,a,b in excluded): return False
     if course_id not in rules or rules[course_id] is None:
         return True
 

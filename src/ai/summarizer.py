@@ -149,6 +149,15 @@ class Summarizer:
                   "keeping local transcription.")
             return []
 
+    def homework_image_reader(self, ledger, checkpoint):
+        """Use the explicit DeepSeek vision route, never text-only fallback."""
+        if not any(p['name'] == 'deepseek' for p in self.providers):
+            return None
+        from src.ai.homework_vision import read_images
+        client = self._clients['deepseek']
+        return lambda frames: read_images(client, config.HOMEWORK_VISION_MODEL,
+                                         frames, ledger, checkpoint)
+
     def summarize_with_keywords(self, title, content, sources, terms):
         """One summary request also returns separately validated keyword metadata."""
         from src.ai.automatic_glossary import INSTRUCTION, validated_keywords

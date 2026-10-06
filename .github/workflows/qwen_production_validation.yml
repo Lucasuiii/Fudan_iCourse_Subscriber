@@ -18,43 +18,91 @@ name: Qwen Production Pipeline Validation
         description: Also export original complete Qwen blocks, before cloud review
         type: boolean
         default: false
+      inspect_audio:
+        description: Inspect existing prepared audio and export bounded listening clips, no ASR
+        type: boolean
+        default: false
+      inspect_source_metadata:
+        description: Inspect stored lesson headers, nine 4-KiB samples, three probes of up to 128 packets; relay limited to 16 MiB; no decoding or ASR
+        type: boolean
+        default: false
+      inspect_authentication:
+        description: One auth-only probe with encrypted stage diagnostics; no media, database or models
+        type: boolean
+        default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
     - '.github/workflows/qwen_production_*.yml'
     - '.github/actions/qwen-pilot-runtime/**'
     - 'scripts/production_*.py'
+    - 'scripts/asr_queue_store.py'
+    - 'scripts/shared_asr_worker.py'
     - 'scripts/qwen_sharding.py'
     - 'scripts/sharded_qwen_pilot.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
     - 'src/ai/homework_review.py'
+    - 'prompts/lecture_summary.md'
+    - 'tests/test_summarizer_prompt.py'
+    - 'src/ai/automatic_glossary.py'
+    - 'src/ai/qwen_transcriber.py'
     - 'src/ai/homework_visual_evidence.py'
+    - 'src/ai/homework_vision.py'
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
+    - 'src/runtime/scheduler.py'
+    - 'src/runtime/media_transport.py'
+    - 'src/api/icourse.py'
+    - 'tests/test_media_transport.py'
+    - 'src/api/webvpn.py'
+    - 'tests/test_webvpn_auth_diagnostics.py'
+    - 'tests/test_production_byte_ranges.py'
+    - 'tests/test_audio_timeline.py'
     - 'tests/test_homework_review.py'
+    - 'tests/test_shared_asr_queue.py'
+    - 'tests/test_automatic_glossary.py'
+    - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
   pull_request:
     paths:
     - '.github/**'
+    - 'prompts/lecture_summary.md'
+    - 'tests/test_summarizer_prompt.py'
     - 'scripts/production_*.py'
+    - 'src/runtime/scheduler.py'
+    - 'src/runtime/media_transport.py'
+    - 'src/api/icourse.py'
+    - 'tests/test_media_transport.py'
+    - 'src/api/webvpn.py'
+    - 'tests/test_webvpn_auth_diagnostics.py'
+    - 'tests/test_production_byte_ranges.py'
+    - 'tests/test_audio_timeline.py'
+    - 'scripts/asr_queue_store.py'
+    - 'scripts/shared_asr_worker.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
     - 'src/ai/homework_review.py'
+    - 'src/ai/automatic_glossary.py'
+    - 'src/ai/qwen_transcriber.py'
     - 'src/ai/homework_visual_evidence.py'
+    - 'src/ai/homework_vision.py'
     - 'src/ai/ocr.py'
     - 'src/ai/segment_rescue.py'
     - 'tests/test_homework_review.py'
+    - 'tests/test_shared_asr_queue.py'
+    - 'tests/test_automatic_glossary.py'
+    - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
 permissions:
   contents: read
 jobs:
   export:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -85,6 +133,108 @@ jobs:
         if-no-files-found: error
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
+  inspect-audio:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        python -m pip install cryptography pycryptodome numpy soundfile sherpa-onnx
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        curl --fail --silent --show-error --location -o silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+    - run: python -m scripts.production_audio_inspection
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-audio-private-inspection
+        path: ${{ runner.temp }}/qwen-shards/out/audio-inspection.enc
+        retention-days: 7
+        if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  inspect-source-metadata:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_source_metadata && !inputs.inspect_audio && !inputs.inspect_authentication }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: |
+        python -m pip install cryptography pycryptodome requests
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    - run: python -m scripts.production_media_inspection
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-media-private-inspection-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/qwen-shards/out/media-inspection.enc
+        retention-days: 7
+        if-no-files-found: ignore
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  inspect-authentication:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_authentication && !inputs.inspect_audio && !inputs.inspect_source_metadata }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      StuId: ${{ secrets.STUID }}
+      UISPsw: ${{ secrets.UISPSW }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome requests
+    - run: python -m scripts.production_auth_inspection
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-auth-private-inspection-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/qwen-shards/out/auth-inspection.enc
+        retention-days: 7
+        if-no-files-found: ignore
+    - run: python -c "import os,shutil; shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'],'qwen-shards'),ignore_errors=True)"
+      if: ${{ always() }}
   validate:
     if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
@@ -96,10 +246,15 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: '3.12'
-    - run: python -m pip install PyYAML cryptography pycryptodome requests openai pillow
+    - run: python -m pip install PyYAML cryptography pycryptodome requests openai pillow numpy soundfile
+    - run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Original shard invariants and independent course scheduling
-      run: PYTHONPATH=tests python -m unittest test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
+      run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
+    - name: Authentication verification and bounded HTTP source diagnostics
+      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
-      run: PYTHONPATH=tests python -m unittest test_homework_review test_doubao_asr
+      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary test_summarizer_prompt
