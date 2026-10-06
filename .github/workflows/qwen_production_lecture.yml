@@ -87,10 +87,19 @@ jobs:
       if: ${{ always() }}
       with:
         name: qwen-production-prepare-${{ inputs.task_slot }}
-        path: ${{ runner.temp }}/qwen-shards/out/prepared.enc
+        path: |-
+          ${{ runner.temp }}/qwen-shards/out/prepared.enc
+          ${{ runner.temp }}/qwen-shards/out/prepared-*-part-*.enc
         retention-days: 7
         compression-level: 0
         overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-prepare-audit-${{ inputs.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/prepare-failure.json
+        retention-days: 7
         if-no-files-found: ignore
     - name: clean
       run: python -m scripts.production_qwen clean
