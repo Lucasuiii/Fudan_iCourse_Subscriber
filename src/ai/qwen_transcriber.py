@@ -27,6 +27,7 @@ class QwenTranscriber:
         self._last_speech_windows=[]
         self.last_vad_windows=[]
         self.last_chunks=[]
+        self.last_prepare_stats={}
         self._terms=[]
 
     @property
@@ -96,7 +97,8 @@ class QwenTranscriber:
             vad.pop()
 
     def prepare_pcm_stream(self, read_fn, is_eof_fn, stderr_provider, return_code_fn,
-                            timeout=18000, wait_on_empty_sec=0.1, label='tail', audio_path=None):
+                            timeout=18000, wait_on_empty_sec=0.1, label='tail', audio_path=None,
+                            idle_timeout=None):
         import numpy as np
         import sherpa_onnx
         from src.ai.transcriber import NoAudioStreamError
@@ -112,22 +114,35 @@ class QwenTranscriber:
         cfg.silero_vad.max_speech_duration=28.0
         cfg.sample_rate=RATE;cfg.num_threads=1
         vad=sherpa_onnx.VoiceActivityDetector(cfg,buffer_size_in_seconds=60)
-        began=time.monotonic();total=0;pending=b''
-        while True:
-            if time.monotonic()-began>timeout: raise TimeoutError('Qwen lecture timeout')
-            raw=read_fn(512*4)
-            if not raw and is_eof_fn():
-                # ffmpeg may have written its final samples between the empty
-                # read and poll(). Drain again after exit before declaring EOF.
+        began=time.monotonic();progress=began;total=0;pending=b'';eof=False
+        self.last_prepare_stats={}
+        try:
+            while True:
+                now=time.monotonic()
+                if now-began>timeout: raise TimeoutError('Audio preparation deadline exceeded')
                 raw=read_fn(512*4)
-                if not raw: break
-            if raw:
-                pending+=raw
-                if len(pending)<512*4: continue
-                block,pending=pending[:512*4],pending[512*4:]
-                vad.accept_waveform(np.frombuffer(block,dtype=np.float32))
-                total+=512;self._drain_vad(vad,self.last_vad_windows)
-            else: time.sleep(wait_on_empty_sec)
+                if not raw and is_eof_fn():
+                    # Drain final samples written between an empty read and exit.
+                    raw=read_fn(512*4)
+                    if not raw:
+                        eof=True
+                        break
+                if raw:
+                    progress=time.monotonic()
+                    pending+=raw
+                    if len(pending)<512*4: continue
+                    block,pending=pending[:512*4],pending[512*4:]
+                    vad.accept_waveform(np.frombuffer(block,dtype=np.float32))
+                    total+=512;self._drain_vad(vad,self.last_vad_windows)
+                else:
+                    if idle_timeout is not None and now-progress>idle_timeout:
+                        raise TimeoutError('Audio preparation stalled')
+                    time.sleep(wait_on_empty_sec)
+        finally:
+            ended=time.monotonic()
+            self.last_prepare_stats={'elapsed_seconds':ended-began,
+                'idle_seconds':ended-progress,'timeout_seconds':timeout,
+                'idle_timeout_seconds':idle_timeout,'stream_eof':eof}
         if pending:
             if len(pending)%4: raise RuntimeError('Incomplete PCM sample')
             samples=np.frombuffer(pending,dtype=np.float32)

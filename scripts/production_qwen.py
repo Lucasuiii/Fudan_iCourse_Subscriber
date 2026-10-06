@@ -24,6 +24,9 @@ from scripts.parallel_courses import configured_courses
 from scripts.production_db import load_remote, snapshot, lecture_snapshot, merge_lecture, publish
 from src.data.database import Database
 
+PREPARE_STREAM_TIMEOUT = 90 * 60
+PREPARE_IDLE_TIMEOUT = 5 * 60
+
 
 def root():
     return shards.root()
@@ -59,6 +62,8 @@ def failure_code(error):
         'Production audio is incomplete': 'incomplete_audio',
         'Production audio has read or decode errors': 'audio_decode_errors',
         'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
+        'Audio preparation deadline exceeded': 'preparation_deadline',
+        'Audio preparation stalled': 'preparation_stalled',
         'Encrypted bundle too large': 'bundle_size_limit',
         'Prepared bundle exceeds total size limit': 'bundle_size_limit',
         'Prepared bundle has too many files': 'bundle_file_limit',
@@ -523,6 +528,21 @@ def validate_prepared_audio(specification):
         raise ValueError('Production audio is incomplete')
 
 
+def prepare_audio_stream(transcriber, handle, specification):
+    """Allow progressing downloads to finish, within a bounded prepare job."""
+    try:
+        with open(handle.path, 'rb') as audio:
+            return transcriber.prepare_pcm_stream(audio.read, lambda: handle.process.poll() is not None,
+                lambda: b''.join(handle.stderr_chunks), lambda: handle.process.returncode,
+                audio_path=handle.path, timeout=PREPARE_STREAM_TIMEOUT, idle_timeout=PREPARE_IDLE_TIMEOUT)
+    finally:
+        specification['preparation_timing'] = {'timeout_seconds': PREPARE_STREAM_TIMEOUT,
+            'idle_timeout_seconds': PREPARE_IDLE_TIMEOUT}
+        stats = getattr(transcriber, 'last_prepare_stats', None)
+        if isinstance(stats, dict):
+            specification['preparation_timing'].update(stats)
+
+
 def preparation_failure_audit(specification, files, error, *, saved=False, secondary=(), fallback=False,
                               full_counts=None):
     """Public diagnostics contain fixed codes/counts, never exception text or names."""
@@ -543,6 +563,14 @@ def preparation_failure_audit(specification, files, error, *, saved=False, secon
         'planned_workers': len(specification.get('plan', {}).get('shards', []))}
     if full_counts is not None:
         audit.update(full_checkpoint_file_count=full_counts[0], full_checkpoint_content_bytes=full_counts[1])
+    timing = specification.get('preparation_timing', {})
+    for name in ('elapsed_seconds', 'idle_seconds', 'timeout_seconds', 'idle_timeout_seconds'):
+        value = timing.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            import math
+            if math.isfinite(value) and value >= 0: audit['preparation_' + name] = value
+    if isinstance(timing.get('stream_eof'), bool):
+        audit['preparation_stream_eof'] = timing['stream_eof']
     for name in ('audio_seconds', 'media_seconds', 'duration_gap_seconds', 'decode_return_code',
                  'decode_interrupted', 'stderr_complete', 'timeline_preserved'):
         value = diagnostics.get(name)
@@ -703,10 +731,7 @@ def prepare():
                     time.sleep(.1)
                 transcriber = QwenTranscriber()
                 specification['prepare_phase'] = 'vad'
-                with open(handle.path, 'rb') as audio:
-                    windows = transcriber.prepare_pcm_stream(audio.read, lambda: handle.process.poll() is not None,
-                        lambda: b''.join(handle.stderr_chunks), lambda: handle.process.returncode,
-                        audio_path=handle.path, timeout=2400)
+                windows = prepare_audio_stream(transcriber, handle, specification)
                 duration = transcriber.last_audio_duration
                 media = transcriber.last_media_duration or 0
                 specification.update(audio_seconds=duration, media_seconds=media,
