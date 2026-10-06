@@ -262,6 +262,8 @@ def probe_relay_late_packets(client, signed_url, retained_seconds, stream):
         result = probe_late_packets(relay.url,'',retained_seconds,stream)
     except MediaTransportError as error:
         result = {'status':'failed','failure_code':error.code,'packets':[]}
+    except subprocess.TimeoutExpired:
+        result = {'status':'failed','failure_type':'TimeoutExpired','packets':[]}
     finally:
         relay.close()
     result.update(source_transport=relay.audit(), maximum_upstream_bytes=16*1024*1024,
@@ -356,6 +358,8 @@ def inspect():
             probe_relay_late_packets(client,url,retained,audio[0])
             if len(audio) == 1 and isinstance(retained,(int,float))
             else {'status':'ambiguous_or_unavailable','packets':[]})
+        if payload['transport_source_late_packets']['status'] == 'failed':
+            raise ValueError('Source range transport probe failed')
         stage = 'late_packets'
         if late['status'] == 'failed': raise ValueError('Source late packet probe failed')
         if payload['current_source_byte_ranges']['status'] == 'failed':

@@ -1,13 +1,25 @@
 """Bounded HTTP samples diagnose seek behavior without exporting media."""
 import io
 import json
+import subprocess
 import unittest
 from unittest.mock import MagicMock, patch
-from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors,probe_initial_range_reuse,probe_fresh_late_packets
+from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors,probe_initial_range_reuse,probe_fresh_late_packets,probe_relay_late_packets
 from urllib.parse import parse_qs,urlsplit
 
 
 class SourceByteRangeTests(unittest.TestCase):
+    def test_relay_probe_timeout_retains_safe_transport_audit_and_closes(self):
+        with patch('src.runtime.media_transport.SignedRangeRelay') as relay, \
+             patch('scripts.production_media_inspection.probe_late_packets',side_effect=subprocess.TimeoutExpired('private-url',90,stderr=b'private-cookie')):
+            relay.return_value.audit.return_value={'terminal_error_code':None,'upstream_bytes':4096}
+            result=probe_relay_late_packets(MagicMock(),'private-url',4060.5,{'end_time':6565})
+        self.assertEqual(result['failure_type'],'TimeoutExpired')
+        self.assertEqual(result['source_transport']['upstream_bytes'],4096)
+        self.assertEqual(result['maximum_upstream_bytes'],16*1024*1024)
+        relay.return_value.close.assert_called_once()
+        self.assertNotIn('private',json.dumps(result))
+
     def test_fresh_packet_probe_removes_old_auth_but_preserves_source_and_queries(self):
         client=MagicMock()
         client.sign_video_url.return_value='https://private/media.mp4?track=audio&clientUUID=new&t=new-secret'
