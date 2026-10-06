@@ -77,7 +77,11 @@ def homework_prompt(evidence):
               '取消要求必须保留；分别核对题号、页码、截止时间和提交方式。Qwen、豆包、视觉模型和OCR均可能出错，'
               '画面文字不等于教师口头要求；视觉状态references_supported只表示文字有多帧或语音佐证，'
               '不表示这些题已被布置。needs_verification、旧版ok或无状态都不是题号核实通过；'
-              '视觉核对未完成时只说“题号或页码尚未确认，请以课程通知为准”，不罗列未确认的候选数字；'
+              '先写已有证据支持的具体要求、练习内容和能够可靠读出的题号或页码；'
+              '部分内容明确时保留明确部分，仅对有缺失或冲突的具体项简短标注待确认。'
+              '整体视觉状态未通过不等于每一项都不清楚；可靠语音可独立支持作业要求，'
+              '清单完整性未确认也不否定已经可靠辨认的部分。不得固定追加“题号、页码及安排都不清楚”。'
+              '不罗列没有可靠依据的候选数字；'
               '禁止用普通公式、例题编号或单帧低可信数字补造作业。'
               'writing_state=stable仅表示该帧未见正在书写，不证明老师写完；最后一帧也不保证清单完整。'
               '冲突、听不清或未复核时自然说明哪一项尚不清楚，不得拼凑题号或推断截止日期。'
@@ -114,26 +118,14 @@ def _notice_section(summary):
     return None
 
 
-def _has_assignment_uncertainty(text):
-    # A doubtful formula elsewhere is not a warning about uncertain homework.
-    return any(re.search(r'作业|课务|题号|页码|清单|安排', paragraph)
-               and re.search(r'待核实|待确认|需核实|尚未确认|尚不清楚|不清晰|不清楚|无法确认|核对未完成|不完整', paragraph)
-               for paragraph in re.split(r'\n\s*\n|[。！？]', text))
-
-
 def ensure_homework_notice(summary, evidence):
     """Keep one reader-facing reminder; raw evidence stays in the ledger."""
     if not evidence or not evidence.get('candidates'):
         return summary
-    visual = evidence.get('visual', {})
-    section = _notice_section(summary)
-    if section is not None:
-        start, end = section
-        if visual.get('reference_status') != 'supported' and not _has_assignment_uncertainty(summary[start:end]):
-            notice = '题号和页码尚未确认，请以课程通知为准。'
-            tail = summary[end:].lstrip()
-            summary = summary[:end].rstrip() + '\n\n' + notice + ('\n\n' + tail if tail else '')
+    if _notice_section(summary) is not None:
+        # An aggregate image flag cannot invalidate reliable speech or a
+        # partially supported list. The model handles item-specific evidence.
         return summary
     # Keyword hits do not establish requirements, even if visible numbers agree.
     return summary.rstrip() + ('\n\n### 课程事项提醒\n\n'
-                               '作业或课务说明仍有不清楚的地方，具体要求请以课程通知为准。')
+                               '作业与课务安排请参阅课程通知。')

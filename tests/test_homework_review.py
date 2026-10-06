@@ -42,7 +42,7 @@ class AssignmentEvidenceTests(unittest.TestCase):
         self.assertIn('今天没有作业', prompt)
         summary = ensure_homework_notice('矩阵知识摘要', {'candidates': candidates})
         self.assertIn('### 课程事项提醒', summary)
-        self.assertIn('不清楚', summary)
+        self.assertNotIn('不清楚', summary)
         self.assertNotIn('原始转写块', summary)
         self.assertNotIn('今天没有作业', summary)  # Unverified raw quotes are not reader-facing facts.
         self.assertEqual(ensure_homework_notice(summary, {'candidates': candidates}), summary)
@@ -55,16 +55,17 @@ class AssignmentEvidenceTests(unittest.TestCase):
         self.assertEqual(ensure_homework_notice(summary, evidence), summary)
         self.assertEqual(ensure_homework_notice(summary, {'candidates': [{}]}), summary)
 
-    def test_warning_stays_in_existing_section_without_touching_later_math(self):
+    def test_global_image_status_does_not_override_existing_speech_requirements(self):
         later = '### 矩阵乘法\n\n公式条件待确认。'
-        summary = '### **课程事项提醒**\n\n#### 作业安排\n\n练习用于巩固矩阵运算。\n\n'+later
-        evidence = {'candidates': [{}], 'visual': {'status': 'ok'}}
-        result = ensure_homework_notice(summary, evidence)
-        self.assertEqual(result.count('题号和页码尚未确认'), 1)
-        self.assertLess(result.index('题号和页码尚未确认'), result.index('### 矩阵乘法'))
-        self.assertTrue(result.endswith(later))
-        self.assertNotIn('视觉', result)
-        self.assertEqual(ensure_homework_notice(result, evidence), result)
+        summary = '### **课程事项提醒**\n\n#### 作业安排\n\n完成第3题和第4题。\n\n'+later
+        for visual in ({}, {'status': 'ok'}, {'reference_status': 'unverified'}, {'status': 'failed'}):
+            with self.subTest(visual=visual):
+                evidence = {'candidates': [{}], 'visual': visual,
+                            'cloud': [{'status': 'complete', 'cloud_text': '完成第3题和第4题。'}]}
+                result = ensure_homework_notice(summary, evidence)
+                self.assertEqual(result, summary)
+                self.assertNotIn('题号和页码尚未确认', result)
+                self.assertEqual(ensure_homework_notice(result, evidence), result)
 
     def test_body_mentions_and_fenced_headings_cannot_hide_missing_reminder(self):
         for source in ['正文中提到作业与课务提醒。',
@@ -72,7 +73,7 @@ class AssignmentEvidenceTests(unittest.TestCase):
                        '~~~\n### 课程事项提醒\n~~~']:
             with self.subTest(source=source):
                 result = ensure_homework_notice(source, {'candidates': [{}]})
-                self.assertTrue(result.endswith('具体要求请以课程通知为准。'))
+                self.assertTrue(result.endswith('作业与课务安排请参阅课程通知。'))
                 self.assertEqual(ensure_homework_notice(result, {'candidates': [{}]}), result)
 
     def test_technical_audit_and_raw_numbers_never_leak_from_fallback(self):
@@ -90,16 +91,25 @@ class AssignmentEvidenceTests(unittest.TestCase):
 
     def test_verified_homework_and_cancellation_are_not_rewritten(self):
         summary = '### 课程事项提醒\n\n今天没有新作业，完成上次未完成的练习即可。'
-        evidence = {'candidates': [{}], 'visual': {'reference_status': 'supported'}}
-        self.assertEqual(ensure_homework_notice(summary, evidence), summary)
+        for status in ('supported', 'unverified'):
+            evidence = {'candidates': [{}], 'visual': {'reference_status': status}}
+            self.assertEqual(ensure_homework_notice(summary, evidence), summary)
         unverified = '### 作业与课务\n\n题号待核实，提交方式尚未明确。'
         self.assertEqual(ensure_homework_notice(unverified, {'candidates': [{}]}), unverified)
 
     def test_unfinished_exercises_do_not_mean_uncertain_identification(self):
         summary = '### 课程事项提醒\n\n完成上次未完成的作业。'
         result = ensure_homework_notice(summary, {'candidates': [{}]})
-        self.assertIn('完成上次未完成的作业。', result)
-        self.assertIn('题号和页码尚未确认', result)
+        self.assertEqual(result, summary)
+
+    def test_partial_requirements_keep_known_items_and_local_uncertainty(self):
+        summary = '### 作业安排\n\n完成矩阵乘法的第2题，其余题号待确认。'
+        evidence = {'candidates': [{}], 'visual': {'reference_status': 'unverified'}}
+        self.assertEqual(ensure_homework_notice(summary, evidence), summary)
+        prompt = homework_prompt(evidence)
+        self.assertIn('先写已有证据支持的具体要求', prompt)
+        self.assertIn('可靠语音可独立支持作业要求', prompt)
+        self.assertIn('仅对有缺失或冲突的具体项', prompt)
 
     def test_context_crosses_block_edge_without_changing_original_clock(self):
         raw, *_ = aligned({}, assignment_candidates(material()['full_chunks']))
