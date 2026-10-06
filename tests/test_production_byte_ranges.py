@@ -2,16 +2,37 @@
 import io
 import json
 import unittest
-from unittest.mock import MagicMock
-from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors,probe_initial_range_reuse
+from unittest.mock import MagicMock, patch
+from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors,probe_initial_range_reuse,probe_fresh_late_packets
 from urllib.parse import parse_qs,urlsplit
 
 
 class SourceByteRangeTests(unittest.TestCase):
+    def test_fresh_packet_probe_removes_old_auth_but_preserves_source_and_queries(self):
+        client=MagicMock()
+        client.sign_video_url.return_value='https://private/media.mp4?track=audio&clientUUID=new&t=new-secret'
+        client.get_stream_params.return_value=('private-vpn','Cookie: private-cookie\r\n')
+        with patch('scripts.production_media_inspection.time.time',return_value=12345), \
+             patch('scripts.production_media_inspection.probe_late_packets',return_value={'status':'complete','packets':[]}) as probe:
+            result=probe_fresh_late_packets(client,'https://private/media.mp4?track=audio&t=old-secret&clientUUID=old',4060.5,{'end_time':6565})
+        client.sign_video_url.assert_called_once_with('https://private/media.mp4?track=audio',now=12345)
+        probe.assert_called_once_with('private-vpn','Cookie: private-cookie\r\n',4060.5,{'end_time':6565})
+        self.assertTrue(result['same_media_path']);self.assertTrue(result['full_signature_refreshed'])
+        self.assertFalse(result['url_opened_before_packet_probe'])
+        for secret in ('private','secret','Cookie','12345'):
+            self.assertNotIn(secret,json.dumps(result))
+
+    def test_fresh_packet_probe_requires_unambiguous_original_signature(self):
+        client=MagicMock()
+        for url in ('https://private/media.mp4','https://private/media.mp4?t=one&t=two&clientUUID=old'):
+            self.assertEqual(probe_fresh_late_packets(client,url,4060.5,{'end_time':6565})['status'],'signature_unavailable')
+        client.sign_video_url.assert_not_called()
+
     def test_uuid_contrast_preserves_signature_timestamp_and_auth_headers(self):
         session,responses=self.session('valid')
-        result=probe_initial_range_reuse(session,'https://private/source?t=secret&clientUUID=old&now=123',
-                                        'Cookie: private-cookie\r\n',1808388390)
+        with patch('scripts.production_media_inspection.time.monotonic',return_value=0):
+            result=probe_initial_range_reuse(session,'https://private/source?t=secret&clientUUID=old&now=123',
+                                            'Cookie: private-cookie\r\n',1808388390)
         urls=[call.args[0] for call in session.get.call_args_list]
         parsed=[parse_qs(urlsplit(url).query) for url in urls]
         self.assertEqual(urls[0],urls[1]);self.assertEqual(urls[1],urls[2]);self.assertNotEqual(urls[2],urls[3])

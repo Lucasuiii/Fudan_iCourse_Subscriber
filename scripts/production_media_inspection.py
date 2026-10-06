@@ -175,7 +175,7 @@ def probe_headers(url, headers):
     # -nofind_stream_info avoids the normal packet decoding used to infer
     # missing properties. Only existing demuxer/header metadata is requested.
     began = time.monotonic()
-    process = subprocess.run(['ffprobe', '-v', 'error', '-nofind_stream_info',
+    process = subprocess.run(['ffprobe', '-v', 'trace', '-nofind_stream_info',
         '-rw_timeout', '30000000', '-headers', headers, '-show_entries', ENTRIES,
         '-of', 'json', url], capture_output=True, timeout=90)
     result = {'probe_return_code': process.returncode,
@@ -225,6 +225,30 @@ def probe_late_packets(url, headers, retained_seconds, stream):
             if math.isfinite(value):row[key]=value
         result['packets'].append(row)
     result['status']='complete'
+    return result
+
+
+def probe_fresh_late_packets(client, signed_url, retained_seconds, stream):
+    """One fresh complete signature, same media path, at most 128 packets.
+
+    Refreshing only clientUUID is insufficient to test a stale signature.
+    Do not reuse the URL already opened by the header probe. No URL or token
+    is included in the returned audit, and no audio is decoded.
+    """
+    parts = urlsplit(signed_url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if sum(k == 't' for k, _ in query) != 1 or sum(k == 'clientUUID' for k, _ in query) != 1:
+        return {'status':'signature_unavailable', 'packets':[]}
+    base = urlunsplit(parts._replace(query=urlencode([(k,v) for k,v in query
+                                                    if k not in ('t','clientUUID')])))
+    # Use the actual current clock, never an invented future ticket time.
+    refreshed = client.sign_video_url(base, now=int(time.time()))
+    target, headers = client.get_stream_params(refreshed)
+    result = probe_late_packets(target, headers, retained_seconds, stream)
+    refreshed_query = dict(parse_qsl(urlsplit(refreshed).query))
+    result.update(same_media_path=urlsplit(refreshed).path == parts.path,
+                  full_signature_refreshed=refreshed_query.get('t') != dict(query)['t'],
+                  url_opened_before_packet_probe=False)
     return result
 
 
@@ -305,6 +329,12 @@ def inspect():
                 if len(audio) == 1 and isinstance(retained, (int,float))
                 else {'status':'ambiguous_or_unavailable','packets':[]})
         payload['current_source_late_packets'] = late
+        stage = 'fresh_late_packets'
+        payload['fresh_source_late_packets'] = (
+            probe_fresh_late_packets(client, url, retained, audio[0])
+            if len(audio) == 1 and isinstance(retained, (int,float))
+            else {'status':'ambiguous_or_unavailable','packets':[]})
+        stage = 'late_packets'
         if late['status'] == 'failed': raise ValueError('Source late packet probe failed')
         if payload['current_source_byte_ranges']['status'] == 'failed':
             stage = 'byte_ranges'
