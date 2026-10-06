@@ -45,6 +45,8 @@ name: Qwen Production Pipeline Validation
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
     - 'src/ai/homework_review.py'
+    - 'prompts/lecture_summary.md'
+    - 'tests/test_summarizer_prompt.py'
     - 'src/ai/automatic_glossary.py'
     - 'src/ai/qwen_transcriber.py'
     - 'src/ai/homework_visual_evidence.py'
@@ -68,6 +70,8 @@ name: Qwen Production Pipeline Validation
   pull_request:
     paths:
     - '.github/**'
+    - 'prompts/lecture_summary.md'
+    - 'tests/test_summarizer_prompt.py'
     - 'scripts/production_*.py'
     - 'src/runtime/scheduler.py'
     - 'src/runtime/media_transport.py'
@@ -253,4 +257,4 @@ jobs:
     - name: Authentication verification and bounded HTTP source diagnostics
       run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
-      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary
+      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary test_summarizer_prompt
