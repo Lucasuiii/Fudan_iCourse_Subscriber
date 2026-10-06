@@ -381,9 +381,12 @@ class Emailer:
     def _deliver(self, msg) -> bool:
         """Deliver an already-built message without exposing recipients."""
         for attempt in range(3):
+            phase = 'connect'
             try:
-                with smtplib.SMTP_SSL(self.host, self.port) as server:
+                with smtplib.SMTP_SSL(self.host, self.port, timeout=30) as server:
+                    phase = 'login'
                     server.login(self.sender, self.password)
+                    phase = 'send'
                     rejected = server.sendmail(
                         self.sender, self.receivers, msg.as_string()
                     )
@@ -393,7 +396,7 @@ class Emailer:
                 return True
             except Exception as e:
                 print(f"[Emailer] Attempt {attempt + 1}/3 failed: "
-                      f"{type(e).__name__}")
+                      f"{type(e).__name__} (phase={phase})")
                 if attempt < 2:
                     time.sleep(2 ** attempt)
 

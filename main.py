@@ -86,11 +86,12 @@ def _in_run_scope(course_id: str, lecture: dict) -> bool:
 
 
 def _enumerate_lectures(client: ICourseClient, db: Database,
-                        reporter: Reporter) -> list[tuple[str, str, dict]]:
+                        reporter: Reporter):
     """Sync, fast: list every (course_id, course_title, lecture) we'll
     process this run.  Done up-front so the prefetch loop can see across
     course boundaries when picking the "next" lecture."""
-    out: list[tuple[str, str, dict]] = []
+    from src.runtime.enumeration import EnumerationResult
+    result = EnumerationResult()
     for course_id in config.COURSE_IDS:
         try:
             _check_session(client)
@@ -159,8 +160,10 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             new_lectures.extend(retry_only)
             reporter.course_new_count(len(new_lectures))
             if not new_lectures:
+                result.successful_courses.append(str(course_id))
                 continue
 
+            course_tasks = []
             for lecture in new_lectures:
                 sub_id = str(lecture["sub_id"])
                 db.insert_lecture(
@@ -168,11 +171,14 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
                     lecture.get("sub_title", ""),
                     lecture.get("date", ""),
                 )
-                out.append((course_id, course_title, lecture))
+                course_tasks.append((course_id, course_title, lecture))
+            result.lectures.extend(course_tasks)
+            result.successful_courses.append(str(course_id))
         except Exception as e:
+            result.failed_courses.append(str(course_id))
             reporter.course_enumeration_error(course_id)
             reporter.info(f"  Error type: {type(e).__name__}")
-    return out
+    return result
 
 
 def _drive_lectures(client: ICourseClient, db: Database,
@@ -429,10 +435,10 @@ def run():
     scheduler = Scheduler(reporter=reporter)
 
     try:
-        all_lectures = _enumerate_lectures(client, db, reporter)
+        enumeration = _enumerate_lectures(client, db, reporter)
         _drive_lectures(
             client, db, scheduler, transcriber, summarizer, reporter,
-            all_lectures, email_items,
+            enumeration.lectures, email_items,
         )
 
     finally:
@@ -446,6 +452,7 @@ def run():
     if not config.RERUN_TARGET_IDS:
         _send_failure_notices(emailer, db, reporter)
     reporter.run_footer()
+    enumeration.require_success()
 
 
 if __name__ == "__main__":

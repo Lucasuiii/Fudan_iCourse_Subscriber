@@ -41,9 +41,6 @@ _decrypted_dump/
 _backup_test.gz.enc
 _backup_reencrypted.gz.enc
 
-docs/*
-!docs/*.png
-!docs/frontend-readme.md
 docs/specs/
 *.mp3
 bugs.md

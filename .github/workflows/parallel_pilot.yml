@@ -178,6 +178,14 @@ jobs:
         overwrite: true
         if-no-files-found: ignore
     - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-plan-audit
+        path: ${{ runner.temp }}/qwen-shards/out/plan-audit.json
+        retention-days: 7
+        overwrite: true
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
       if: ${{ always() && inputs.validation_course_id != '' }}
       with:
         name: qwen-validation-selection

@@ -85,12 +85,22 @@ function _highlightSnippet(text, query, radius) {
   if (!text || !query) return "";
   const plain = ICS.render.plainSnippet(text, 99999);
   const idx = plain.toLowerCase().indexOf(query.toLowerCase());
-  if (idx === -1) return plain.slice(0, 120) + "...";
+  if (idx === -1) return ICS.render.sanitizeHighlight(
+    ICS.render.escapeHtmlText(plain.slice(0, 120) + "..."), plain.slice(0, 120) + "...");
   const s = Math.max(0, idx - radius);
   const e = Math.min(plain.length, idx + query.length + radius);
   let snip = (s > 0 ? "..." : "") + plain.slice(s, e) + (e < plain.length ? "..." : "");
   const re = new RegExp("(" + query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
-  return snip.replace(re, "<mark>$1</mark>");
+  // Match original text, then escape every text segment separately. Escaping
+  // before matching would corrupt queries containing <, &, or HTML entities.
+  let html = "", offset = 0;
+  for (const match of snip.matchAll(re)) {
+    html += ICS.render.escapeHtmlText(snip.slice(offset, match.index));
+    html += "<mark>" + ICS.render.escapeHtmlText(match[0]) + "</mark>";
+    offset = match.index + match[0].length;
+  }
+  html += ICS.render.escapeHtmlText(snip.slice(offset));
+  return ICS.render.sanitizeHighlight(html, snip);
 }
 
 function _formatTimestamp(seconds) {

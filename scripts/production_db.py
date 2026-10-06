@@ -42,10 +42,11 @@ def snapshot(db, path):
 
 def lecture_snapshot(db, path, course_id, sub_id):
     snapshot(db, path)
-    with sqlite3.connect(path) as conn:
-        conn.execute('DELETE FROM courses WHERE course_id != ?', (str(course_id),))
-        conn.execute('DELETE FROM lectures WHERE sub_id != ?', (str(sub_id),))
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('DELETE FROM ppt_pages WHERE sub_id != ?', (str(sub_id),))
+        conn.execute('DELETE FROM lectures WHERE sub_id != ?', (str(sub_id),))
+        conn.execute('DELETE FROM courses WHERE course_id != ?', (str(course_id),))
         conn.execute('DELETE FROM all_courses')
         allowed = ('qwen_pipeline:'+str(sub_id), 'auto_glossary:'+str(course_id)+':'+str(sub_id))
         conn.execute('DELETE FROM meta WHERE key NOT IN (?, ?)', allowed)

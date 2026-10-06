@@ -15,6 +15,17 @@ window.ICS = window.ICS || {};
 var _FORMULA_PLACEHOLDER_PREFIX = "";
 var _FORMULA_PLACEHOLDER_SUFFIX = "";
 
+function _escapeHtmlText(text) {
+  return String(text).replace(/[&<>"']/g, ch => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function _sanitizeHighlight(html, plainText) {
+  if (!window.DOMPurify) return _escapeHtmlText(plainText);
+  return DOMPurify.sanitize(html, { ALLOWED_TAGS: ["mark"], ALLOWED_ATTR: [] });
+}
+
 /** Replace $...$ and $$...$$ with placeholders so marked won't touch them. */
 function _stashFormulas(mdText) {
   var formulas = [];
@@ -57,7 +68,7 @@ function _renderMarkdown(mdText) {
   var stashed = _stashFormulas(mdText);
   var rawHtml = marked.parse(stashed.text, { breaks: true });
   var restored = _restoreFormulas(rawHtml, stashed.formulas);
-  return DOMPurify.sanitize(restored);
+  return DOMPurify.sanitize(restored, { USE_PROFILES: { html: true } });
 }
 
 function _activateKaTeX(element) {
@@ -96,4 +107,6 @@ window.ICS.render = {
   renderMarkdown: _renderMarkdown,
   activateKaTeX: _activateKaTeX,
   plainSnippet: _plainSnippet,
+  escapeHtmlText: _escapeHtmlText,
+  sanitizeHighlight: _sanitizeHighlight,
 };

@@ -3,7 +3,7 @@
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.runtime import config
 from src.data.schema import (
@@ -29,6 +29,10 @@ class Database:
         self.db_path = db_path or config.DB_PATH
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        if self.conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            self.conn.close()
+            raise RuntimeError("SQLite foreign-key enforcement unavailable")
         # WAL gets readers (the frontend's read-only export step, or the
         # status badge in long runs) off the writer's lock chain, so the
         # nightly run's many small writes don't block ad-hoc reads.  Pair
@@ -111,7 +115,7 @@ class Database:
         We delete-then-upsert under one transaction so the term's catalog
         is never half-empty during a concurrent frontend export.
         """
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         keep_ids = {str(r["course_id"]) for r in rows if r.get("course_id")}
         with self._lock, self.conn:
             if keep_ids:
@@ -178,16 +182,13 @@ class Database:
         self, sub_id: str, course_id: str, sub_title: str, date: str
     ) -> bool:
         """Insert a new lecture. Returns True if inserted, False if already exists."""
-        try:
-            with self._lock, self.conn:
-                self.conn.execute(
-                    """INSERT INTO lectures (sub_id, course_id, sub_title, date)
-                       VALUES (?, ?, ?, ?)""",
-                    (sub_id, course_id, sub_title, date),
-                )
-            return True
-        except sqlite3.IntegrityError:
-            return False
+        with self._lock, self.conn:
+            cursor = self.conn.execute(
+                """INSERT INTO lectures (sub_id, course_id, sub_title, date)
+                   VALUES (?, ?, ?, ?) ON CONFLICT(sub_id) DO NOTHING""",
+                (sub_id, course_id, sub_title, date),
+            )
+        return cursor.rowcount == 1
 
     def get_processed_sub_ids(self, course_id: str) -> set[str]:
         """Return sub_ids that have been fully processed."""
@@ -241,21 +242,21 @@ class Database:
         with self._lock, self.conn:
             self.conn.execute(
                 "UPDATE lectures SET processed_at = ? WHERE sub_id = ?",
-                (datetime.now().isoformat(), sub_id),
+                (datetime.now(timezone.utc).isoformat(), sub_id),
             )
 
     def mark_emailed(self, sub_id: str):
         with self._lock, self.conn:
             self.conn.execute(
                 "UPDATE lectures SET emailed_at = ? WHERE sub_id = ?",
-                (datetime.now().isoformat(), sub_id),
+                (datetime.now(timezone.utc).isoformat(), sub_id),
             )
 
     def mark_emailed_batch(self, sub_ids: list[str]):
         """Mark multiple lectures as emailed in a single transaction."""
         if not sub_ids:
             return
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock, self.conn:
             self.conn.executemany(
                 "UPDATE lectures SET emailed_at = ? WHERE sub_id = ?",
@@ -312,7 +313,7 @@ class Database:
         """Record a successfully delivered failure notice."""
         if not sub_ids:
             return
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock, self.conn:
             self.conn.executemany(
                 """UPDATE lectures
@@ -354,7 +355,7 @@ class Database:
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock, self.conn:
             found = self.conn.execute(
                 f"""SELECT COUNT(*) FROM lectures
@@ -396,7 +397,7 @@ class Database:
                 """UPDATE ppt_pages
                    SET text = ?, ocr_status = ?, ocr_at = ?
                    WHERE sub_id = ? AND page_num = ?""",
-                (text, status, datetime.now().isoformat(), sub_id, page_num),
+                (text, status, datetime.now(timezone.utc).isoformat(), sub_id, page_num),
             )
 
     def update_ppt_page_dhash(self, sub_id: str, page_num: int,
