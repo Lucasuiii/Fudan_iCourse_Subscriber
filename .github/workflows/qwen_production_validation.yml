@@ -31,7 +31,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
@@ -61,6 +61,7 @@ name: Qwen Production Pipeline Validation
     - 'tests/test_webvpn_auth_diagnostics.py'
     - 'tests/test_production_byte_ranges.py'
     - 'tests/test_audio_timeline.py'
+    - 'tests/test_audio_preparation_budget.py'
     - 'tests/test_homework_review.py'
     - 'tests/test_shared_asr_queue.py'
     - 'tests/test_automatic_glossary.py'
@@ -82,6 +83,7 @@ name: Qwen Production Pipeline Validation
     - 'tests/test_webvpn_auth_diagnostics.py'
     - 'tests/test_production_byte_ranges.py'
     - 'tests/test_audio_timeline.py'
+    - 'tests/test_audio_preparation_budget.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'
     - 'src/pipeline/**'
@@ -257,7 +259,7 @@ jobs:
     - name: Prepared audio volumes, artifact transfer and failure retention
       run: python -m unittest discover -s tests -p test_qwen_prepared_bundle.py
     - name: Original shard invariants and independent course scheduling
-      run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
+      run: PYTHONPATH=tests python -m unittest test_audio_timeline test_audio_preparation_budget test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Authentication verification and bounded HTTP source diagnostics
       run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
