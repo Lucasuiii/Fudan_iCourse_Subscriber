@@ -1,282 +1,188 @@
-# iCourse Subscriber V2
+# Fudan iCourse Subscriber
 
-> [!NOTE]
-> 当前为 `codex/qwen-production-pilot` 试运行分支，尚未合并 main。
-> 本地识别统一为 Qwen3-ASR-1.7B；完整课堂端到端验证尚未完成。
-> 运行约束见 [Qwen 运行说明](docs/qwen-only-runtime.md)；main 的线上定时任务不变。
-> 已接入分支的 [正式分片处理链](docs/parallel-course-pilot.md)：默认两路，最多 5 个活跃课次、15 个 Runner，复用 `LectureRunner` 保存与恢复；main 线上不变。
-> [隔离对照入口](docs/qwen-sharded-pilot.md) 继续保留；新正式链尚待真实课堂集成验证。
+自动检查复旦大学 iCourse 的课程更新，将录播语音、课件和板书整理成中文课程笔记，按课程发送邮件，并提供加密数据查看器。
 
-> [!IMPORTANT]
-> 本 Fork 对个人信息保护做了加固，并支持私密课次白名单、按课程分别发信和
-> Markdown 附件。课程获取及录播开放时间处理保持上游行为。部署前请先阅读
-> [PERSONAL_DEPLOYMENT.md](PERSONAL_DEPLOYMENT.md)。
+项目运行在 GitHub Actions 上，不需要让本地电脑持续开机。当前 `main` 已包含 Qwen 本地识别、单堂课跨 Runner 并行、共享识别队列、作业多帧读图和课程术语库。
 
-自动监控复旦大学 iCourse 智慧教学平台的课程更新，对新课次的录播视频进行**语音转文字 + PPT OCR + AI 摘要**，并通过邮件推送到你的邮箱。
+仅用于本人有权访问的课程和个人学习。账号、模型密钥、邮箱信息及数据库密钥通过 Actions Secrets 配置；不要公开传播录播、转录或课程笔记。部署前请阅读 [个人部署说明](PERSONAL_DEPLOYMENT.md)。
 
-部署在 GitHub Actions 上，每天定时运行，免服务器；云端 ASR 与大模型可能产生费用。
+## 功能与默认行为
 
-> [!NOTE]
-> 本项目严禁大规模传播（例如，不准分享到树洞、班级群、大群等地），否则信息办可能随时ban掉该项目。
-> 如果该项目对你有用，请点个**star**⭐作为对作者的鼓励，并将项目**单独**分享给你的好朋友。
+| 功能 | 当前行为 |
+| --- | --- |
+| 课程订阅 | 按课程 ID 扫描；支持课次白名单、固定课时排除和调课日期例外 |
+| 本地识别 | **Qwen3-ASR-1.7B**；Silero VAD 跳过长时间无讲话区间，再切成约两分钟的块 |
+| 单堂课并行 | 默认固定两路；可选按音频量分片或共享队列，最多 5 个活跃课次、15 个处理 Runner |
+| 疑难复核 | 豆包仅处理疑难短片段；每堂课共享 **600 秒／20 段**，不要求用满 |
+| 课件与作业 | PPT OCR；作业提示附近多帧直接读图，失败时回退本地 OCR |
+| 课程笔记 | 按讲授脉络组织分级标题、正文和公式；保留可靠的作业要求、题号及页码 |
+| 术语提示 | 使用人工基础词表；自动候选／确认词库**默认关闭**，同堂冻结词表 |
+| 保存与恢复 | 加密数据库、音频哈希和检查点；正式处理链重试复用成功块及复核额度 |
+| 邮件 | 每门课程分别发送；HTML 正文及 PDF 附件，PDF 失败时回退 Markdown 附件 |
 
+官方字幕仅作辅助，不替代 Qwen 转录。SenseVoice、FireRed 和 Zipformer 已不作为本地识别后端。
 
-## 它能做什么？
-
-假设你选了「摸鱼学导论」和「躺平学原理」两门课。在每天设定的时间，iCourse Subscriber 会自动：
-
-1. 登录你的复旦 iCourse 账号（通过 WebVPN）
-2. 检查这两门课是否有新的录播视频
-3. 如果有：先用本地 Qwen3-ASR-1.7B 识别；检测到人声但识别为空/极少字的片段先补救，再结合转写和 PPT 做一次大模型疑点检查，把选中的短片段交给豆包 Seed-ASR 2.0。作业或课务关键词先定位前后音频，优先交给豆包复核，并对附近截图/视频画面做 OCR；题号、页码和提交要求不清时保留待核实提示。所有补救共享每节课最多 10 分钟、20 段的上限。没有检测到人声时不为填补整段空白而上传。录播标称时长与实际音频不一致时检查有效内容，不只凭时长比例跳过；官方字幕仅作辅助 → AI 生成课程笔记
-4. 每门课程单独发送一封邮件，并附带该课程的 Markdown 笔记
-
-邮件正文包含专业排版的 Markdown 渲染内容（含 LaTeX 公式渲染），并附带可归档的
-`.md` 文件。如果老师提到了作业、考试、签到、组队等重要课程事项，会在笔记开头
-醒目标注。
-
-
-### 课程术语参考
-
-`prompts/course_glossary.json` 为疑点检查和笔记整理提供每课候选术语，默认配置数值算法与案例分析 I、高等代数 I、数据结构（H）。`courses` 填完整课程名或别名；匹配时忽略空白、大小写及全半角/罗马数字形式，不做模糊匹配。`terms` 是术语字符串列表，每课最多采用 30 个，每词最多 40 字。可以为其他课程新增条目，不要填写账号、密钥或私人信息。
-
-本分支把词表作为 Qwen 识别与豆包复核的上下文提示，并为笔记整理提供参考；不做全局同音词替换。词表不证明老师讲过某内容。自动课程词库默认关闭，开启后的证据约束见 [自动课程术语库](docs/automatic-course-glossary.md)。未配置的课程、缺失或无效人工词表继续使用原流程。每课每次运行的豆包补救仍共享 10 分钟/20 段上限。
-
-### 可选共享识别队列
-
-手动入口可选择 `shard_mode=shared`，让本堂课的空闲 Runner 动态领取原始音频块。按待识别量使用 1–3 台，保留总并发 15、时间戳、完整性校验和失败恢复；真实课堂的收益仍待对照验证。定时入口和手动默认仍使用固定两路。配置、恢复及保留期限见 [共享 ASR 队列](docs/shared-asr-queue.md)。
-
-正式 pilot 的媒体提取使用[签名更新与字节范围续传](docs/signed-media-transport.md)：每次源请求更新完整签名，短读时只补未收到的字节，源文件标识变化或不可核对时停止。原始时间戳、音频哈希和完整性检查保持；真实整课修复效果仍需验证。
-
-## 快速部署（5 分钟）
-
-### 第 1 步：Fork 本仓库
-
-点击页面右上角的 **Fork** 按钮，将仓库复制到你的 GitHub 账号下。
-
-### 第 2 步：配置 Secrets
-
-进入你 Fork 后的仓库，点击 **Settings → Secrets and variables → Actions → New repository secret**，逐个添加以下 Secret：
-
-| Secret 名称 | 必填 | 说明 | 示例 |
-|---|---|---|---|
-| `STUID` | ✅ | 复旦学号 | `22307110000` |
-| `UISPSW` | ✅ | UIS 统一身份认证密码 | `your_password` |
-| `COURSE_IDS` | ✅ | 要监控的课程 ID，多个用英文逗号分隔 | `35472,30251` |
-| `COURSE_SESSION_RULES` | ⬜ | 私密课次白名单；未列出的课程处理全部课次 | `35472=周一第1-2节|周三第6-8节` |
-| `COURSE_SESSION_EXCLUSIONS` | ⬜ | 私密固定课时排除；重叠课时不识别，日期例外不恢复被排除课时 | `35472=周一第6-10节` |
-| `COURSE_SESSION_OVERRIDE_DATES` | ⬜ | 调课/补课日期例外；这些日期临时绕过课次白名单 | `2026-09-20` |
-| `DB_ENCRYPTION_KEY` | ✅ | 独立数据库密钥；用 `openssl rand -hex 32` 生成 | `64位随机十六进制字符串` |
-| `DASHSCOPE_API_KEY` | ⬜ | ModelScope 平台 API Key | `ms-xxxxxxxx` |
-| `DEEPSEEK_API_KEY` | ⬜ | DeepSeek API Key（推荐） | `sk-xxxxxxxx` |
-| `DOUBAO_ASR_API_KEY` | ⬜ | 豆包语音新版控制台的 API Key；配置后仅补救本地识别困难的短片段，每课最多上传 10 分钟；未配置时完全使用本地 ASR | 请勿写入仓库 |
-| `TAVILY_API_KEY` | ⬜ | 可选，疑点处最多两次基础网页检索；不传完整课程材料 | `tvly-xxxxxxxx` |
-| `GEMINI_API_KEY` | ⬜ | Gemini API Key | `AIza...` |
-| `SMTP_EMAIL` | ✅ | 用于发送邮件的 QQ 邮箱 | `123456@qq.com` |
-| `SMTP_PASSWORD` | ✅ | QQ 邮箱 SMTP **授权码**（不是登录密码） | `abcdefghijklmnop` |
-| `RECEIVER_EMAILS` | ✅ | 接收摘要邮件的邮箱，多个用英文逗号分隔 | `first@example.com,second@example.com` |
-| `RECEIVER_EMAIL` | ⬜ | 兼容旧部署的单个收件邮箱 | `you@m.fudan.edu.com` |
-
-> 至少配置一个 LLM API Key（DASHSCOPE、DEEPSEEK 或 GEMINI）。程序按配置顺序自动回退尝试。如果需要选择其他的LLM供应商，可以在`src\runtime\config.py`路径下自定义供应商。
-
-云端 ASR 另需在豆包语音控制台开通录音文件识别模型 2.0 标准版
-（`volc.seedasr.auc`）。体验中心试用与 API 开通、计费应分别核对；不配置
-`DOUBAO_ASR_API_KEY` 时仍可完全使用本地 ASR。
-本分支未使用经校准的 Qwen 逐字置信度。大模型依据上下文断裂、重复噪声或术语疑点提出复核候选，只能逐字引用已有识别块中的原文，再由完整块强制对齐定位；定位失败不上传，无法保证发现所有错字。检查使用现有首选 LLM，每课最多一次请求（输入不超过 96,000 字符，最多 3,000 输出 tokens）；检查失败时继续用已有转写。豆包复核版本单独提供给摘要，不无条件覆盖原文。没有配置豆包 Key 时不做这次额外检查。运行日志会报告每课尝试上传的音频秒数；这不等于平台最终计费用量。正式分片链的失败恢复沿用整堂课已有额度，未知云端调用不退款、不自动重复上传。
-
-### 第 3 步：获取课程 ID
-
-登录 [iCourse 网页版](https://icourse.fudan.edu.cn)，进入你要监控的课程页面，URL 中的数字就是课程 ID：
-
-![课程id如图所示](docs/courseid.png)
-
-多门课用英文逗号隔开：`35472,30251,40123`
-
-### 第 4 步：获取 API Key
-
-选择一个或多个模型服务商：
-
-| 服务商 | 获取方式 | 免费额度 |
-|---|---|---|
-| **ModelScope**（`DASHSCOPE_API_KEY`） | [API 密钥管理](https://modelscope.cn/my/myaccesstoken) | 每天 2000 次免费调用，推荐 |
-| **DeepSeek**（`DEEPSEEK_API_KEY`） | [DeepSeek Platform](https://platform.deepseek.com/) | 注册赠额度 |
-| **Gemini**（`GEMINI_API_KEY`） | [Google AI Studio](https://aistudio.google.com/) | flash模型每日免费额度 |
-
-### 第 5 步：获取 QQ 邮箱 SMTP 授权码
-
-1. 登录 [QQ 邮箱](https://mail.qq.com) → 设置 → 账户与安全 → 安全设置
-2. 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV 服务」
-3. 开启 SMTP 服务，按提示获取**授权码**（16 位字母）
-4. 将授权码填入 `SMTP_PASSWORD`
-
-### 第 6 步：运行
-
-- **自动运行**：每天 17:07（北京时间）主运行；若当天主任务仍未开始或已经失败，
-  20:07 执行保底任务
-- **手动触发**：进入仓库 → Actions → **iCourse Check** → Run workflow。`Single Run`
-  也默认读取官方字幕，但只用于完整度参考和谨慎补缺。
-
-同一课次连续失败三次后会暂停自动重试，并向收件邮箱发送一次不含异常原文和签名
-URL 的失败摘要。需要重试时运行 `Single Run`，勾选
-`Retry all paused failed lectures`；该开关不会在公开参数中暴露课程或课次 ID。
-
-每门课程单独发送邮件，正文为 HTML，并附带由相同 HTML 渲染的 PDF；PDF 失败时
-自动回退为 Markdown 附件。首次运行会处理所有已有录播，后续只处理新增课次。详细的隐私配置步骤见
-[个人部署说明](PERSONAL_DEPLOYMENT.md)。
-
-## 前端页面（索引与查看）
-
-![alt text](docs/frontend.png)
-
-本 Fork 的 GitHub Pages 前端直接使用独立 `DB_ENCRYPTION_KEY` 解密数据库，不再索取
-或保存 UIS 凭证。PAT 和数据库密钥只保存在当前标签页的 `sessionStorage`，关闭标签页
-后失效。课程页支持按课次导出，以及清除摘要/转录/OCR 后永久忽略该课次。
-
-> [!TIP]
->
-> ## V2 更新说明
->
-> - 重构了代码架构，清晰的分层化设计。
->
-> - 原 V2 引入了 SenseVoice、FireRed 与 Zipformer 插件后端；本试运行分支已统一使用 Qwen3-ASR-1.7B，sherpa-onnx 仅用于 VAD。
->
-> - 引入了 PPT OCR 流水线和清洗机制，通过 PPT 信息引导模型生成更丰富的课程总结。
->
-> - 引入新的调度系统，以改善 GitHub Actions 低核数环境下的吞吐与稳定性。
->
-> - 更新了数据库结构，从原本的单文件数据库演进为按课程约 10MB 的分片结构，支持前端增量加载与按需读取，降低课程加载开销。
->
-> - 新增 GitHub Pages 前端查看器，支持加密数据库浏览、订阅编辑器与 PDF 导出等功能。
->
-> - 更新了 LLM 调度逻辑，将原本的单一 provider 调用改为多 provider 列表式自动回退机制。
->
-> - 设计了完善的版本过渡机制，V1 可以直接升级为 V2，程序会自动处理所有兼容性问题。
-
-
-> [!CAUTION]
-> **⚠️ 合规使用声明**
->
-> 本项目的设计初衷仅为辅助本校学生进行**个人的日常学习与复习**与进行技术交流。程序采用"封闭容器、流式处理、阅后即焚"的架构，默认不保存任何视频文件。任何人在部署和使用本项目时，必须严格遵守《复旦大学智慧教学资源平台使用规范》及相关校纪校规。**严禁使用者利用本程序进行以下违规操作，一切因滥用导致的账号封禁或纪律处分（如通报批评、限制平台权限等），均由使用者自行承担，与本仓库及作者无关：**
->
-> * **严禁二次分发与传播**：《规范》第二部分明确指出，平台教学资源属于职务作品，未经许可不得传播。**禁止**将推送到你邮箱的课程摘要、转录文本或笔记转发给他人，或发布到任何公共网络平台。
-> * **严禁修改代码非法下载视频**：《规范》严禁未经许可对平台资源进行复制和下载。基于此，本项目并不留存视频，**严禁**任何人修改源代码将受版权保护的课程录播违规下载、保存到任何本地或云端存储介质。
-> * **严禁解密或泄露数据库**：仓库中的 `icourse.db.enc` 仅用于程序追踪课次进度避免重复计算。**严禁**手动解密该数据库以提取、滥用或公开其中的转录和摘要文本信息。
-> * **注意账号环境安全**：本程序会使用你的 UIS 凭证进行云端 WebVPN 自动化登录，有触发异地登录风控的可能。请妥善保管个人 Secret，因使用云端自动化服务导致的账号异常风险由使用者自行评估。
->
-> **当你 Fork 并配置 Secret 运行本项目时，即代表你已知晓上述风险，并承诺仅在授权范围内为个人学习目的使用本工具，遵守相关校纪校规。**
-
-
----
-
-## 技术说明
-
-以下调度器与 SenseVoice 性能数据保留为历史设计说明，不作为本分支 Qwen 的性能或实现结论。当前运行参数以 [Qwen 运行说明](docs/qwen-only-runtime.md) 和源码为准。
-
-> 以下部分是对本项目技术细节和设计的讨论，欢迎感兴趣的技术读者阅读。
-
-### 调度器：CPU 反馈闭环
-
-OCR 和 ASR 是两个 CPU-bound 工作负载，在 4 核 GitHub Actions runner 上需要共享算力。RapidOCR 每处理一页 PPT 图片约需 1 秒，保持单核 100% 占用；sherpa-onnx ASR 使用 4 线程 ONNX 推理，需要多核。ASR 的优先级高于 OCR——转录延迟会导致音频流中断。
-
-动态信号量：标准库 BoundedSemaphore 不支持在运行时调整并发上限。DynamicSemaphore 在线程安全的基础上增加了 `set_target(n)` 方法，允许在运行时调高/调低并发目标。正在执行的 worker 不受影响（自然结束后不再补充），等待中的 worker 在 target 上调时被唤醒。
-
-资源监控：ResourceMonitor 每秒采样 `psutil.cpu_percent()`，执行迟滞判断（hysteresis control）：当 CPU > 95% 且 target 尚未到达下限时递减 OCR 并发；当 CPU < 75% 且 target 尚未到达上限时递增。双阈值（95%/75%）制造了一个 20% 宽的死区（deadband），避免系统在单个阈值附近震荡。这套逻辑本质上是一个 bang-bang 控制器。
-
-```mermaid
-flowchart TB
-    subgraph Pools["并发池"]
-        IP["图片下载池<br>20 workers (IO-bound)"]
-        OP["OCR 池<br>8 workers (CPU-bound)"]
-        AP["音频下载<br>BoundedSemaphore(2)"]
-    end
-
-    subgraph Control["控制层"]
-        RM["ResourceMonitor<br>每秒采样 CPU%"]
-        DS["DynamicSemaphore<br>当前 target: 1-2"]
-    end
-
-    subgraph Signal["ASR 阶段信号"]
-        SA["set_asr_active(True/False)"]
-    end
-
-    RM -->|CPU > 95% ↓| DS
-    RM -->|CPU < 75% ↑| DS
-    SA -->|限制上限| DS
-    DS -->|门控| OP
-
-    style Control fill:#fff0f0,stroke:#d03030
-```
-
-OCR_MAX_TARGET 设为 2 而非 8 的原因是：实际运行数据表明，RapidOCR 在 4 核机器上从未超过 2 个并发 worker——其余核心被 ASR 的 4 线程 ONNX 推理占满。更高的 target 仅导致 ResourceMonitor 频繁调整目标值，对吞吐无贡献。
-
-ASR 阶段通过 `set_asr_active(True/False)` 向调度器主动声明状态。这是一个简单的布尔标志位，不需要细粒度的上下文切换，因为 ASR 和 OCR 是两个完全独立的阶段——ASR 运行时没有 OCR 依赖，反之亦然。
-
-音频下载器使用 `BoundedSemaphore(2)` 限制并发 ffmpeg 数量。2 是理论最小值：当前转录课次需要一路，预取课次需要另一路。在 runner 的网络带宽下，两路 ffmpeg 公平共享带宽，各获得约 10 MB/s，远高于 ASR 消费速率。
-
-### 语音识别：后处理优于更好的模型
-
-该模块经历了 SenseVoice → FireRed → SenseVoice 的三次选择。FireRed 的转录文本更"干净"（纯中文 + 英文，无跨语种污染），但 SenseVoice 的实时倍率约 25x，FireRed 仅约 6x。在 348 节课的批量场景中，FireRed 的 ASR 总时长为 2h41m，SenseVoice 降至约 37m。当将两种模型的输出分别输入 DeepSeek-V4-Pro 生成摘要时，LLM 的摘要质量差异不显著——LLM 自动忽略了 SenseVoice 混入的日语假名和韩语谚文。
-
-最终选择 SenseVoice 并附加后处理。后处理函数在每条 ASR segment 加入 segments 列表前执行多级清洗：删除日语假名和平假名/片假名 Unicode 区块、删除韩语谚文 Unicode 区块、删除英文 filler word 白名单（yeah, okay, uh, um, hmm 等）、删除 `<sil>` 和 `<|zh|>` 等 bracket token。技术英文（CNN, YOLO, Transformer）通过 `\b` 单词边界匹配不受影响。
-
-每条清洗规则都经过 7 节课 × 5 门课的真实 OCR 数据验证。选择保留"well"——"well-defined"、"well-known"在技术英文中合法。
-
-VAD 参数调优：Silero VAD 的默认 `min_silence_duration=0.25s` 在课堂场景中将老师的换气、翻页、停顿都切分为独立片段。每个片段需要一次 ASR decode，且 SenseVoice 在短片段（2-3s）上的语言检测倾向于误判为日语（因为缺乏上下文）。将参数调至 0.8s，并将 `max_speech_duration` 设为 30.0s（匹配 SenseVoice 训练感受野）。片段数量减少约 60%，日语误判率大幅下降。
-
-### PPT 流水线：计算成本驱动的去重策略
-
-iCourse 录播系统每 20-30 秒截取桌面截图。90 分钟课程产生约 200-300 张图片，其中大量是同一张幻灯片的重复截图。直接 OCR 全部图片将浪费大量计算时间和 LLM prompt token 预算。
-
-去重采用两阶段策略：先以 dHash 感知哈希做粗筛，再以 OCR 文本分类做精筛。dHash 的计算成本约每张几毫秒，而 OCR 约每张 1 秒——因此在 OCR 之前执行。
+## 处理流程
 
 ```mermaid
 flowchart LR
-    A["PPT 图片"] --> B["dHash 感知哈希<br>每张 ~5ms"]
-    B --> C["滑动窗口去重<br>窗口=5, 阈值=2bit"]
-    C -->|丢弃 50-80%| D["OCR 识别<br>每张 ~1s"]
-    C -->|保留| D
-    D --> E["invalid 页面检测<br>特征子串匹配"]
-    E -->|噪声屏| F["丢弃"]
-    E -->|合法内容| G["UI 噪声清洗<br>停用词按行匹配"]
-    G --> H["送入 LLM prompt"]
-
-    style B fill:#e8f5e9
-    style D fill:#fff9c4
+    A[扫描与筛选课次] --> B[获取音频并校验完整性]
+    B --> C[VAD 与原始分块]
+    C --> D[多个 Runner 识别]
+    D --> E[本堂全部块完成]
+    E --> F[疑难复核与作业读图]
+    F --> G[生成笔记并保存]
+    G --> H[按开关发布与发信]
 ```
 
-滑动窗口去重有一个关键实现细节：已丢弃的页面不成为锚点。防止级联效应——如果第 1 页与第 3 页相似（第 3 页被丢弃），第 2 页与第 4 页相似但第 1 页与第 4 页无关，我们不希望第 1 页引发第 3 页被丢弃后，第 3 页又作为锚点引发第 4 页被丢弃。
+每堂课完成后独立汇总，无需等待其他课程识别结束；邮件在本批课次处理结束后按课程发送。各块保留源时间戳，汇总统一排序和边界去重。正式音频获取会更新媒体签名、校验字节范围和源标识；存在读取错误或显著时长缺口时停止，避免把截断录播作为完整课堂发布。
 
-OCR 之后执行 invalid 页面检测：通过特征子串匹配（约 20 条模式，如"请不要关闭设备""cfdfudaneducn""智慧教学资源平台使用规范"）识别教室桌面壁纸和 iCourse 资源平台启动页。归一化去掉所有非字母数字字符以容忍 OCR 轻微变异。
+## 快速开始
 
-PPT 功能区 UI 噪声清洗：PowerPoint 功能区标签（"文件""开始""插入""设计"……）每次截图都被 OCR 识别，占用了 8-18% 的 LLM prompt token。清洗采用按行精确匹配策略，而非子串匹配——例如"选择"在功能区是按钮，在生物学"自然选择"中是正常文本。功能区标签在截图中独占一行，而同一词汇出现在课程内容中时周围有其他文字。100+ 条停用词在 7 节课 × 5 门课数据中零误删。
+### 1. Fork 并启用 Actions
 
-### 数据库持久化：三环境兼容的加密 + 内容寻址分片
+Fork 本仓库，在自己的仓库中启用 GitHub Actions。先配置下列 Secrets，再手动运行工作流；首次处理可能包括所有符合筛选条件且尚未处理的历史录播，建议先只订阅一门课程。
 
-GitHub Actions 每次在全新容器中运行，无法依赖本地文件系统持久化。解决方案是独立的 `data` 分支，每次运行结束时加密推送数据库，下次运行时拉取解密。
+### 2. 配置凭据和课程
 
-本 Fork 的持久化数据库使用独立 `DB_ENCRYPTION_KEY`，避免数据库加密强度与 UIS
-密码绑定。未配置该 Secret 时仅保留旧版 UIS 派生方式作为兼容回退；新的个人部署
-必须配置独立密钥。前端由用户在当前会话中直接输入该密钥，明文不写入持久化存储。
+进入 **Settings → Secrets and variables → Actions**，添加 Repository secrets。
 
-分片的动机是增量传输。数据库约 20MB，通过 GitHub API 完整拉取会显著增加前端加载时间。按课程分组切割为 ~10MB 的 shard，每个独立加密。前端使用 git blob SHA 作为缓存键存储于 IndexedDB，未变化的 shard 自动跳过网络下载、解密、解压。
+| Secret | 用途 |
+| --- | --- |
+| `STUID` | 复旦学号 |
+| `UISPSW` | UIS 统一身份认证密码 |
+| `COURSE_IDS` | 订阅课程 ID，使用英文逗号分隔，如 `12345,23456` |
+| `DB_ENCRYPTION_KEY` | 独立随机数据库密钥，用于保存与查看加密数据 |
 
-并发保护：所有会写入 `data` 分支的 workflow 共用同一 concurrency group，按顺序
-执行。发布前重新读取远端并由 `merge_db.py` 做 field-level COALESCE 合并，随后执行
-SQLite 完整性检查；最终使用普通 fast-forward push 保留历史。如果远端在发布窗口内
-发生意外变化，推送会安全失败而不会强制覆盖。
+数据库密钥可在本地终端生成：
 
-Schema 迁移：新增列时，旧的 shard 与新的 schema 之间存在列数不匹配的兼容性问题。`_migrate_shard_schema()` 在 INSERT 之前对每个 attached shard 执行 PRAGMA table_info 差集检查并通过 ALTER TABLE ADD COLUMN 补齐，将 schema 迁移与 shard 管理解耦。
+```bash
+openssl rand -hex 32
+```
 
-### 前端：在静态页面中解密远程数据库
+将输出保存到 Secret，并自行妥善备份。不要提交到仓库，也不要用 UIS 密码代替；丢失密钥后无法读取已有数据库，更换前需要迁移数据。
 
-前端是运行在 GitHub Pages 上的纯静态单页应用，无后端服务器。它通过 GitHub raw API 拉取位于 `data` 分支的加密 shard，在浏览器中使用 Web Crypto API 解密，并利用 sql.js（SQLite WebAssembly 编译）在内存中构建数据库。
+登录 [iCourse](https://icourse.fudan.edu.cn)，进入课程页面，从页面 URL 获取课程 ID。
 
-解密凭证是独立的 `DB_ENCRYPTION_KEY`，不经过网络传输，在浏览器本地内存中完成解密。
+![课程 ID 在课程页面 URL 中的位置](docs/courseid.png)
 
-订阅编辑器解决了一个特殊的约束：GitHub Actions Secrets API 只支持写入，不支持读取——无法通过 API 获知当前 COURSE_IDS 的值。数据库 `meta` 中保存最近一次运行使用的订阅列表，前端据此显示当前状态；保存时通过 GitHub API 将完整选择列表写回 `COURSE_IDS` Secret。
+### 3. 配置摘要模型
 
-### 技术方法总结
+至少配置以下一个 Secret。文字模型按 [运行配置](src/runtime/config.py) 中的顺序尝试已配置的服务商。
 
-- **控制理论**：ResourceMonitor 的双阈值迟滞比较器（deadband control），防止在单个阈值附近震荡。
-- **排队论**：DynamicSemaphore 的可调整并发池，系统过载时减少服务窗口，负载下降后恢复。不影响正在服务的 worker，只影响等待队列。
-- **CRDT 思想**：merge_db.py 的 field-level COALESCE，最终一致的并发合并策略。
-- **内容寻址存储**：前端以 git blob SHA 为 shard 缓存键，相同内容产生相同 SHA 的特性直接复用。
+| Secret | 对应服务 | 获取入口 |
+| --- | --- | --- |
+| `DASHSCOPE_API_KEY` | 此项目中用于 ModelScope 文字模型，名称为历史兼容项 | [ModelScope](https://modelscope.cn/my/myaccesstoken) |
+| `DEEPSEEK_API_KEY` | DeepSeek 文字模型及可选作业图片理解 | [DeepSeek Platform](https://platform.deepseek.com/) |
+| `GEMINI_API_KEY` | Gemini 文字模型 | [Google AI Studio](https://aistudio.google.com/) |
+
+Qwen ASR 在 Runner 本地执行，不需要语音 API Key。模型可用性、调用额度和费用以对应服务商为准，仓库不承诺免费额度。
+
+作业图片理解使用独立的 DeepSeek 图像路径，不把图片发送到文字模型回退链；未配置或调用失败时使用本地 OCR。自定义 `DASHSCOPE_BASE_URL`、`DEEPSEEK_BASE_URL`、`GEMINI_BASE_URL` 时须确认接口兼容；增加服务商还需同步可复用工作流的密钥声明。
+
+### 4. 配置邮件
+
+日常订阅发信需要以下 Secrets；仅做隔离验证时不会调用 SMTP。
+
+| Secret | 用途 |
+| --- | --- |
+| `SMTP_EMAIL` | QQ 发件邮箱 |
+| `SMTP_PASSWORD` | QQ 邮箱 SMTP 授权码，**不是邮箱登录密码** |
+| `RECEIVER_EMAILS` | 收件邮箱；支持逗号、分号或换行分隔 |
+| `RECEIVER_EMAIL` | 兼容旧部署的单一收件邮箱；未设置 `RECEIVER_EMAILS` 时使用 |
+
+在 [QQ 邮箱](https://mail.qq.com) 的账户设置中启用 SMTP 并获取授权码。邮件按课程拆分，公式在本地渲染，不通过外部公式图片服务发送笔记内容。
+
+### 5. 先做隔离验证，再启用日常订阅
+
+在 **Actions → iCourse Parallel Pilot → Run workflow** 中选择 `main`。名称保留了 Pilot，但它也是当前日常订阅调用的正式处理入口。
+
+首次验证可填写已订阅课程的 `validation_course_id`，保持 `validation_lecture_rank=1`，选择最新实际可播放录播。该模式跳过未来课次、无录播的假期／调休记录和排除时段，使用独立空课堂数据库执行识别。课程 ID 是可见的工作流输入；账号和密钥仍只填 Secrets。
+
+保持 `publish_results=false`、`send_email=false`，运行后核对选定日期、计划块完成数、转录／摘要状态和复核额度。隔离模式会调用配置的识别与摘要服务、保存加密产物并验证数据库合并，但不写正式 `data` 分支、不发邮件。**未填写单课验证参数时，仍会按订阅范围规划课次**，不要将其误认为只处理最新一堂。
+
+确认配置后，可手动运行 **iCourse Check**，或等待日常定时任务：
+
+- **17:07（北京时间）**：主运行。
+- **20:07**：若当天没有排队中、运行中或成功的定时任务，再执行保底运行。
+
+`iCourse Check` 开启正式发布和邮件。GitHub 定时任务可能延迟；已完成摘要不会因再次扫描或识别后端更新而自动重算。
+
+## 可选配置
+
+### 课次筛选
+
+| Secret | 示例 | 行为 |
+| --- | --- | --- |
+| `COURSE_SESSION_RULES` | `12345=周一第1-2节\|周三第6-8节` | 课次白名单；未列出的课程不受白名单限制 |
+| `COURSE_SESSION_EXCLUSIONS` | `12345=周一第6-10节` | 固定排除时段，与课次有重叠即排除 |
+| `COURSE_SESSION_OVERRIDE_DATES` | `2026-09-20,2026-10-01` | 指定日期绕过白名单，适用于调课；不绕过排除规则 |
+
+白名单和排除规则均支持每行一门课程。排除规则优先于日期例外和定向重跑；配置格式错误会停止任务，不公开打印规则内容。
+
+### 识别与复核
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `shard_mode` | `2` | 原始块按累计音频时长分配到两路；块数不足时减少 Runner |
+| `shard_mode=auto` | 可选 | 待识别音频超过 60 分钟时用三路，否则两路 |
+| `shard_mode=shared` | 可选 | 空闲 Runner 动态领本堂课的块；≤30 分钟一路、≤60 分钟两路、更长三路 |
+| `automatic_terms` | `false` | 启用自动术语候选和确认库；仅确认词可供更晚日期的课堂使用 |
+| `DOUBAO_ASR_API_KEY` | 未配置 | 启用疑难音频及作业重点复核；所有分片和重试共享每课 600 秒／20 段 |
+| `TAVILY_API_KEY` | 未配置 | 可选公共知识疑点检索，每课最多两次，不上传完整课堂材料 |
+
+这里的音频量是 **VAD 后原始块的累计时长，包含块间重叠**，不是录播总长度。共享范围为单堂课，各课程暂不互相借用 Runner；15 台是正式处理链的并发预算，不包含其他 CI 作业。完整规则见 [共享队列](docs/shared-asr-queue.md) 和 [作业复核](docs/homework-review.md)。
+
+人工基础词表位于 [course_glossary.json](prompts/course_glossary.json)。同堂 Qwen、豆包和疑难筛选使用冻结词表，不在识别后用新候选重跑同堂音频。词表是上下文提示，不是全局替换规则，也不证明课堂实际讲过该词。自动词库的证据门槛见 [课程术语库](docs/automatic-course-glossary.md)。
+
+## 保存、恢复与历史数据
+
+正式数据库以加密分片保存于独立 `data` 分支。发布按单堂课范围合并，保留历史摘要、处理状态、删除标记和邮件回执；发生竞争时重新读取远端并普通快进推送，不强制覆盖。
+
+正式分片链的准备音频、输入哈希、识别结果和复核检查点通过加密 Actions artifacts 保留 **7 天**。失败恢复先复用成功块，只补未完成部分；摘要失败不会重跑已完成 ASR，云端调用的预留额度不会因重试重置。检查点缺失、过期、输入不符或额度未知时明确停止，避免默认为一节新课。
+
+共享模式另建 `codex/asr-queue-<run_id>-<task_slot>` 协调分支，只保存加密队列。它不是正式数据库，当前不会自动清理；清理前须确认任务结束、恢复窗口及所需产物已保留。不要根据“分支不是 main”就直接删除活动队列。
+
+连续失败三次的课次会暂停自动重试，并按邮件配置发送一次失败提醒。**Single Run** 保留定向重跑、导出、删除及暂停课次重试等入口，采用单 Runner 流程，不能当作正式分片链的块级恢复入口。删除课次会清除摘要、转录和 PPT OCR，并保留永久忽略标记；不会在下一次扫描中自动重新识别。
+
+SMTP 不提供恰好一次投递保证；若服务端已收信但客户端未能保存回执，仍可能重复投递。保存与恢复细节见 [正式处理链](docs/parallel-course-pilot.md)。
+
+## 前端查看器
+
+![课程与笔记查看器](docs/frontend.png)
+
+前端是静态页面，读取 `data` 分支的加密数据库，使用用户输入的 `DB_ENCRYPTION_KEY` 在浏览器内解密，不需要 UIS 凭证。PAT 和数据库密钥只保存在当前标签页的 `sessionStorage`；关闭标签页后失效。支持课程订阅编辑、课次查看、导出与删除。
+
+GitHub Pages 部署是可选且**仅手动触发**：配置 Pages 后运行 **Deploy Frontend**。处理课程和接收邮件不依赖 Pages。仓库公开不等于课堂内容可公开；API Key、明文数据库和课程文件不能提交到仓库。
+
+## 验证范围与限制
+
+当前正式链已完成一堂约 109 分钟录播的隔离验证：三个共享 Worker 完成全部 62 块，复核、非空转录和摘要、`LectureRunner` 保存及隔离发布均通过。后续摘要表达、提醒去重和子题号保留有回归测试与 CI 覆盖。[整课运行记录](https://github.com/Lucasuiii/Fudan_iCourse_Subscriber/actions/runs/37410686897)与 [PR #23](https://github.com/Lucasuiii/Fudan_iCourse_Subscriber/pull/23)保留验证证据。
+
+这些结果证明流程连通，不能当作识别准确率听审或严格同输入性能对照。作业截图中的可靠单项会保留到最终摘要，但画面有题号不等于已经布置整份作业，清单完整性和模糊数字仍需核对。课末通知的跨块重点复核、跨课术语升确认和队列自动清理仍有改进空间；本次课堂验证没有执行正式发信或故障注入。
+
+## 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [个人部署说明](PERSONAL_DEPLOYMENT.md) | Secrets、权限、私密筛选、数据操作和停用 |
+| [正式处理链](docs/parallel-course-pilot.md) | 规划、独立汇总、数据库保存、恢复和发布 |
+| [Qwen 运行说明](docs/qwen-only-runtime.md) | 本地识别后端、依赖、VAD 与推理边界 |
+| [共享 ASR 队列](docs/shared-asr-queue.md) | 动态领块、协调分支、故障恢复 |
+| [作业与课务复核](docs/homework-review.md) | 重点音频、多帧读图、题号佐证和摘要保留 |
+| [课程术语库](docs/automatic-course-glossary.md) | 基础库、候选库、确认库及同堂冻结 |
+| [媒体签名与范围续传](docs/signed-media-transport.md) | 获取完整音频、源标识与读取故障 |
+| [隔离分片对照](docs/qwen-sharded-pilot.md) | 保留的实验入口，与正式订阅流程分开 |
+| [早期 V2 设计记录](docs/legacy-design.md) | 历史调度与识别方案，不代表当前实现 |
+
+## 开发
+
+Python 依赖在 [requirements.txt](requirements.txt)，本地公式渲染依赖在 [package.json](package.json)。ASR 所需的 CPU 版 PyTorch 和 `qwen-asr` 由 [Actions 运行环境](.github/actions/qwen-pilot-runtime/action.yml) 单独安装；仅执行 `pip install -r requirements.txt` 不构成完整识别环境。
+
+配置测试所需依赖后，可运行隔离测试：
+
+```bash
+python -m unittest discover -s tests
+```
+
+PDF／邮件渲染测试还需要系统字体、Pango 和 Cairo；环境配置参考 Actions。测试使用临时数据库、合成输入及模拟服务，不等于实际课程调用。修改正式处理逻辑后应区分隔离测试、完整课堂验证和真实发布验证，并保留旧输入与检查点。
