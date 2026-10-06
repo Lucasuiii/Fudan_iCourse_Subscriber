@@ -254,6 +254,8 @@ jobs:
         sudo apt-get install -y ffmpeg
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
+    - name: Prepared audio volumes, artifact transfer and failure retention
+      run: python -m unittest discover -s tests -p test_qwen_prepared_bundle.py
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_audio_timeline test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Authentication verification and bounded HTTP source diagnostics
