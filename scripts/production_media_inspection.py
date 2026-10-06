@@ -34,8 +34,15 @@ def safe_probe_errors(stderr):
         'invalid_media': (b'invalid data found', b'moov atom not found'),
     }.items():
         if any(marker in lowered for marker in markers): counts[code] = 1
-    statuses = sorted({int(code) for code in re.findall(rb'http error ([45]\d\d)', lowered)})
+    statuses = sorted({int(code) for code in re.findall(
+        rb'(?:http error|server returned) ([45]\d\d)', lowered)})
     result = {'error_counts':counts, 'http_error_statuses':statuses}
+    ranges = re.findall(rb'\bRange: bytes=(\d{1,16})-(\d{0,16})',stderr)
+    if ranges:
+        result['http_range_requests'] = [{'start':int(a),'end':int(z) if z else None}
+                                         for a,z in ranges[:16]]
+    response_statuses = re.findall(rb'HTTP/1\.[01] ([1-5]\d\d)',stderr)
+    if response_statuses: result['http_response_statuses'] = [int(s) for s in response_statuses[:16]]
     if lowered.strip() and not counts and not statuses:
         # Preserve a fixed diagnostic vocabulary, never arbitrary provider text
         # or numeric tokens that could be identifiers, timestamps or signatures.
@@ -44,7 +51,8 @@ def safe_probe_errors(stderr):
             b'decoding decoded frames find found interval intervals specification '
             b'rw_timeout headers read_intervals select_streams show_packets show_entries '
             b'nofind_stream_info opening input file no operation permitted arguments '
-            b'argument avformat demuxing match section entries print format'.split())
+            b'argument avformat demuxing match section entries print format '
+            b'server returned forbidden access denied'.split())
         terms = [word.decode('ascii') for word in re.findall(rb'[a-z][a-z_-]*',lowered[:8192])
                  if word in vocabulary][:96]
         if terms: result['unclassified_terms'] = terms
@@ -164,7 +172,7 @@ def probe_late_packets(url, headers, retained_seconds, stream):
     starts = [max(0, retained_seconds+10), max(0, endpoint-10)]
     intervals = ','.join(f'{start:.3f}%+#64' for start in starts)
     began = time.monotonic()
-    process = subprocess.run(['ffprobe', '-v', 'error', '-nofind_stream_info',
+    process = subprocess.run(['ffprobe', '-v', 'trace', '-nofind_stream_info',
         '-rw_timeout', '30000000', '-headers', headers, '-select_streams', 'a:0',
         '-read_intervals', intervals, '-show_packets', '-show_entries',
         'packet=stream_index,pts_time,dts_time,duration_time,size,pos', '-of', 'json', url],

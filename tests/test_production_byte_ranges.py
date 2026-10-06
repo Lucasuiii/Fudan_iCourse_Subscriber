@@ -7,6 +7,17 @@ from scripts.production_media_inspection import probe_byte_ranges,safe_probe_err
 
 
 class SourceByteRangeTests(unittest.TestCase):
+    def test_http_trace_exports_offsets_and_statuses_but_not_private_headers(self):
+        text=(b'GET /signed/private?key=secret HTTP/1.1\nCookie: private-cookie\n'
+              b'Range: bytes=1138114319-\nHTTP/1.1 403 Forbidden\n'
+              b'Server returned 403 Forbidden (access denied)\n')
+        result=safe_probe_errors(text)
+        self.assertEqual(result['http_error_statuses'],[403])
+        self.assertEqual(result['http_range_requests'],[{'start':1138114319,'end':None}])
+        self.assertEqual(result['http_response_statuses'],[403])
+        for secret in ('signed','private','secret','Cookie'):
+            self.assertNotIn(secret,json.dumps(result))
+
     def test_unclassified_probe_failure_only_retains_fixed_words_not_values(self):
         result=safe_probe_errors(b"Failed to set value 'private-cookie-123' for option 'read_intervals': Operation not permitted https://private/signed?key=secret\n")
         self.assertIn('read_intervals',result['unclassified_terms'])
