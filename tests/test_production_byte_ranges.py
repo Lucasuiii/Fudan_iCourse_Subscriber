@@ -17,6 +17,7 @@ class SourceByteRangeTests(unittest.TestCase):
         self.assertEqual(result['failure_type'],'TimeoutExpired')
         self.assertEqual(result['source_transport']['upstream_bytes'],4096)
         self.assertEqual(result['maximum_upstream_bytes'],16*1024*1024)
+        self.assertEqual(relay.call_args.kwargs['chunk_bytes'],1024*1024)
         relay.return_value.close.assert_called_once()
         self.assertNotIn('private',json.dumps(result))
 

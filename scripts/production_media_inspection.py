@@ -255,7 +255,7 @@ def probe_fresh_late_packets(client, signed_url, retained_seconds, stream):
 def probe_relay_late_packets(client, signed_url, retained_seconds, stream):
     """Exercise production range transport within a 16-MiB read budget."""
     from src.runtime.media_transport import SignedRangeRelay, MediaTransportError
-    relay = SignedRangeRelay(client,signed_url,chunk_bytes=256*1024,
+    relay = SignedRangeRelay(client,signed_url,chunk_bytes=1024*1024,
                              max_upstream_bytes=16*1024*1024)
     try:
         relay.start()
