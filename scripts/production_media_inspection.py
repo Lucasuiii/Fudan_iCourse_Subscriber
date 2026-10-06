@@ -35,7 +35,20 @@ def safe_probe_errors(stderr):
     }.items():
         if any(marker in lowered for marker in markers): counts[code] = 1
     statuses = sorted({int(code) for code in re.findall(rb'http error ([45]\d\d)', lowered)})
-    return {'error_counts':counts, 'http_error_statuses':statuses}
+    result = {'error_counts':counts, 'http_error_statuses':statuses}
+    if lowered.strip() and not counts and not statuses:
+        # Preserve a fixed diagnostic vocabulary, never arbitrary provider text
+        # or numeric tokens that could be identifiers, timestamps or signatures.
+        vocabulary = set(b'failed error invalid unknown unsupported option value set for '
+            b'could not seek read position packet packets stream streams codec decoder '
+            b'decoding decoded frames find found interval intervals specification '
+            b'rw_timeout headers read_intervals select_streams show_packets show_entries '
+            b'nofind_stream_info opening input file no operation permitted arguments '
+            b'argument avformat demuxing match section entries print format'.split())
+        terms = [word.decode('ascii') for word in re.findall(rb'[a-z][a-z_-]*',lowered[:8192])
+                 if word in vocabulary][:96]
+        if terms: result['unclassified_terms'] = terms
+    return result
 
 
 def probe_byte_ranges(session, url, headers, total_bytes):

@@ -3,10 +3,17 @@ import io
 import json
 import unittest
 from unittest.mock import MagicMock
-from scripts.production_media_inspection import probe_byte_ranges
+from scripts.production_media_inspection import probe_byte_ranges,safe_probe_errors
 
 
 class SourceByteRangeTests(unittest.TestCase):
+    def test_unclassified_probe_failure_only_retains_fixed_words_not_values(self):
+        result=safe_probe_errors(b"Failed to set value 'private-cookie-123' for option 'read_intervals': Operation not permitted https://private/signed?key=secret\n")
+        self.assertIn('read_intervals',result['unclassified_terms'])
+        self.assertIn('permitted',result['unclassified_terms'])
+        for secret in ('private','cookie','123','secret','signed'):
+            self.assertNotIn(secret,json.dumps(result))
+
     def session(self, mode):
         session = MagicMock()
         responses = []
