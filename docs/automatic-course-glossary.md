@@ -1,6 +1,6 @@
 # 课程术语：基础库 → 候选库 → 确认库
 
-自动术语默认关闭，通过手动入口 `automatic_terms=true` 启用。基础库仍使用人工维护的 `course_glossary.py`；候选和证据只存在原有加密数据库的 `meta` 表，不进入公开提示词文件。
+自动术语默认关闭，通过手动入口 `automatic_terms=true` 启用。基础库由 `course_glossary.py` 加载人工维护的 [course_glossary.json](../prompts/course_glossary.json)；候选和证据只存在原有加密数据库的 `meta` 表，不进入公开提示词文件。
 
 ## 三层规则
 
