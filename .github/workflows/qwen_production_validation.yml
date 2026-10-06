@@ -31,7 +31,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
@@ -67,6 +67,7 @@ name: Qwen Production Pipeline Validation
     - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
+    - 'tests/test_qwen_prepared_bundle.py'
   pull_request:
     paths:
     - '.github/**'
@@ -98,6 +99,7 @@ name: Qwen Production Pipeline Validation
     - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
     - 'tests/test_qwen_production_pipeline.py'
+    - 'tests/test_qwen_prepared_bundle.py'
 permissions:
   contents: read
 jobs:

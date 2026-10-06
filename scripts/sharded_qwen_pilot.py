@@ -53,6 +53,9 @@ def context(role, slot=None):
 
 
 def seal(files, role, path, slot=None):
+    if role == 'prepared' and os.environ.get('QWEN_PRODUCTION_TASK') == 'true':
+        from scripts import production_prepared_bundle
+        return production_prepared_bundle.seal(files, path, key(), context(role, slot))
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     data = io.BytesIO()
     with zipfile.ZipFile(data, 'w', compression=zipfile.ZIP_STORED) as archive:
@@ -72,6 +75,14 @@ def seal(files, role, path, slot=None):
 
 
 def unseal(path, role, slot=None):
+    path = Path(path)
+    with path.open('rb') as stream:
+        header = stream.read(4)
+    if header == b'QSP2':
+        if role != 'prepared' or os.environ.get('QWEN_PRODUCTION_TASK') != 'true':
+            raise ValueError('Multipart audio requires a production preparation identity')
+        from scripts import production_prepared_bundle
+        return production_prepared_bundle.unseal(path, key(), context(role, slot))
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     if path.stat().st_size > MAX_BUNDLE + 32:
         raise ValueError('Oversized encrypted bundle')

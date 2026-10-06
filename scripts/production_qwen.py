@@ -59,6 +59,10 @@ def failure_code(error):
         'Production audio is incomplete': 'incomplete_audio',
         'Production audio has read or decode errors': 'audio_decode_errors',
         'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
+        'Encrypted bundle too large': 'bundle_size_limit',
+        'Prepared bundle exceeds total size limit': 'bundle_size_limit',
+        'Prepared bundle has too many files': 'bundle_file_limit',
+        'Retained preparation failed; explicit repair required': 'retained_preparation_failed',
         'Isolated validation produced no transcript or summary': 'validation_empty_output',
         'All planned ASR shards must finish before finalization': 'incomplete_shards',
         'Shard incomplete; summary forbidden': 'incomplete_shards',
@@ -519,6 +523,91 @@ def validate_prepared_audio(specification):
         raise ValueError('Production audio is incomplete')
 
 
+def preparation_failure_audit(specification, files, error, *, saved=False, secondary=(), fallback=False,
+                              full_counts=None):
+    """Public diagnostics contain fixed codes/counts, never exception text or names."""
+    from scripts import production_prepared_bundle as bundle
+    phase = specification.get('prepare_phase', 'restore_or_task_load')
+    phases = {'restore_or_task_load', 'imports', 'recovery', 'login', 'ppt', 'glossary',
+              'audio_download', 'vad', 'audio_validation', 'chunk_encoding', 'ppt_drain',
+              'snapshot', 'initial_publish', 'queue_initialize', 'checkpoint_write', 'outputs'}
+    diagnostics = specification.get('audio_diagnostics', {})
+    audit = {'phase': phase if phase in phases else 'unknown',
+        'error_type': type(error).__name__, 'error_code': failure_code(error),
+        'secondary_error_types': [type(e).__name__ for e in secondary],
+        'checkpoint_saved': saved, 'fallback_audio_only': fallback,
+        'audio_retained': saved and 'lecture.flac' in files,
+        'file_count': len(files), 'content_bytes': sum(len(v) for v in files.values()),
+        'total_size_limit_bytes': bundle.MAX_BYTES, 'part_size_limit_bytes': bundle.PART_BYTES,
+        'planned_blocks': len(specification.get('plan', {}).get('blocks', [])),
+        'planned_workers': len(specification.get('plan', {}).get('shards', []))}
+    if full_counts is not None:
+        audit.update(full_checkpoint_file_count=full_counts[0], full_checkpoint_content_bytes=full_counts[1])
+    for name in ('audio_seconds', 'media_seconds', 'duration_gap_seconds', 'decode_return_code',
+                 'decode_interrupted', 'stderr_complete', 'timeline_preserved'):
+        value = diagnostics.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            import math
+            if math.isfinite(value): audit[name] = value
+        elif isinstance(value, bool): audit[name] = value
+    bundle.atomic_write(out('prepare-failure.json'), shards.encoded(audit))
+
+
+def preserve_preparation_failure(db, sub_id, specification, files, handle, error):
+    """A second retention failure must not mask the original preparation error."""
+    secondary = []
+    try:
+        preparation_failure_audit(specification, files, error)
+    except Exception as failure:
+        secondary.append(failure)
+    try:
+        db.update_error(sub_id, 'prepare', type(error).__name__)
+    except Exception as failure:
+        secondary.append(failure)
+    if handle is not None:
+        try:
+            retain_prepared_audio(handle, specification, files)
+        except Exception as failure:
+            secondary.append(failure)
+            specification['audio_retention_error_type'] = type(failure).__name__
+    specification.update(prepare_error_type=type(error).__name__, prepare_error_code=failure_code(error))
+    if specification.get('mode') != 'sharded' or 'lecture.flac' not in files:
+        specification.update(mode='failed', error_type=type(error).__name__, error_code=failure_code(error))
+    try:
+        files['database.db'] = lecture_snapshot(db, root()/'snapshot.db', specification['course_id'], sub_id)
+    except Exception as failure:
+        secondary.append(failure)
+    files['specification.json'] = shards.encoded(specification)
+    full_counts = (len(files), sum(len(v) for v in files.values()))
+    preparation_failure_audit(specification, files, error, secondary=secondary, full_counts=full_counts)
+    fallback = False
+    try:
+        encode(files, 'prepared', out('prepared.enc'))
+    except Exception as failure:
+        secondary.append(failure)
+        # Blocks duplicate the retained source. Keep the source and its original
+        # plan for diagnosis, but never mark an audio-only fallback ASR-ready.
+        fallback = True
+        files = {name: value for name, value in files.items() if not name.startswith('chunk-')}
+        from scripts.production_prepared_bundle import MAX_BYTES
+        if sum(len(v) for v in files.values()) > MAX_BYTES:
+            files.pop('lecture.flac', None)
+        specification.update(mode='failed', error_type=type(error).__name__,
+            error_code=failure_code(error), checkpoint_fallback='audio_only',
+            recovery_blocked=True)
+        specification.setdefault('audio_diagnostics', {})['audio_retained'] = 'lecture.flac' in files
+        files['specification.json'] = shards.encoded(specification)
+        try:
+            encode(files, 'prepared', out('prepared.enc'))
+        except Exception as final_failure:
+            secondary.append(final_failure)
+            preparation_failure_audit(specification, files, error, secondary=secondary, fallback=True,
+                                      full_counts=full_counts)
+            return
+    preparation_failure_audit(specification, files, error, saved=True, secondary=secondary, fallback=fallback,
+                              full_counts=full_counts)
+
+
 def prepare():
     slot = int(os.environ['COURSE_SLOT'])
     if artifact(f'qwen-production-prepare-{slot}', root()/'previous'):
@@ -541,7 +630,7 @@ def prepare():
     sub_id = str(lecture['sub_id'])
     scheduler = None
     handle = None
-    specification = {'course_id': course, 'course_title': title, 'lecture': lecture}
+    specification = {'course_id': course, 'course_title': title, 'lecture': lecture, 'prepare_phase': 'imports'}
     files = {}
     try:
         from src.pipeline.prepared_lecture import cached_material
@@ -557,6 +646,7 @@ def prepare():
             specification['mode'] = 'finished'
         else:
             if not existing.get('transcript'):
+                specification['prepare_phase'] = 'recovery'
                 recovered = recover_preparation(db, course, sub_id)
                 if recovered:
                     recovered_plan = read_json(recovered['specification.json'])['plan']
@@ -569,8 +659,10 @@ def prepare():
                     return
             # Audio retrieval uses the production downloader and its unchanged
             # authenticated playback fallback chain; no benchmark acquisition cap.
+            specification['prepare_phase'] = 'login'
             reporter = Reporter(); client = ICourseClient(login_with_retry())
             scheduler = Scheduler(reporter)
+            specification['prepare_phase'] = 'ppt'
             ppt = PPTPipeline(db, scheduler, reporter).submit(client, course, sub_id, defer_ocr=True)
             from src.runtime import config
             if config.USE_OFFICIAL_TRANSCRIPT:
@@ -594,11 +686,13 @@ def prepare():
                     specification.update(material=material, review=review)
             else:
                 terms = course_terms(title)
+                specification['prepare_phase'] = 'glossary'
                 if os.environ.get('AUTO_COURSE_TERMS') == 'true':
                     glossary_snapshot = lecture.get('_frozen_glossary') or freeze_course_terms(db, course, title, sub_id)
                     validate_frozen_terms(glossary_snapshot, course, lecture)
                     terms = glossary_snapshot['terms']
                     specification['glossary_snapshot'] = glossary_snapshot
+                specification['prepare_phase'] = 'audio_download'
                 scheduler.audio_downloader.schedule(client, course, sub_id, preserve_timestamps=True)
                 handle = scheduler.audio_downloader.get(sub_id, timeout=180)
                 if handle is None: raise ValueError('No playable production audio')
@@ -608,6 +702,7 @@ def prepare():
                         raise ValueError('Decoded audio did not become available')
                     time.sleep(.1)
                 transcriber = QwenTranscriber()
+                specification['prepare_phase'] = 'vad'
                 with open(handle.path, 'rb') as audio:
                     windows = transcriber.prepare_pcm_stream(audio.read, lambda: handle.process.poll() is not None,
                         lambda: b''.join(handle.stderr_chunks), lambda: handle.process.returncode,
@@ -616,6 +711,7 @@ def prepare():
                 media = transcriber.last_media_duration or 0
                 specification.update(audio_seconds=duration, media_seconds=media,
                     vad_windows=transcriber.last_vad_windows, full_chunks=[{'start':a,'end':b} for a,b in windows])
+                specification['prepare_phase'] = 'audio_validation'
                 retain_prepared_audio(handle, specification, files)
                 if abs(specification['audio_seconds']-duration) > 1/16000:
                     raise ValueError('VAD input differs from retained PCM samples')
@@ -628,6 +724,7 @@ def prepare():
                     'vad_windows': transcriber.last_vad_windows, 'recognition_terms': terms},
                     reference={'pipeline': 'production'}, course_slot=slot, run_id=os.environ['GITHUB_RUN_ID'],
                     audio_sha256=digest, mode=os.environ.get('SHARD_MODE', '2'), production=True)
+                specification['prepare_phase'] = 'chunk_encoding'
                 for block in plan['blocks']:
                     chunk = root()/f"chunk-{block['chunk_id']}.flac"
                     # atrim operates on sample indices so FLAC preserves exact
@@ -639,10 +736,13 @@ def prepare():
                     block['flac_sha256'] = hashlib.sha256(files[chunk.name]).hexdigest()
                 validate_plan(plan)
                 specification.update(mode='sharded', plan=plan, media_seconds=media)
+            specification['prepare_phase'] = 'ppt_drain'
             ppt.drain()
+        specification['prepare_phase'] = 'snapshot'
         files.update({'specification.json': shards.encoded(specification),
                       'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)})
         if specification['mode'] == 'sharded' and os.environ.get('PUBLISH_RESULTS') == 'true':
+            specification['prepare_phase'] = 'initial_publish'
             db.write_meta('qwen_pipeline:'+sub_id, json.dumps({'review': {}, 'recovery': {
                 'run_id': os.environ['GITHUB_RUN_ID'], 'task_slot': slot,
                 'plan_hash': fingerprint(specification['plan'])},
@@ -653,25 +753,21 @@ def prepare():
             # starts. A lost job cannot look like a brand-new lecture next run.
             publish(delta, course, sub_id)
         if specification.get('plan', {}).get('execution') == 'shared_queue':
+            specification['prepare_phase'] = 'queue_initialize'
             from scripts.shared_asr_worker import initialize
             initialize(specification['plan'], files)
+        specification['prepare_phase'] = 'checkpoint_write'
+        files['specification.json'] = shards.encoded(specification)
         encode(files, 'prepared', out('prepared.enc'))
+        specification['prepare_phase'] = 'outputs'
         write_outputs(workers={'shard_id': list(range(len(specification.get('plan', {}).get('shards', [])))) or [-1]})
     except Exception as error:
-        db.update_error(sub_id, 'prepare', type(error).__name__)
-        if handle is not None:
-            try: retain_prepared_audio(handle, specification, files)
-            except Exception as retention_error:
-                specification['audio_retention_error_type'] = type(retention_error).__name__
-        # A coordination/API failure after slicing must retain the acquired
-        # input. Retry initializes the queue from this same immutable plan.
-        if specification.get('mode') == 'sharded' and 'lecture.flac' in files:
-            specification['prepare_error_type'] = type(error).__name__
-        else:
-            specification.update(mode='failed', error_type=type(error).__name__, error_code=failure_code(error))
-        files.update({'specification.json': shards.encoded(specification),
-                      'database.db': lecture_snapshot(db, root()/'snapshot.db', course, sub_id)})
-        encode(files, 'prepared', out('prepared.enc'))
+        try:
+            preserve_preparation_failure(db, sub_id, specification, files, handle, error)
+        except Exception:
+            # Disk exhaustion can prevent even tiny diagnostic writes. Still
+            # propagate the primary error, never a checkpoint-write substitute.
+            pass
         raise
     finally:
         if scheduler: scheduler.shutdown()
@@ -985,5 +1081,11 @@ def main():
 if __name__ == '__main__':
     try: main()
     except Exception as error:
+        if len(sys.argv) > 1 and sys.argv[1] == 'prepare':
+            try:
+                if not out('prepare-failure.json').exists():
+                    preparation_failure_audit({}, {}, error)
+            except Exception:
+                pass
         print(f'Production pilot failed ({type(error).__name__}, {failure_code(error)}); private details withheld', flush=True)
         raise SystemExit(1)
