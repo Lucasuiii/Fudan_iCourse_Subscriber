@@ -28,6 +28,46 @@ def client_response(client, data):
 
 
 class DirectVisionTests(unittest.TestCase):
+    def test_subquestions_preserved_and_flattened_lists_rejected(self):
+        data = response(1)
+        raw = 'P69 1(1)(3)、2（1）（3）、3'
+        data['frames'][0].update(text=raw, references=[
+            {'raw': raw, 'page': 69, 'exercises': ['1(1)(3)', '2(1)(3)', 3], 'legible': True}])
+        accepted = validated_frames(data, 1)[0]['references']
+        self.assertEqual([ref['text'] for ref in accepted],
+                         ['69页', '第1(1)(3)题', '第2(1)(3)题', '第3题'])
+        self.assertTrue(all(ref['page'] == 69 for ref in accepted))
+        for items in [[1, 1, 3, 2, 1, 3, 3], [1, 2, 3], ['1(1)', '2(1)(3)', 3],
+                      ['1-3', 2], ['1(1)(3)', '2(1)(3)', True]]:
+            with self.subTest(items=items):
+                data['frames'][0]['references'][0]['exercises'] = items
+                self.assertEqual(validated_frames(data, 1)[0]['references'], [])
+
+    def test_later_board_additions_keep_earlier_supported_subquestions(self):
+        data = response()
+        for frame, raw, items in zip(data['frames'], ['P69 1(1)(3)', 'P69 1(1)(3),2'],
+                                    [['1(1)(3)'], ['1(1)(3)', 2]]):
+            frame.update(text=raw, references=[{'raw': raw, 'page': 69, 'exercises': items, 'legible': True}])
+        rows = validated_frames(data, 2)
+        for row, sec in zip(rows, [100, 120]):
+            row.update(seconds=sec, candidate_id='cue')
+        result = assess_visual({'candidate_ids': ['cue', 'missing'], 'frames': rows})
+        refs = {ref['text']: ref for ref in result['reference_evidence']}
+        self.assertTrue(refs['第1(1)(3)题']['supported'])
+        self.assertFalse(refs['第2题']['supported'])
+        self.assertEqual(result['reference_status'], 'unverified')
+        self.assertIn('部分', result['notice'])
+
+    def test_complete_audio_subquestion_can_support_one_frame(self):
+        data = response(1); raw = 'P69 1(1)(3)'
+        data['frames'][0].update(text=raw, references=[
+            {'raw': raw, 'page': 69, 'exercises': ['1(1)(3)'], 'legible': True}])
+        rows = validated_frames(data, 1)
+        rows[0].update(seconds=100, candidate_id='cue')
+        result = assess_visual({'candidate_ids': ['cue'], 'frames': rows}, [
+            {'candidate_id': 'cue', 'status': 'complete', 'cloud_text': '69页第1（1）（3）题'}])
+        self.assertTrue(all(ref['supported'] for ref in result['reference_evidence']))
+
     def test_actual_images_sent_no_ocr_and_later_twelve_frames(self):
         client = MagicMock(); client.get_ppt_list.return_value = []
         client.get_video_url.return_value = 'private'; client.get_stream_params.return_value = ('private', '')

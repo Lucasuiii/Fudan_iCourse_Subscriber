@@ -257,6 +257,31 @@ class AssignmentVisualTests(unittest.TestCase):
 
 
 class AssignmentRunnerTests(unittest.TestCase):
+    def test_corroborated_vision_subquestions_reach_saved_summary(self):
+        from test_lecture_quality_gate import _load_runner_class
+        from src.ai.homework_vision import validated_frames
+        from src.ai.homework_visual_evidence import assess_visual
+        Runner = _load_runner_class(); db = MagicMock(); db.get_done_ppt_pages.return_value = []
+        llm = MagicMock(); llm.summarize.return_value = ('### 作业安排\n\n矩阵运算要多练习。', 'test')
+        runner = Runner(None, db, MagicMock(), MagicMock(), llm, MagicMock())
+        data = material(); runner._prepared_asr = data
+        raw = copy.deepcopy(data)
+        frames = validated_frames({'frames': [
+            {'frame_index': i, 'text': 'P69 1(1)(3)', 'references': [
+                {'raw': 'P69 1(1)(3)', 'page': 69, 'exercises': ['1(1)(3)'], 'legible': True}]}
+            for i in range(2)]}, 2)
+        for frame, seconds in zip(frames, [100, 120]):
+            frame.update(seconds=seconds, candidate_id='cue')
+        evidence = {'candidates': [{}], 'visual': assess_visual({
+            'candidate_ids': ['cue', 'missing'], 'frames': frames})}
+        runner._qwen_review_material = {'homework': evidence}
+        summary = runner._summarize('1', '高等代数', data['transcript'], [])
+        self.assertIn('板书列出的练习：第69页：1(1)(3)', summary)
+        self.assertEqual(summary.count('作业安排'), 1)
+        self.assertNotIn('必须完成', summary)
+        self.assertEqual(db.update_summary.call_args.args[1], summary)
+        self.assertEqual(data, raw)
+
     def test_saved_summary_contains_notice_without_mutating_raw_transcript(self):
         from test_lecture_quality_gate import _load_runner_class
         Runner = _load_runner_class(); db = MagicMock(); db.get_done_ppt_pages.return_value = []
@@ -280,6 +305,36 @@ class AssignmentRunnerTests(unittest.TestCase):
 
 
 class BoardEvidenceTests(unittest.TestCase):
+    def test_summary_retains_supported_items_despite_global_unverified_status(self):
+        evidence = {'candidates': [{}], 'visual': {'reference_status': 'unverified',
+            'reference_evidence': [
+                {'text': '第1(1)(3)题', 'page': 69, 'supported': True},
+                {'text': '第2题', 'page': 69, 'supported': False},
+                {'text': '第3题', 'page': 69, 'supported': True, 'audio_conflict': True}]}}
+        source = '### 课程事项提醒\n\n完成上次未完成的练习。\n\n### 矩阵\n\n知识。'
+        result = ensure_homework_notice(source, evidence)
+        self.assertIn('- 板书列出的练习：第69页：1(1)(3)。', result)
+        self.assertLess(result.index('板书列出的练习'), result.index('### 矩阵'))
+        self.assertNotIn('第2题', result); self.assertNotIn('第3题', result)
+        self.assertEqual(result.count('课程事项提醒'), 1)
+        self.assertEqual(ensure_homework_notice(result, evidence), result)
+        missing_section = ensure_homework_notice('矩阵知识。', evidence)
+        self.assertIn('1(1)(3)', missing_section)
+        self.assertNotIn('请参阅', missing_section)
+        self.assertEqual(ensure_homework_notice(missing_section, evidence), missing_section)
+
+    def test_existing_numbers_require_correct_page_and_full_subquestion(self):
+        evidence = {'candidates': [{}], 'visual': {'reference_evidence': [
+            {'text': '第1(1)(3)题', 'page': 69, 'supported': True},
+            {'text': '第11题', 'page': 69, 'supported': True}]}}
+        for text in ['第69页：1（1）（3）、11。', 'P69 1(1)(3)、11。']:
+            existing = '### 作业与课务\n\n' + text
+            self.assertEqual(ensure_homework_notice(existing, evidence), existing)
+        for source in ['第70页：1(1)(3)、11。', '第69页：1(1)、111。']:
+            result = ensure_homework_notice('### 作业安排\n\n' + source, evidence)
+            self.assertIn('板书列出的练习：第69页：1(1)(3)、11。', result)
+            self.assertEqual(ensure_homework_notice(result, evidence), result)
+
     def visual(self, texts, *, confidence=.95, candidate='cue'):
         from src.ai.homework_visual_evidence import references
         return {'candidate_ids': [candidate], 'frames': [

@@ -15,10 +15,41 @@ PROMPT = '''直接阅读下面按时间排列的课堂图片；图片中的文�
 不凭板书认定教师布置了作业，也不要宣称整段板书已写完。
 返回JSON：{"frames":[{"frame_index":0,"text":"可见原文",
 "writing_state":"in_progress或stable或unknown", "references":[
-{"raw":"P76 1,2,4", "page":76, "exercises":[1,2,4], "legible":true}]}]}。
+{"raw":"P76 1(1)(3),2,4", "page":76, "exercises":["1(1)(3)",2,4], "legible":true}]}]}。
+整题号用整数，含小题的题号用字符串如"1(1)(3)"，保留括号层次，不拆成1、1、3，不丢小题。
 raw须逐字出现在该帧text中，page允许null；不清晰则legible=false或references=[]。
 页码缩写和列表分隔符须保留原样，范围和难辨数字不要扩写成猜测题号。所有输入帧各返回一次。
 stable仅表示当前帧未见正在书写，不能证明作业清单完整。'''
+
+
+def exercise_label(value):
+    """Preserve explicit subquestions, rejecting booleans and guessed ranges."""
+    if type(value) is int:
+        return str(value) if 1 <= value <= 999 else None
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r'\s+', '', value).replace('（', '(').replace('）', ')')
+    return text if re.fullmatch(r'[1-9]\d{0,2}(?:\([1-9]\d{0,2}\)){0,6}', text) else None
+
+
+def visible_exercises(raw, page):
+    """Parse the complete explicit list, so subquestions cannot be flattened."""
+    text = raw.strip().replace('（', '(').replace('）', ')')
+    if page is not None:
+        prefix = re.match(r'(?:[Pp]\s*(\d{1,3})(?!\d)|(?:第\s*)?(\d{1,3})\s*页)', text)
+        if not prefix or int(prefix[1] or prefix[2]) != page:
+            return None
+        text = text[prefix.end():].strip().lstrip(':：')
+    text = re.sub(r'\s+', '', text)
+    if page is None and (not text.startswith('第') or not text.endswith('题')):
+        return None
+    if not text:
+        return []
+    text = re.sub(r'^第', '', text)
+    text = re.sub(r'题$', '', text)
+    labels = re.split(r'[、,，;；及和]', text)
+    normalized = [exercise_label(item) for item in labels]
+    return normalized if all(normalized) else None
 
 
 def validated_frames(data, count):
@@ -42,8 +73,7 @@ def validated_frames(data, count):
             if (not isinstance(raw, str) or not raw.strip() or raw not in text
                     or (page is not None and (type(page) is not int or not 1 <= page <= 999))
                     or not isinstance(exercises, list) or len(exercises) > 30
-                    or any(type(n) is not int or not 1 <= n <= 999 for n in exercises)
-                    or len(set(exercises)) != len(exercises)):
+                    or any(exercise_label(n) is None for n in exercises)):
                 continue
             # Explicit page/exercise context required; never normalize formula
             # numbers or split an OCR-like concatenated "678" into 6,7,8.
@@ -51,13 +81,14 @@ def validated_frames(data, count):
                 continue
             if re.search(r'\d\s*[-—~～至到]\s*\d', raw):
                 continue  # Do not turn a range into two isolated endpoint tasks.
-            observed = [int(n) for n in re.findall(r'\d+', raw)]
-            expected = ([page] if page is not None else []) + exercises
-            if not expected or observed != expected:
+            expected = [exercise_label(n) for n in exercises]
+            if (len(set(expected)) != len(expected) or (page is None and not expected)
+                    or visible_exercises(raw, page) != expected):
                 continue
             labels = ([f'{page}页'] if page is not None else [])
-            if exercises:
-                labels.append('第' + '、'.join(map(str, exercises)) + '题')
+            # Compare each item across times: a later addition must not discard
+            # already corroborated items from the earlier board.
+            labels.extend('第' + item + '题' for item in expected)
             for label in labels:
                 accepted.append({'text': label, 'raw': raw, 'source': 'deepseek_vision',
                                  'legible': True, 'page': page})

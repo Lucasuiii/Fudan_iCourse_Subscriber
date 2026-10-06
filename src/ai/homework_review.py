@@ -81,6 +81,9 @@ def homework_prompt(evidence):
               '部分内容明确时保留明确部分，仅对有缺失或冲突的具体项简短标注待确认。'
               '整体视觉状态未通过不等于每一项都不清楚；可靠语音可独立支持作业要求，'
               '清单完整性未确认也不否定已经可靠辨认的部分。不得固定追加“题号、页码及安排都不清楚”。'
+              '逐项保留reference_evidence中supported=true的题号及其对应页码，包含1(1)(3)这类小题结构；'
+              '不能因另一候选缺失或全局unverified而省略这些已佐证项。仅有画面依据时写“板书列出的练习”，'
+              '只有语音或明确通知支持布置事实时才写成要求完成的作业；不把两者混为一谈。'
               '不罗列没有可靠依据的候选数字；'
               '禁止用普通公式、例题编号或单帧低可信数字补造作业。'
               'writing_state=stable仅表示该帧未见正在书写，不证明老师写完；最后一帧也不保证清单完整。'
@@ -118,13 +121,60 @@ def _notice_section(summary):
     return None
 
 
+def _supported_board_items(evidence):
+    """Select item-level corroboration, never promote aggregate flags or raw text."""
+    from src.ai.homework_vision import exercise_label
+    groups = {}
+    for ref in evidence.get('visual', {}).get('reference_evidence', []):
+        if ref.get('supported') is not True or ref.get('audio_conflict'):
+            continue
+        text, page = ref.get('text', ''), ref.get('page')
+        if page is not None and (type(page) is not int or not 1 <= page <= 999):
+            continue
+        match = re.fullmatch(r'第(.+)题', text)
+        if not match:
+            continue
+        items = [exercise_label(item) for item in re.split(r'[、,，及和]', match[1])]
+        if not all(items):
+            continue
+        for item in items:
+            if item not in groups.setdefault(page, []):
+                groups[page].append(item)
+    return groups
+
+
+def _listed_in_notice(notice, page, item):
+    """Match the whole subquestion in the same explicitly scoped page passage."""
+    normalized = notice.replace('（', '(').replace('）', ')')
+    pages = list(re.finditer(r'(?:[Pp]\s*(\d{1,3})(?!\d)|(?:第\s*)?(\d{1,3})\s*页)', normalized))
+    passages = [re.sub(r'\s+', '', paragraph).replace('（', '(').replace('）', ')')
+                for paragraph in re.split(r'\n\s*\n', notice)
+                if not re.search(r'[Pp]\s*\d|\d\s*页', paragraph)] if page is None else []
+    if page is not None:
+        passages = [re.sub(r'\s+', '', normalized[m.end():pages[i+1].start() if i+1 < len(pages) else len(normalized)])
+                    for i, m in enumerate(pages) if int(m[1] or m[2]) == page]
+    return any(re.search(r'(?<![\d(])' + re.escape(item) + r'(?![\d(])', passage)
+               for passage in passages)
+
+
 def ensure_homework_notice(summary, evidence):
     """Keep one reader-facing reminder; raw evidence stays in the ledger."""
     if not evidence or not evidence.get('candidates'):
         return summary
-    if _notice_section(summary) is not None:
-        # An aggregate image flag cannot invalidate reliable speech or a
-        # partially supported list. The model handles item-specific evidence.
+    section = _notice_section(summary)
+    notice = summary[section[0]:section[1]] if section else ''
+    missing = []
+    for page, items in _supported_board_items(evidence).items():
+        omitted = [item for item in items if not _listed_in_notice(notice, page, item)]
+        if omitted:
+            prefix = f'第{page}页：' if page is not None else ''
+            missing.append('- 板书列出的练习：' + prefix + '、'.join(omitted) + '。')
+    if missing:
+        addition = '\n\n' + '\n'.join(missing) + '\n\n'
+        if section:
+            return summary[:section[1]].rstrip() + addition + summary[section[1]:]
+        return summary.rstrip() + '\n\n### 课程事项提醒' + addition.rstrip()
+    if section:
         return summary
     # Keyword hits do not establish requirements, even if visible numbers agree.
     return summary.rstrip() + ('\n\n### 课程事项提醒\n\n'
