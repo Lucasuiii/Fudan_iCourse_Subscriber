@@ -8,7 +8,7 @@ name: iCourse Parallel Pilot
   workflow_dispatch:
     inputs:
       validation_course_id:
-        description: Validate one playable lecture from this course (requires no publication or email)
+        description: Validate latest playable lecture per course, comma-separated IDs (max 5; no publication/email)
         type: string
         default: ''
       validation_lecture_rank:

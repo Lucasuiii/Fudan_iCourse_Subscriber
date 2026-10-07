@@ -221,11 +221,16 @@ def validation_course():
     if not course and (rank != 1 or validation_before_date() or source):
         raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
-        if not course.isascii() or not course.isdigit():
-            raise ValueError('Invalid validation course')
+        courses = [item.strip() for item in course.split(',')]
+        if (len(courses) > 5 or len(set(courses)) != len(courses)
+                or any(not item.isascii() or not item.isdigit() for item in courses)):
+            raise ValueError('Invalid validation courses')
+        if source and len(courses) != 1:
+            raise ValueError('Source-run validation requires exactly one course')
+        course = ','.join(courses)
         if os.environ.get('PUBLISH_RESULTS') != 'false' or os.environ.get('SEND_EMAIL') != 'false':
             raise ValueError('Classroom validation requires publication and email disabled')
-        if course not in configured_courses(os.environ['COURSE_IDS']):
+        if any(item not in configured_courses(os.environ['COURSE_IDS']) for item in courses):
             raise ValueError('Validation course is not subscribed')
     return course
 
@@ -353,7 +358,8 @@ def plan():
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         from scripts.production_pool import verify_previous_pool
         verify_previous_pool()  # Also gate legacy mode after an orphaned pool.
-    course = validation_course()
+    requested = validation_course()
+    courses = requested.split(',') if requested else []
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
         files = decode(root()/'previous'/'queue.enc', 'queue')
@@ -372,18 +378,21 @@ def plan():
             db.conn.close(); load_remote(root()/'queue.db'); db = Database(str(root()/'queue.db'))
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
-            if course:
-                task, teacher = latest_validation_task(client, db, course, rank=validation_rank(),
-                                                       before_date=validation_before_date())
+            if courses:
+                selections = [latest_validation_task(client, db, course, rank=validation_rank(),
+                                                    before_date=validation_before_date()) for course in courses]
                 history = snapshot(db, root()/'history.db')
                 # A separate scratch database forces this authorized lecture
                 # through ASR even when production already has a summary.
                 # The original encrypted history remains in the queue bundle.
                 db.conn.close(); db = Database(str(root()/'validation.db'))
-                db.upsert_course(course, task[1], teacher)
-                lecture = task[2]
-                db.insert_lecture(lecture['sub_id'], course, lecture.get('sub_title', ''), lecture['date'])
-                tasks = [task]
+                tasks = []
+                for task, teacher in selections:
+                    course = task[0]
+                    db.upsert_course(course, task[1], teacher)
+                    lecture = task[2]
+                    db.insert_lecture(lecture['sub_id'], course, lecture.get('sub_title', ''), lecture['date'])
+                    tasks.append(task)
             else:
                 _crawl_semester_catalog(client, db, reporter)
                 enumeration = _enumerate_lectures(client, db, reporter)
@@ -392,7 +401,7 @@ def plan():
             if len(tasks) > MAX_TASKS:
                 raise ValueError('Queue exceeds 256 tasks; narrow the subscribed course scope')
             files = {'queue.json': shards.encoded(tasks), 'database.db': snapshot(db, root()/'snapshot.db')}
-            if course: files['history.db'] = history
+            if courses: files['history.db'] = history
             else: files['enumeration.json'] = shards.encoded(enumeration.public_audit())
         finally:
             db.conn.close()
@@ -400,19 +409,24 @@ def plan():
     identities = [(str(t[0]), str(t[2]['sub_id'])) for t in tasks]
     if len(tasks) > MAX_TASKS or len(set(identities)) != len(identities):
         raise ValueError('Invalid or duplicate lecture queue')
-    if course:
-        if (len(tasks) != 1 or str(tasks[0][0]) != course or not tasks[0][2].get('_validation')
-                or tasks[0][2]['_validation'].get('playable_rank', 1) != validation_rank()
-                or tasks[0][2]['_validation'].get('before_date', '') != validation_before_date()
-                or (validation_before_date() and str(tasks[0][2].get('date', '')) >= validation_before_date())):
-            raise ValueError('Validation queue does not match the requested course')
-        if tasks[0][2]['_validation'].get('source_run_id', '') != os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
-            raise ValueError('Validation queue does not match its source run')
+    if courses:
+        if len(tasks) != len(courses) or [str(t[0]) for t in tasks] != courses:
+            raise ValueError('Validation queue does not match the requested courses')
         from src.runtime.session_rules import lecture_is_selected
         from src.runtime import config
-        if not lecture_is_selected(course, tasks[0][2], {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
-            raise ValueError('Frozen validation lesson is now excluded')
-        out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
+        for course, task in zip(courses, tasks):
+            lecture = task[2]; audit = lecture.get('_validation')
+            if (not audit or audit.get('playable_rank', 1) != validation_rank()
+                    or audit.get('before_date', '') != validation_before_date()
+                    or (validation_before_date() and str(lecture.get('date', '')) >= validation_before_date())):
+                raise ValueError('Validation queue does not match the requested recording')
+            if audit.get('source_run_id', '') != os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
+                raise ValueError('Validation queue does not match its source run')
+            if not lecture_is_selected(course, lecture, {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
+                raise ValueError('Frozen validation lesson is now excluded')
+        selection = tasks[0][2]['_validation'] if len(tasks) == 1 else {'courses': [
+            dict(task_slot=i, course_id=str(task[0]), **task[2]['_validation']) for i, task in enumerate(tasks)]}
+        out('validation-selection.json').write_bytes(shards.encoded(selection))
     encode(files, 'queue', out('queue.enc'))
     if os.environ.get('SHARD_MODE') == 'shared' and tasks:
         from scripts.production_pool import initial_state, read_state, save, store_for

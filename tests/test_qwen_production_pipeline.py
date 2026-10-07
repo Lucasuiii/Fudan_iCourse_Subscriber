@@ -289,6 +289,65 @@ class ClassroomSelectionTests(unittest.TestCase):
                                      'PUBLISH_RESULTS':'false','SEND_EMAIL':'false'}):
             self.assertEqual(pipeline.validation_course(), '38404')
 
+    def test_validation_course_list_is_bounded_subscribed_and_isolated(self):
+        with patch.dict(os.environ, {'COURSE_IDS':'10,20,30,40,50,60',
+                'VALIDATION_LECTURE_RANK':'1', 'VALIDATION_BEFORE_DATE':'',
+                'VALIDATION_SOURCE_RUN_ID':'', 'PUBLISH_RESULTS':'false', 'SEND_EMAIL':'false'}):
+            for raw in ('10,10', '10,', '10,bad', '10,99', '10,20,30,40,50,60'):
+                with patch.dict(os.environ, {'VALIDATION_COURSE_ID':raw}):
+                    with self.assertRaises(ValueError): pipeline.validation_course()
+            with patch.dict(os.environ, {'VALIDATION_COURSE_ID':'10, 20'}):
+                self.assertEqual(pipeline.validation_course(), '10,20')
+                with patch.dict(os.environ, {'VALIDATION_SOURCE_RUN_ID':'99'}):
+                    with self.assertRaises(ValueError): pipeline.validation_course()
+                for flags in ({'PUBLISH_RESULTS':'true'}, {'SEND_EMAIL':'true'}):
+                    with patch.dict(os.environ, flags):
+                        with self.assertRaises(ValueError): pipeline.validation_course()
+
+    def test_two_course_trial_preserves_history_and_freezes_both_selections_on_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp, 'GITHUB_RUN_ID':'99', 'GITHUB_RUN_ATTEMPT':'1',
+                'COURSE_SLOT':'0', 'DB_ENCRYPTION_KEY':'k'*32, 'QWEN_PRODUCTION_TASK':'true',
+                'VALIDATION_COURSE_ID':'10,20', 'COURSE_IDS':'10,20,30', 'SHARD_MODE':'2',
+                'VALIDATION_LECTURE_RANK':'1', 'VALIDATION_BEFORE_DATE':'', 'VALIDATION_SOURCE_RUN_ID':'',
+                'PUBLISH_RESULTS':'false', 'SEND_EMAIL':'false'}):
+            root=pipeline.root(); db=database(root/'history-fixture.db', summary='历史摘要')
+            db.upsert_course('20','数值算法',''); db.insert_lecture('2','20','第1节','2026-10-04')
+            db.update_summary('2','数值历史摘要','test'); db.mark_processed('2')
+            original=snapshot(db,root/'original-snapshot.db'); db.conn.close()
+            client=MagicMock()
+            client.get_course_detail.side_effect=lambda course: {'title':{'10':'概率论','20':'数值算法'}[course],
+                'lectures':[{'sub_id':{'10':'1','20':'2'}[course], 'date':'2026-10-04'}]}
+            client.get_video_url.return_value='https://private.example/recording'
+            fake_main=SimpleNamespace(login_with_retry=lambda:None, _enumerate_lectures=MagicMock(),
+                                      _crawl_semester_catalog=MagicMock())
+            with patch.dict('sys.modules', {'main':fake_main}), \
+                 patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'load_remote',side_effect=lambda path:path.write_bytes(original)), \
+                 patch('src.api.icourse.ICourseClient',return_value=client), patch.object(pipeline,'write_outputs'):
+                pipeline.plan()
+            saved=pipeline.decode(root/'out'/'queue.enc','queue'); tasks=json.loads(saved['queue.json'])
+            self.assertEqual([t[0] for t in tasks], ['10','20'])
+            self.assertEqual([c.args[0] for c in client.get_course_detail.call_args_list], ['10','20'])
+            (root/'fresh.db').write_bytes(saved['database.db']); db=Database(str(root/'fresh.db'))
+            for sub in ('1','2'): self.assertIsNone(db.get_lecture(sub)['summary'])
+            db.conn.close()
+            (root/'preserved.db').write_bytes(saved['history.db']); db=Database(str(root/'preserved.db'))
+            self.assertEqual(db.get_lecture('1')['summary'],'历史摘要')
+            self.assertEqual(db.get_lecture('2')['summary'],'数值历史摘要'); db.conn.close()
+            audit=json.loads((root/'out'/'validation-selection.json').read_text())
+            self.assertEqual([x['course_id'] for x in audit['courses']], ['10','20'])
+            self.assertNotIn('sub_id',json.dumps(audit)); self.assertNotIn('https:',json.dumps(audit))
+            with patch.dict(os.environ, {'GITHUB_RUN_ATTEMPT':'2'}), \
+                 patch.object(pipeline,'artifact',return_value=True), patch.object(pipeline,'decode',return_value=saved), \
+                 patch.object(pipeline,'latest_validation_task') as select, patch.object(pipeline,'write_outputs'):
+                pipeline.plan(); select.assert_not_called()
+                tampered=dict(saved, **{'queue.json':pipeline.shards.encoded(list(reversed(tasks)))})
+                with patch.object(pipeline,'decode',return_value=tampered):
+                    with self.assertRaises(ValueError): pipeline.plan()
+            fake_main._enumerate_lectures.assert_not_called()
+            fake_main._crawl_semester_catalog.assert_not_called()
+
     def test_workflow_registration_never_processes_classrooms_on_push(self):
         workflow=yaml.safe_load((ROOT/'.github/workflows/parallel_pilot.yml').read_text())
         self.assertIn("github.event_name != 'push'",workflow['jobs']['plan']['if'])

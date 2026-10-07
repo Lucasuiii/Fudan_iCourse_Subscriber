@@ -1,6 +1,9 @@
 name: Qwen Production Pool Stage
 run-name: icourse-stage-${{ inputs.parent_run_id }}-${{ inputs.ticket }}
 'on':
+  push:
+    branches: [codex/global-runner-pool]
+    paths: [.github/workflows/qwen_production_stage.yml]
   workflow_dispatch:
     inputs:
       parent_run_id:
@@ -15,7 +18,15 @@ permissions:
   contents: write
   actions: read
 jobs:
+  register:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+    - run: echo 'Pool stage entry registered; no classroom processing on push'
   execute:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
