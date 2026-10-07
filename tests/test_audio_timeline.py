@@ -51,7 +51,7 @@ class AudioTimelineTests(unittest.TestCase):
             self.assertEqual(downloader.get('1').timeline_preserved,preserve)
             client.get_video_url.assert_called_once_with('10','1')
             if preserve:
-                relay.assert_called_once_with(client,'selected-private-url')
+                relay.assert_called_once_with(client,'selected-private-url',allow_session_refresh=True)
                 self.assertNotIn('-reconnect_streamed',cmd)
                 client.get_stream_params.assert_not_called()
             else:

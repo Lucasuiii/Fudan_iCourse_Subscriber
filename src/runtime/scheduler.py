@@ -233,7 +233,7 @@ class AudioDownloader:
                     self._sem.release()
                     return
                 if preserve_timestamps:
-                    transport = SignedRangeRelay(client,url).start()
+                    transport = SignedRangeRelay(client,url,allow_session_refresh=True).start()
                     vpn_url, headers = transport.url, ''
                     # Three bounded upstream connect/read attempts can take
                     # about 77s; allow them to finish before FFmpeg gives up.

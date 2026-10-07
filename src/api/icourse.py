@@ -89,6 +89,38 @@ class ICourseClient:
         except Exception:
             return False
 
+    def refresh_media_session(self) -> bool:
+        """Refresh existing SSO cookies with two bounded, non-redirecting probes.
+
+        A signed URL alone cannot repair an expired WebVPN session. Probe the
+        configured portal without following redirects, then verify iCourse.
+        If either is unavailable, the caller must stop and retain its input.
+        """
+        try:
+            response = self.vpn.session.get(config.WEBVPN_BASE+'/',
+                                            allow_redirects=False, timeout=5)
+            if response.status_code != 200:
+                return False
+            response = self.vpn.get(f'{self.base_url}/userapi/v1/infosimple',
+                                    allow_redirects=False, timeout=10)
+            if response.status_code != 200:
+                return False
+            payload = response.json()
+            if payload.get('code') not in (0,200):
+                return False
+            userinfo = payload.get('params') or payload.get('data')
+            if not isinstance(userinfo,dict) or not userinfo.get('id'):
+                return False
+            if (self._userinfo and self._userinfo.get('id')
+                    and str(self._userinfo['id']) != str(userinfo['id'])):
+                return False
+            # Reuse the verified response when re-signing; do not add another
+            # default-60s userinfo request to the decoder's recovery budget.
+            self._userinfo = userinfo
+            return True
+        except Exception:
+            return False
+
     def sign_video_url(
         self, video_url: str, now: int | None = None
     ) -> str:
