@@ -434,6 +434,35 @@ class AudioAndStorageTests(unittest.TestCase):
 
 
 
+class InspectionSourceTests(unittest.TestCase):
+    def test_live_parent_allows_only_confirmed_ended_preparation_child(self):
+        from scripts.production_result_export import validate_inspection_source
+        state=journal(2); ticket=pool.reserve(state,1,'prepare',1)
+        ticket.update(status='completed',conclusion='failure',run='101')
+        info={'path':'.github/workflows/parallel_pilot.yml','status':'in_progress','head_sha':state['sha']}
+        child={'path':'.github/workflows/'+pool.WORKFLOW,'status':'completed','head_sha':state['sha'],
+               'display_title':'icourse-stage-99-'+ticket['nonce'],'run_attempt':1}
+        validate_inspection_source(info,'99',1,read_pool=lambda:state,inspect_run=lambda run:child)
+        for changes in ({'status':'in_progress'}, {'head_sha':'b'*40}, {'run_attempt':2}, {'display_title':'wrong'}):
+            with self.assertRaises(ValueError):
+                validate_inspection_source(info,'99',1,read_pool=lambda:state,inspect_run=lambda run:dict(child,**changes))
+        for changes in ({'status':'reserved'}, {'run':None}):
+            altered=copy.deepcopy(state);altered['tickets'][0].update(changes)
+            with self.assertRaises(ValueError):
+                validate_inspection_source(info,'99',1,read_pool=lambda:altered,inspect_run=lambda run:child)
+        for run,slot in [('100',1),('99',0)]:
+            with self.assertRaises(ValueError):
+                validate_inspection_source(info,run,slot,read_pool=lambda:state,inspect_run=lambda run:child)
+
+    def test_completed_legacy_inspection_remains_read_only_and_wrong_workflow_rejected(self):
+        from scripts.production_result_export import validate_inspection_source
+        info={'path':'.github/workflows/parallel_pilot.yml','status':'completed'}
+        read=MagicMock()
+        validate_inspection_source(info,'99',0,read_pool=read);read.assert_not_called()
+        with self.assertRaises(ValueError):
+            validate_inspection_source(dict(info,path='.github/workflows/check.yml'),'99',0,read_pool=read)
+
+
 class WorkflowTests(unittest.TestCase):
     def test_graph_uses_one_controller_single_job_children_and_disjoint_legacy_path(self):
         parent = yaml.safe_load((ROOT/'.github/workflows/parallel_pilot.yml').read_text())

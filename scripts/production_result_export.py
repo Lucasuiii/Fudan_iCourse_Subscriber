@@ -103,6 +103,38 @@ def raw_qwen_payload(spec, results):
                        for r in results]}
 
 
+def validate_inspection_source(info, run, slot, *, read_pool=None, inspect_run=None):
+    """Inspect an ended prepare independently of a still-running sibling lecture.
+
+    A live parent is allowed only with a journal-bound, ended prepare child.
+    This authorizes read-only inspection, never model or acquisition recovery.
+    """
+    if info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml':
+        raise ValueError('Source is not a formal pilot')
+    if info['status'] == 'completed': return
+    from scripts import production_pool as pool
+    if read_pool is None:
+        store=pool.store_for(run)
+        try: state=pool.read_state(store)[1]
+        finally: store.close()
+    else: state=read_pool()
+    pool.validate(state)
+    if state['run_id'] != run or state['sha'] != info['head_sha']:
+        raise ValueError('Inspection parent source mismatch')
+    tickets=[t for t in state['tickets'] if t['slot']==slot and t['stage']=='prepare']
+    if not tickets: raise ValueError('No prepared source for inspection')
+    ticket=tickets[-1]
+    if ticket['status']!='completed' or not ticket.get('run'):
+        raise ValueError('Preparation is still active or unconfirmed')
+    inspect_run=inspect_run or (lambda child:pool.api(f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{child}'))
+    child=inspect_run(ticket['run'])
+    if (child['status']!='completed' or child['head_sha']!=state['sha']
+            or child['path'].split('@')[0]!='.github/workflows/'+pool.WORKFLOW
+            or child['display_title']!=f'icourse-stage-{run}-{ticket["nonce"]}'
+            or child['run_attempt']!=1):
+        raise ValueError('Prepared child identity mismatch')
+
+
 def export():
     from scripts import production_qwen as pipeline
     from scripts import sharded_qwen_pilot as shards

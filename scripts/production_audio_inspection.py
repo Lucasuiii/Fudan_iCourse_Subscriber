@@ -54,7 +54,7 @@ def listening_offsets(levels, duration):
 def inspect():
     from scripts import production_qwen as pipeline
     from scripts import sharded_qwen_pilot as shards
-    from scripts.production_result_export import encrypt, identity
+    from scripts.production_result_export import encrypt, identity, validate_inspection_source
     from src.ai.qwen_transcriber import QwenTranscriber
     run, slot = os.environ['SOURCE_RUN_ID'], int(os.environ['SOURCE_SLOT'])
     identity(run, slot)
@@ -62,8 +62,7 @@ def inspect():
     if len(recipient) != 32: raise ValueError('Invalid recipient public key')
     info = json.loads(subprocess.check_output(['gh','api',
         f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run}'], stderr=subprocess.PIPE, timeout=60))
-    if info['status'] != 'completed' or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml':
-        raise ValueError('Source is not a completed production pilot')
+    validate_inspection_source(info, run, slot)
     target = pipeline.root()/'audio-inspection-source'
     pipeline.artifact(f'qwen-production-prepare-{slot}', target, run=run, required=True)
     with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
