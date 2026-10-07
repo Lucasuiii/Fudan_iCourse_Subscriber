@@ -5,6 +5,8 @@ Provides access to course details, lecture lists, video URLs,
 and video downloads through WebVPN.
 """
 
+import copy
+import threading
 import hashlib
 import os
 import re
@@ -56,10 +58,13 @@ def fetch_ppt_image(client: "ICourseClient", item: dict,
 class ICourseClient:
     """Client for the iCourse API, operating through WebVPN."""
 
-    def __init__(self, vpn_session: WebVPNSession):
+    def __init__(self, vpn_session: WebVPNSession, *, media_reauth_factory=None):
         self.vpn = vpn_session
         self.base_url = config.ICOURSE_BASE
         self._userinfo = None
+        self._media_reauth_factory = media_reauth_factory
+        self._media_owned_session = None
+        self.media_auth_audit = {}
 
     def get_userinfo(self) -> dict:
         """Get current user info (id, tenant_id, phone, account).
@@ -90,38 +95,119 @@ class ICourseClient:
         except Exception:
             return False
 
-    def refresh_media_session(self) -> bool:
-        """Refresh existing SSO cookies with two bounded, non-redirecting probes.
+    def fork_for_media(self):
+        # Authentication recovery belongs to this download, not concurrent PPT
+        # requests or another lecture sharing the original client.
+        value = copy.copy(self)
+        value._userinfo = dict(self.get_userinfo())
+        value._media_owned_session = None
+        value.media_auth_audit = {}
+        return value
 
-        A signed URL alone cannot repair an expired WebVPN session. Probe the
-        configured portal without following redirects, then verify iCourse.
-        If either is unavailable, the caller must stop and retain its input.
-        """
+    def close_media_session(self):
+        if self._media_owned_session is not None:
+            self._media_owned_session.close()
+            self._media_owned_session = None
+
+    def _verified_media_user(self, vpn):
+        response = vpn.get(f'{self.base_url}/userapi/v1/infosimple',
+                           allow_redirects=False, timeout=10)
+        try:
+            self.media_auth_audit['api_status'] = response.status_code
+            if response.status_code != 200: return None
+            payload = response.json()
+            if payload.get('code') not in (0, 200): return None
+            user = payload.get('params') or payload.get('data')
+            if not isinstance(user, dict) or not user.get('id'): return None
+            for key in ('id', 'tenant_id'):
+                if (self._userinfo and self._userinfo.get(key) is not None
+                        and str(self._userinfo[key]) != str(user.get(key))):
+                    self.media_auth_audit['failure'] = 'identity_mismatch'
+                    return None
+            return user
+        finally:
+            response.close()
+
+    def refresh_media_session(self) -> bool:
+        """Probe existing SSO only. Password recovery is separately opt-in."""
+        self.media_auth_audit = {'stage': 'existing_session'}
         try:
             portal = config.ICOURSE_BASE if getattr(self.vpn, 'access_mode', None) == 'direct' else config.WEBVPN_BASE
-            response = self.vpn.session.get(portal+'/',
-                                            allow_redirects=False, timeout=5)
-            if response.status_code != 200:
+            response = self.vpn.session.get(portal+'/', allow_redirects=False, timeout=5)
+            try:
+                self.media_auth_audit['portal_status'] = response.status_code
+                if response.status_code != 200:
+                    self.media_auth_audit['failure'] = 'portal_unavailable'
+                    return False
+            finally:
+                response.close()
+            user = self._verified_media_user(self.vpn)
+            if user is None:
+                self.media_auth_audit.setdefault('failure', 'api_verification_failed')
                 return False
-            response = self.vpn.get(f'{self.base_url}/userapi/v1/infosimple',
-                                    allow_redirects=False, timeout=10)
-            if response.status_code != 200:
-                return False
-            payload = response.json()
-            if payload.get('code') not in (0,200):
-                return False
-            userinfo = payload.get('params') or payload.get('data')
-            if not isinstance(userinfo,dict) or not userinfo.get('id'):
-                return False
-            if (self._userinfo and self._userinfo.get('id')
-                    and str(self._userinfo['id']) != str(userinfo['id'])):
-                return False
-            # Reuse the verified response when re-signing; do not add another
-            # default-60s userinfo request to the decoder's recovery budget.
-            self._userinfo = userinfo
+            self._userinfo = user
             return True
         except Exception:
+            self.media_auth_audit['failure'] = 'existing_session_exception'
             return False
+
+    def reauthenticate_media_session(self, stopped, *, timeout=75):
+        """Bounded fresh login; rejected/late sessions are never adopted."""
+        if (self._media_reauth_factory is None or stopped.is_set()
+                or self.media_auth_audit.get('failure') == 'identity_mismatch'):
+            return False
+        cancelled = threading.Event()
+        deadline = time.monotonic()+timeout
+        ready = threading.Event()
+        lock = threading.Lock()
+        result = {}
+        previous_failure = self.media_auth_audit.pop('failure', None)
+        if previous_failure: self.media_auth_audit['existing_failure'] = previous_failure
+        self.media_auth_audit.update(stage='fresh_session', reauth_attempts=1,
+                                     reauth_successes=0)
+        def authenticate():
+            candidate = None
+            try:
+                candidate = self._media_reauth_factory(cancelled, deadline)
+                if cancelled.is_set() or stopped.is_set() or time.monotonic() >= deadline: return
+                user = self._verified_media_user(candidate)
+                if user is None: return
+                with lock:
+                    if not cancelled.is_set() and not stopped.is_set() and time.monotonic() < deadline:
+                        result.update(vpn=candidate, user=user)
+                        candidate = None
+            except Exception as error:
+                # Only our own fixed enum is allowed; never provider text.
+                from src.api.webvpn import AuthenticationError
+                allowed = {'service_unavailable', 'cold_session', 'cas_context_missing',
+                           'api_verification_failed', 'authentication_rejected',
+                           'password_method_missing', 'media_auth_cancelled'}
+                reason = error.reason if isinstance(error, AuthenticationError) else None
+                self.media_auth_audit['failure'] = reason if reason in allowed else 'fresh_session_exception'
+            finally:
+                if candidate is not None: candidate.session.close()
+                ready.set()
+        threading.Thread(target=authenticate, daemon=True).start()
+        while not ready.wait(.05):
+            if stopped.is_set() or time.monotonic() >= deadline: break
+        with lock:
+            cancelled.set()
+            candidate = result.get('vpn')
+            if candidate is None or stopped.is_set() or time.monotonic() >= deadline:
+                if candidate is not None: candidate.session.close()
+                self.media_auth_audit.setdefault('failure', 'fresh_session_unavailable')
+                return False
+            # Session stays usable after recovery; keep its cancellation separate
+            # from the finished auth wait and retain a lifetime request deadline.
+            if hasattr(candidate.session, 'cancelled'):
+                candidate.session.cancelled = stopped
+                candidate.session.deadline = float('inf')
+            self.vpn = candidate
+            self._userinfo = result['user']
+            self._media_owned_session = candidate.session
+            self.media_auth_audit.pop('failure', None)
+            self.media_auth_audit.update(stage='verified', reauth_successes=1)
+            return True
 
     def trusted_media_login_urls(self) -> tuple[str, ...]:
         """Exact WebVPN SSO routes; no request or credential access here."""

@@ -52,7 +52,7 @@ class AudioTimelineTests(unittest.TestCase):
             client.get_video_url.assert_called_once_with('10','1')
             if preserve:
                 relay.assert_called_once_with(client,'selected-private-url',allow_session_refresh=True,cache_bytes=16*1024*1024)
-                self.assertEqual(cmd[cmd.index('-rw_timeout')+1],'120000000')
+                self.assertEqual(cmd[cmd.index('-rw_timeout')+1],'180000000')
                 self.assertNotIn('-reconnect_streamed',cmd)
                 client.get_stream_params.assert_not_called()
             else:

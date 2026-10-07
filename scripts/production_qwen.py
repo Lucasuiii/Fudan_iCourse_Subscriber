@@ -820,7 +820,8 @@ def prepare():
             # Audio retrieval uses the production downloader and its unchanged
             # authenticated playback fallback chain; no benchmark acquisition cap.
             specification['prepare_phase'] = 'login'
-            reporter = Reporter(); client = ICourseClient(login_with_retry())
+            from src.api.auth_recovery import fresh_media_session
+            reporter = Reporter(); client = ICourseClient(login_with_retry(), media_reauth_factory=fresh_media_session)
             scheduler = Scheduler(reporter)
             specification['prepare_phase'] = 'ppt'
             ppt = PPTPipeline(db, scheduler, reporter).submit(client, course, sub_id, defer_ocr=True)

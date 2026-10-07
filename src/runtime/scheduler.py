@@ -221,10 +221,10 @@ class AudioDownloader:
                     transport = SignedRangeRelay(client,url,allow_session_refresh=True,
                                                  cache_bytes=16*1024*1024).start()
                     vpn_url, headers = transport.url, ''
-                    # Three 10/15s range attempts plus the one-time 5/10s
-                    # connect/read SSO probes and backoff fit within 120s.
+                    # Bounded range recovery, old-session probes and one 75s
+                    # fresh authentication fit within the 180s network window.
                     # The existing 5-minute PCM-stall gate still applies.
-                    network_options = ['-rw_timeout','120000000']
+                    network_options = ['-rw_timeout','180000000']
                 else:
                     vpn_url, headers = client.get_stream_params(url)
                     network_options = ['-reconnect','1','-reconnect_streamed','1','-reconnect_delay_max','5']

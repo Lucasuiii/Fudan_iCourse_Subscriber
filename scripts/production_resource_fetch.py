@@ -4,6 +4,8 @@ import base64
 import io
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -13,7 +15,7 @@ from scripts import sharded_qwen_pilot as shards
 from scripts.parallel_courses import configured_courses
 from scripts.production_db import load_remote
 from scripts.production_result_export import encrypt
-from src.api.auth_recovery import authenticated_session
+from src.api.auth_recovery import authenticated_session, fresh_media_session
 from src.api.icourse import ICourseClient
 from src.api.webvpn import WebVPNSession
 from src.data.database import Database
@@ -59,13 +61,49 @@ def selection_audit(rows):
                 {'error_type': r['error_type']})) for r in rows]}
 
 
+def requested_slots():
+    value = os.environ.get('RESOURCE_SLOTS', '').strip()
+    if not value: return list(range(4))
+    if not re.fullmatch(r'[0-3](,[0-3])*', value):
+        raise ValueError('Invalid resource slots')
+    slots = [int(i) for i in value.split(',')]
+    if len(set(slots)) != len(slots): raise ValueError('Duplicate resource slot')
+    return slots
+
+
+def frozen_resource_selection(source):
+    if not re.fullmatch(r'[1-9][0-9]{0,19}', source) or source == os.environ['GITHUB_RUN_ID']:
+        raise ValueError('Invalid resource selection source')
+    repo = os.environ['GITHUB_REPOSITORY']
+    info = json.loads(subprocess.check_output(['gh','api',
+        f'repos/{repo}/actions/runs/{source}'], stderr=subprocess.PIPE, timeout=60))
+    if (info.get('status') != 'completed'
+            or info.get('path') != '.github/workflows/qwen_production_resources.yml'):
+        raise ValueError('Resource selection source must have ended')
+    target = pipeline.root()/'source-selection'
+    pipeline.artifact('icourse-resource-selection', target, run=source, required=True)
+    with shards.environment({'GITHUB_RUN_ID': source}):
+        files = shards.unseal(target/'selection.enc', 'resource-selection', slot=0)
+    rows = json.loads(files['selections.json'])
+    if (not isinstance(rows,list) or len(rows)!=4
+            or [r.get('task_slot') for r in rows] != list(range(4))
+            or len({r.get('course_id') for r in rows}) != 4):
+        raise ValueError('Invalid frozen resource selection')
+    for row in rows:
+        if row.get('status') == 'selected':
+            task = row['task']
+            if str(task[0]) != str(row['course_id']) or not task[2].get('sub_id'):
+                raise ValueError('Frozen resource identity differs')
+            task[2]['_validation']['selection_source_run_id'] = source
+        elif row.get('status') != 'selection_failed':
+            raise ValueError('Invalid frozen selection status')
+    return rows
+
+
 def plan():
     check_request()
-    courses = configured_courses(os.environ['COURSE_IDS'])
-    pipeline.out('selection-audit.json').write_bytes(shards.encoded(
-        {'resource_only': True, 'course_count': len(courses), 'status': 'selecting'}))
-    if len(courses) != 4:
-        raise ValueError('Expected exactly four configured subscriptions')
+    slots = requested_slots()
+    source = os.environ.get('RESOURCE_SELECTION_SOURCE_RUN_ID', '').strip()
     vpn = db = None
     sessions = []
     def factory():
@@ -74,20 +112,30 @@ def plan():
         return value
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            load_remote(pipeline.root()/'resource-history.db')
-            db = Database(str(pipeline.root()/'resource-history.db'))
-            vpn = authenticated_session(factory=factory)
-            rows = select_latest(ICourseClient(vpn), db, courses)
+            if source:
+                rows = frozen_resource_selection(source)
+            else:
+                courses = configured_courses(os.environ['COURSE_IDS'])
+                pipeline.out('selection-audit.json').write_bytes(shards.encoded(
+                    {'resource_only': True, 'course_count': len(courses), 'status': 'selecting'}))
+                if len(courses) != 4:
+                    raise ValueError('Expected exactly four configured subscriptions')
+                load_remote(pipeline.root()/'resource-history.db')
+                db = Database(str(pipeline.root()/'resource-history.db'))
+                vpn = authenticated_session(factory=factory)
+                rows = select_latest(ICourseClient(vpn), db, courses)
         shards.seal({'selections.json': shards.encoded(rows)}, 'resource-selection',
                     pipeline.out('selection.enc'), slot=0)
         pipeline.out('selection-export.enc').write_bytes(encrypt(
             shards.encoded({'resource_only': True, 'selections': rows}), check_request(),
             os.environ['GITHUB_RUN_ID'], 255))
-        pipeline.out('selection-audit.json').write_bytes(shards.encoded(selection_audit(rows)))
-        pipeline.write_outputs(tasks={'include': [{'task_slot': i} for i in range(4)]})
+        audit = selection_audit(rows)
+        audit['requested_slots'] = slots
+        pipeline.out('selection-audit.json').write_bytes(shards.encoded(audit))
+        pipeline.write_outputs(tasks={'include': [{'task_slot': i} for i in slots]})
     finally:
         pipeline.out('authentication-audit.json').write_bytes(shards.encoded(
-            {'authenticated': vpn is not None,
+            {'authenticated': vpn is not None, 'frozen_selection_reused': bool(source),
              'attempts': [s.auth_diagnostics for s in sessions]}))
         if db is not None: db.conn.close()
         if vpn is not None: vpn.session.close()
@@ -129,7 +177,7 @@ def fetch():
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             vpn = authenticated_session()
             downloader = AudioDownloader(str(pipeline.root()/'audio'), max_concurrent=1)
-            downloader.schedule(ICourseClient(vpn), course, lecture['sub_id'], preserve_timestamps=True)
+            downloader.schedule(ICourseClient(vpn, media_reauth_factory=fresh_media_session), course, lecture['sub_id'], preserve_timestamps=True)
             handle = downloader.get(lecture['sub_id'], timeout=180)
             if handle is None: raise ValueError('No playable production audio')
             wait_audio(handle)

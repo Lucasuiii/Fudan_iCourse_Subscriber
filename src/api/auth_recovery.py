@@ -39,3 +39,32 @@ def authenticated_session(*, max_attempts=3, student_id=None, password=None,
             # The next attempt gets a new Session and a new one-use ticket.
             # Outage probes run before credentials are submitted.
             sleep(min(5*(attempt+1), 10))
+
+
+class DeadlineSession(requests.Session):
+    """Each auth request/redirect checks the same cancellation and wall deadline."""
+    def __init__(self, cancelled, deadline):
+        super().__init__()
+        self.cancelled, self.deadline = cancelled, deadline
+
+    def send(self, request, **kwargs):
+        remaining = self.deadline-time.monotonic()
+        if self.cancelled.is_set() or remaining <= 0:
+            raise AuthenticationError('media_auth_cancelled')
+        requested = kwargs.get('timeout') or (10, 10)
+        if not isinstance(requested, tuple): requested = (requested, requested)
+        kwargs['timeout'] = tuple(min(float(v or cap), cap, remaining)
+                                  for v, cap in zip(requested, (10, 30)))
+        return super().send(request, **kwargs)
+
+
+def fresh_media_session(cancelled, deadline):
+    """One new ticket flow from configured credentials, never a media Location."""
+    def factory():
+        vpn = WebVPNSession()
+        vpn.session.close()
+        vpn.session = DeadlineSession(cancelled, deadline)
+        from src.runtime import config
+        vpn.session.headers.update({'User-Agent': config.USER_AGENT})
+        return vpn
+    return authenticated_session(max_attempts=1, factory=factory)

@@ -1,7 +1,7 @@
 """Bounded login decisions and strict API proof, without live credentials."""
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import requests
 from src.api.auth_recovery import authenticated_session
@@ -150,3 +150,28 @@ class AuthRecoveryTests(unittest.TestCase):
             self.assertNotIn('private-sso',headers);self.assertNotIn('private-api',headers)
             self.assertFalse(vpn.requires_webvpn_login)
         finally:vpn.session.close()
+
+
+class MediaAuthDeadlineTests(unittest.TestCase):
+    def test_cancelled_or_expired_session_never_sends_a_request(self):
+        import threading
+        import time
+        from src.api.auth_recovery import DeadlineSession
+        for cancelled, deadline in ((True,time.monotonic()+5),(False,time.monotonic()-1)):
+            stopped=threading.Event()
+            if cancelled:stopped.set()
+            session=DeadlineSession(stopped,deadline)
+            with patch('requests.Session.send') as send:
+                with self.assertRaises(AuthenticationError): session.get('https://example.invalid/')
+                send.assert_not_called()
+            session.close()
+
+    def test_timeout_is_clamped_for_every_redirect(self):
+        import threading
+        import time
+        from src.api.auth_recovery import DeadlineSession
+        session=DeadlineSession(threading.Event(),time.monotonic()+2)
+        with patch('requests.Session.send') as send:
+            session.send(object(),timeout=(60,90))
+            self.assertTrue(all(0 < v <= 2 for v in send.call_args.kwargs['timeout']))
+        session.close()

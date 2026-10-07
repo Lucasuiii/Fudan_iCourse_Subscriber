@@ -261,8 +261,8 @@ class MediaSessionTests(unittest.TestCase):
                 (200,{'code':0},False),(200,{'code':0,'params':{'id':'another-user'}},False),
                 (200,valid,True)]:
             vpn=MagicMock();client=ICourseClient(vpn);client._userinfo={'id':'private-user'}
-            vpn.session.get.return_value=SimpleNamespace(status_code=portal)
-            vpn.get.return_value=SimpleNamespace(status_code=200,json=lambda:api)
+            vpn.session.get.return_value=SimpleNamespace(status_code=portal,close=lambda:None)
+            vpn.get.return_value=SimpleNamespace(status_code=200,json=lambda:api,close=lambda:None)
             success=client.refresh_media_session()
             self.assertEqual(success,expected)
             self.assertFalse(vpn.session.get.call_args.kwargs['allow_redirects'])
@@ -270,6 +270,89 @@ class MediaSessionTests(unittest.TestCase):
             else:vpn.get.assert_not_called()
             vpn.login.assert_not_called();vpn.authenticate_icourse.assert_not_called()
             self.assertEqual(client._userinfo,valid['params'] if success else {'id':'private-user'})
+
+    def test_fresh_login_resumes_same_offset_without_mutating_shared_client(self):
+        with SessionOrigin('cold') as origin:
+            old = origin.client.vpn
+            def factory(cancelled, deadline):
+                candidate = type(old)()
+                origin.token = 'refreshed'
+                candidate.session.cookies.set('media_token','refreshed',domain='127.0.0.1',path='/')
+                return candidate
+            origin.client._media_reauth_factory = MagicMock(side_effect=factory)
+            with self.relay(origin,allow_session_refresh=True) as relay:
+                self.assertEqual(requests.get(relay.url,timeout=15).content,origin.DATA)
+                self.assertIs(origin.client.vpn,old)
+                self.assertIsNot(relay.client,origin.client)
+                audit = relay.audit()
+                self.assertEqual(audit['last_failure_offset'],4096)
+                self.assertEqual(audit['upstream_bytes'],len(origin.DATA))
+                self.assertEqual(audit['media_auth']['reauth_successes'],1)
+                origin.client._media_reauth_factory.assert_called_once()
+                self.assertNotIn('/login',origin.calls)
+                self.assertNotIn('private',json.dumps(audit))
+
+    def test_fresh_login_cannot_accept_another_account_or_tenant(self):
+        for user in ({'id':'another'}, {'id':'cached-private-user','tenant_id':'another'}):
+            with self.subTest(user=user), SessionOrigin('cold') as origin:
+                origin.client._userinfo['tenant_id']='fake'
+                candidate=MagicMock()
+                candidate.get.return_value=SimpleNamespace(status_code=200,json=lambda:{'code':0,'params':user},close=lambda:None)
+                origin.client._media_reauth_factory=MagicMock(return_value=candidate)
+                with self.relay(origin,allow_session_refresh=True) as relay:
+                    with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+                    self.assertEqual(relay.audit()['upstream_bytes'],4096)
+                    self.assertEqual(relay.audit()['media_auth']['failure'],'identity_mismatch')
+                    candidate.session.close.assert_called_once()
+
+    def test_fresh_session_still_rejects_changed_source_or_persistent_login(self):
+        for mode, code in [('changed','source_changed'),('persistent','media_session_unavailable')]:
+            with self.subTest(mode=mode), SessionOrigin('cold') as origin:
+                def factory(cancelled,deadline):
+                    candidate=type(origin.client.vpn)()
+                    origin.mode=mode;origin.token='refreshed'
+                    candidate.session.cookies.set('media_token','refreshed',domain='127.0.0.1',path='/')
+                    return candidate
+                origin.client._media_reauth_factory=MagicMock(side_effect=factory)
+                with self.relay(origin,allow_session_refresh=True) as relay:
+                    with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+                    self.assertEqual(relay.audit()['terminal_error_code'],code)
+                    self.assertEqual(relay.audit()['upstream_bytes'],4096)
+                    origin.client._media_reauth_factory.assert_called_once()
+
+    def test_unknown_redirect_never_submits_credentials_even_with_factory(self):
+        with SessionOrigin('foreign') as origin:
+            origin.client._media_reauth_factory=MagicMock()
+            with self.relay(origin,allow_session_refresh=True) as relay:
+                with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+                origin.client._media_reauth_factory.assert_not_called()
+
+    def test_timeout_cancels_and_closes_late_authentication_without_adopting_it(self):
+        candidate=MagicMock()
+        candidate.get.return_value=SimpleNamespace(status_code=200,json=lambda:{'code':0,'params':{'id':'same'}},close=lambda:None)
+        release=threading.Event(); finished=threading.Event()
+        def factory(cancelled, deadline):
+            release.wait(2)
+            self.assertTrue(cancelled.is_set())
+            finished.set()
+            return candidate
+        old=MagicMock();client=ICourseClient(old,media_reauth_factory=factory);client._userinfo={'id':'same'}
+        self.assertFalse(client.reauthenticate_media_session(threading.Event(),timeout=.05))
+        release.set();self.assertTrue(finished.wait(2))
+        import time
+        for _ in range(50):
+            if candidate.session.close.called:break
+            time.sleep(.01)
+        candidate.session.close.assert_called_once()
+        candidate.get.assert_not_called()
+        self.assertIs(client.vpn,old)
+
+    def test_readonly_transport_never_uses_fresh_authentication(self):
+        with SessionOrigin('cold') as origin:
+            origin.client._media_reauth_factory=MagicMock()
+            with self.relay(origin) as relay:
+                with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+                origin.client._media_reauth_factory.assert_not_called()
 
 
 if __name__=='__main__': unittest.main()

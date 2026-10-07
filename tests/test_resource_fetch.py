@@ -111,7 +111,7 @@ class ResourceFetchTests(unittest.TestCase):
     def test_manual_workflow_has_one_acquisition_slot_and_no_model_or_publish_secrets(self):
         path=Path(__file__).resolve().parents[1]/'.github/workflows/qwen_production_resources.yml'
         workflow=yaml.safe_load(path.read_text())
-        self.assertEqual(workflow['jobs']['fetch']['strategy']['max-parallel'],1)
+        self.assertEqual(workflow['jobs']['fetch']['strategy']['max-parallel'],2)
         self.assertFalse(workflow['jobs']['fetch']['strategy']['fail-fast'])
         self.assertEqual(workflow['permissions']['contents'],'read')
         text=path.read_text()
@@ -120,3 +120,37 @@ class ResourceFetchTests(unittest.TestCase):
         for key in ('plan','fetch'):
             commands=[s.get('run','') for s in workflow['jobs'][key]['steps']]
             self.assertFalse(any(' worker' in c or ' gather' in c or ' publish' in c for c in commands))
+
+
+class FrozenResourceTests(unittest.TestCase):
+    def test_slot_subset_is_explicit_and_unique(self):
+        for value in ('0,0','4','-1','0, 3',''):
+            with patch.dict(os.environ,{'RESOURCE_SLOTS':value}):
+                if value:self.assertRaises(ValueError,resource.requested_slots)
+                else:self.assertEqual(resource.requested_slots(),[0,1,2,3])
+        with patch.dict(os.environ,{'RESOURCE_SLOTS':'0,3'}):self.assertEqual(resource.requested_slots(),[0,3])
+
+    def test_frozen_selection_rebinds_without_login_or_latest_scan(self):
+        rows=[{'task_slot':i,'course_id':str(i+1),'status':'selected',
+               'task':[str(i+1),'private',{'sub_id':str(i+11),'_validation':{'date':'2026-09-29'}}]} for i in range(4)]
+        env={'GITHUB_RUN_ID':'200','GITHUB_REPOSITORY':'owner/repo'}
+        info={'status':'completed','path':'.github/workflows/qwen_production_resources.yml'}
+        def unseal(*args,**kwargs):
+            self.assertEqual(os.environ['GITHUB_RUN_ID'],'100')
+            return {'selections.json':json.dumps(rows).encode()}
+        with patch.dict(os.environ,env),patch.object(resource.pipeline,'root',return_value=Path('/tmp/frozen-resource-test')),patch.object(resource.subprocess,'check_output',return_value=json.dumps(info).encode()), \
+             patch.object(resource.pipeline,'artifact') as artifact,patch.object(resource.shards,'unseal',side_effect=unseal), \
+             patch.object(resource,'authenticated_session') as login,patch.object(resource,'select_latest') as select:
+            frozen=resource.frozen_resource_selection('100')
+            self.assertEqual(os.environ['GITHUB_RUN_ID'],'200')
+            self.assertEqual([r['task'][2]['_validation']['selection_source_run_id'] for r in frozen],['100']*4)
+            self.assertEqual(artifact.call_args.kwargs['run'],'100')
+            login.assert_not_called();select.assert_not_called()
+
+    def test_active_or_other_workflow_source_is_rejected_before_download(self):
+        for status,path in [('in_progress','.github/workflows/qwen_production_resources.yml'),('completed','other.yml')]:
+            with patch.dict(os.environ,{'GITHUB_RUN_ID':'200','GITHUB_REPOSITORY':'owner/repo'}), \
+                 patch.object(resource.subprocess,'check_output',return_value=json.dumps({'status':status,'path':path}).encode()), \
+                 patch.object(resource.pipeline,'artifact') as artifact:
+                with self.assertRaises(ValueError):resource.frozen_resource_selection('100')
+                artifact.assert_not_called()

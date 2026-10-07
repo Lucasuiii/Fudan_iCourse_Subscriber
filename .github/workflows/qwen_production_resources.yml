@@ -9,6 +9,14 @@ name: iCourse Resource Acquisition Validation
         description: Ephemeral recipient public key for private selection and diagnostics
         required: true
         type: string
+      selection_source_run_id:
+        description: Reuse the frozen four-course selection from an ended resource run
+        default: ''
+        type: string
+      resource_slots:
+        description: Frozen slots to fetch (0 to 3, comma separated; blank means all)
+        default: ''
+        type: string
 permissions:
   contents: read
   actions: read
@@ -19,6 +27,8 @@ env:
   GH_TOKEN: ${{ github.token }}
   DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
   QWEN_PRODUCTION_TASK: 'true'
+  RESOURCE_SELECTION_SOURCE_RUN_ID: ${{ inputs.selection_source_run_id }}
+  RESOURCE_SLOTS: ${{ inputs.resource_slots }}
   RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
   StuId: ${{ secrets.STUID }}
   UISPsw: ${{ secrets.UISPSW }}
@@ -88,7 +98,7 @@ jobs:
     timeout-minutes: 110
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.tasks) }}
     env:
       COURSE_SLOT: ${{ matrix.task_slot }}

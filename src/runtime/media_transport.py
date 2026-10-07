@@ -2,7 +2,7 @@
 
 Only bounded upstream ranges are buffered. A failed range resumes at its next
 unread byte; FFmpeg never sees duplicate bytes or an upstream signed URL.
-Session refresh is opt-in; no password login, decoding, model or publisher is invoked.
+Session recovery is opt-in; fresh authentication requires an explicit client factory.
 """
 from __future__ import annotations
 
@@ -25,7 +25,10 @@ class SignedRangeRelay:
                  prefix_bytes=64*1024, attempts=3, max_upstream_bytes=None,
                  session_factory=requests.Session, timeout=(10, 15),
                  allow_session_refresh=False, cache_bytes=0):
-        self.client, self.signed_url = client, signed_url
+        factory = getattr(client, "_media_reauth_factory", None)
+        self._owns_client = callable(factory) and allow_session_refresh
+        self.client = client.fork_for_media() if self._owns_client else client
+        self.signed_url = signed_url
         self.chunk_bytes, self.prefix_bytes = chunk_bytes, prefix_bytes
         self.attempts, self.max_bytes = attempts, max_upstream_bytes
         self.session_factory, self.timeout = session_factory, timeout
@@ -56,7 +59,7 @@ class SignedRangeRelay:
                            session_refresh_attempts=0, session_refresh_successes=0,
                            last_failure_offset=None, last_error_code=None, state='idle',
                            cache_hits=0, cached_bytes_served=0, cache_bytes=0,
-                           last_failure_stage=None, last_redirect={})
+                           last_failure_stage=None, last_redirect={}, media_auth={})
         if type(chunk_bytes) is not int or not 4096 <= chunk_bytes <= 16*1024*1024:
             raise ValueError('Invalid bounded media transport limits')
         if not 1 <= prefix_bytes <= chunk_bytes:
@@ -79,7 +82,8 @@ class SignedRangeRelay:
             return dict(self._audit,
                         upstream_status_counts=dict(self._audit['upstream_status_counts']),
                         redirect_counts=dict(self._audit['redirect_counts']),
-                        last_redirect=dict(self._audit['last_redirect']))
+                        last_redirect=dict(self._audit['last_redirect']),
+                        media_auth=dict(self._audit['media_auth']))
 
     def _count(self, key, amount=1):
         with self._audit_lock:
@@ -144,11 +148,14 @@ class SignedRangeRelay:
         self._count('session_refresh_attempts')
         if self._stop.is_set(): raise MediaTransportError('stopped')
         try:
-            # Refresh only existing SSO cookies; never replay CAS tickets or
-            # start a password flow from a streaming decoder thread.
             success = refresh() is True
+            reauthenticate = getattr(self.client, "reauthenticate_media_session", None)
+            if not success and self._owns_client and callable(reauthenticate):
+                success = reauthenticate(self._stop) is True
         except Exception:
             success = False
+        with self._audit_lock:
+            self._audit['media_auth'] = dict(getattr(self.client, 'media_auth_audit', {}))
         if self._stop.is_set(): raise MediaTransportError('stopped')
         if not success: self._fail('media_session_unavailable')
         self._count('session_refresh_successes')
@@ -355,6 +362,7 @@ class SignedRangeRelay:
                 self._server.server_close()
             if self._thread is not None:self._thread.join(timeout=2)
             if self._session is not None:self._session.close()
+            if self._owns_client: self.client.close_media_session()
             self._buffer.close()
             with self._audit_lock: self._audit['cache_bytes'] = 0
             self._transition('closed')
