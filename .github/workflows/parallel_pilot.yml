@@ -23,6 +23,10 @@ name: iCourse Parallel Pilot
         description: Explicitly reacquire the exact failed preparation selection and frozen glossary from this completed run
         type: string
         default: ''
+      validation_selection_run_id:
+        description: Explicit fresh pre-ASR trial with the exact frozen selections of an ended pool run
+        type: string
+        default: ''
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
@@ -55,6 +59,9 @@ name: iCourse Parallel Pilot
         type: string
         default: ''
       validation_source_run_id:
+        type: string
+        default: ''
+      validation_selection_run_id:
         type: string
         default: ''
       automatic_terms:
@@ -154,6 +161,7 @@ jobs:
       VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
       VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
       VALIDATION_SOURCE_RUN_ID: ${{ inputs.validation_source_run_id }}
+      VALIDATION_SELECTION_RUN_ID: ${{ inputs.validation_selection_run_id }}
       AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}

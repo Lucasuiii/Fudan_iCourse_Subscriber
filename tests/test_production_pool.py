@@ -463,6 +463,56 @@ class InspectionSourceTests(unittest.TestCase):
             validate_inspection_source(dict(info,path='.github/workflows/check.yml'),'99',0,read_pool=read)
 
 
+class SelectionReplayTests(unittest.TestCase):
+    def test_fresh_trial_copies_only_ended_pre_asr_selection_and_keeps_history(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'100','COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,
+                'GITHUB_REPOSITORY':'owner/repo','QWEN_PRODUCTION_TASK':'true',**FLAGS}):
+            state=journal(2);ticket=pool.reserve(state,0,'prepare',1)
+            ticket.update(status='completed',conclusion='cancelled',run='101')
+            info={'path':'.github/workflows/parallel_pilot.yml','status':'completed','head_sha':state['sha']}
+            child={'status':'completed','head_sha':state['sha'],'path':'.github/workflows/'+pool.WORKFLOW,
+                   'display_title':'icourse-stage-99-'+ticket['nonce'],'run_attempt':1}
+            files={'queue.json':shards.encoded([['10','概率论',{'sub_id':'1','_validation':{'date':'2026-10-04'}}],
+                ['20','数值',{'sub_id':'2','_validation':{'date':'2026-10-03'}}]]),
+                'database.db':b'empty scratch database','history.db':b'original encrypted history'}
+            with shards.environment({'GITHUB_RUN_ID':'99'}):
+                pipeline.encode(files,'queue',pipeline.root()/'fixture.enc')
+            def download(name,target,**kwargs):
+                self.assertEqual(kwargs['run'],'99');target.mkdir(parents=True,exist_ok=True)
+                (target/'queue.enc').write_bytes((pipeline.root()/'fixture.enc').read_bytes());return True
+            api=lambda path:info if path.endswith('/99') else child
+            with patch.object(pool,'store_for',return_value=MemoryStore(state)), \
+                 patch.object(pool,'api',side_effect=api),patch.object(pipeline,'artifact',side_effect=download):
+                copied=pipeline.validation_selection_queue('99')
+            self.assertEqual(copied['database.db'],files['database.db'])
+            self.assertEqual(copied['history.db'],files['history.db'])
+            tasks=json.loads(copied['queue.json'])
+            self.assertEqual([t[2]['sub_id'] for t in tasks],['1','2'])
+            self.assertTrue(all(t[2]['_validation']['selection_source_run_id']=='99' for t in tasks))
+            for change in ('asr','gather','publish','unknown','active','source_sha'):
+                altered=copy.deepcopy(state);changed_child=dict(child);changed_info=dict(info)
+                if change in ('asr','gather','publish'):altered['tickets'][0]['stage']=change
+                if change=='unknown':altered['tickets'][0]['run']=None
+                if change=='active':changed_child['status']='in_progress'
+                if change=='source_sha':changed_info['head_sha']='b'*40
+                with patch.object(pool,'store_for',return_value=MemoryStore(altered)), \
+                     patch.object(pool,'api',side_effect=lambda path:changed_info if path.endswith('/99') else changed_child), \
+                     patch.object(pipeline,'artifact') as fetch:
+                    with self.assertRaises(ValueError):pipeline.validation_selection_queue('99')
+                    fetch.assert_not_called()
+
+    def test_selection_source_cannot_enable_side_effects_or_conflict_with_old_source(self):
+        with patch.dict(os.environ, {'VALIDATION_COURSE_ID':'10,20','COURSE_IDS':'10,20',
+                'VALIDATION_LECTURE_RANK':'1','VALIDATION_BEFORE_DATE':'',
+                'VALIDATION_SELECTION_RUN_ID':'99','VALIDATION_SOURCE_RUN_ID':'',**FLAGS}):
+            self.assertEqual(pipeline.validation_course(),'10,20')
+            for changes in ({'VALIDATION_SOURCE_RUN_ID':'98'}, {'PUBLISH_RESULTS':'true'},
+                            {'VALIDATION_SELECTION_RUN_ID':'bad'}, {'VALIDATION_COURSE_ID':''}):
+                with patch.dict(os.environ,changes):
+                    with self.assertRaises(ValueError):pipeline.validation_course()
+
+
 class WorkflowTests(unittest.TestCase):
     def test_graph_uses_one_controller_single_job_children_and_disjoint_legacy_path(self):
         parent = yaml.safe_load((ROOT/'.github/workflows/parallel_pilot.yml').read_text())

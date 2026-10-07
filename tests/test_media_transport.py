@@ -20,9 +20,10 @@ from src.runtime.scheduler import AudioDownloader
 
 
 class Origin:
-    def __init__(self,data,*,drop_start=None,change=False,ignore=False,validator=True,expired=False,persistent=False):
+    def __init__(self,data,*,drop_start=None,change=False,ignore=False,validator=True,expired=False,persistent=False,ignored_once_start=None):
         self.data=data;self.drop_start=drop_start;self.change=change
         self.ignore=ignore;self.validator=validator;self.expired=expired;self.persistent=persistent
+        self.ignored_once_start=ignored_once_start;self.ignored_once=False
         self.requests=[];self.dropped=False;self.tickets=set();self.error=None
     def __enter__(self):
         owner=self
@@ -43,7 +44,9 @@ class Origin:
                     owner.tickets.add(ticket)
                 if (owner.expired or owner.persistent) and start>0:
                     owner.expired=False;self.send_error(403);return
-                self.send_response(200 if owner.ignore else 206)
+                ignored=(owner.ignore or start==owner.ignored_once_start and not owner.ignored_once)
+                if ignored: owner.ignored_once=True
+                self.send_response(200 if ignored else 206)
                 self.send_header('Content-Length',str(end-start+1))
                 self.send_header('Content-Range',f'bytes {start}-{end}/{len(owner.data)}')
                 if owner.validator:
@@ -132,6 +135,29 @@ class MediaTransportTests(unittest.TestCase):
                 with self.assertRaises(MediaTransportError) as raised:relay.start()
                 self.assertEqual(raised.exception.code,code)
                 self.assertEqual(relay.audit()['upstream_bytes'],0)
+
+    def test_temporary_ignored_range_recovers_same_offset_without_forwarding_bad_response(self):
+        with Origin(self.DATA,ignored_once_start=16384) as origin, \
+             SignedRangeRelay(origin.client,origin.signed,chunk_bytes=128*1024,prefix_bytes=16384) as relay:
+            response=requests.get(relay.url,timeout=20)
+            self.assertEqual(response.content,self.DATA)
+            audit=relay.audit()
+            self.assertEqual(audit['range_rejections'],1);self.assertEqual(audit['retries'],1)
+            self.assertIsNone(audit['terminal_error_code'])
+            self.assertEqual(audit['upstream_bytes'],len(self.DATA))
+            rows=[r for r in origin.requests if r[0]==16384]
+            self.assertEqual(len(rows),2);self.assertNotEqual(rows[0][2],rows[1][2])
+            self.assertEqual(audit['upstream_status_counts']['200'],1)
+            self.assertGreater(audit['upstream_status_counts']['206'],1)
+
+    def test_persistent_ignored_range_stays_bounded_and_forwards_no_unverified_bytes(self):
+        with Origin(self.DATA,ignore=True) as origin:
+            relay=SignedRangeRelay(origin.client,origin.signed,attempts=2)
+            with self.assertRaises(MediaTransportError) as error:relay.start()
+            self.assertEqual(error.exception.code,'range_not_honored')
+            self.assertEqual(len(origin.requests),2)
+            self.assertEqual(relay.audit()['upstream_bytes'],0)
+            self.assertEqual(relay.audit()['upstream_status_counts'],{'200':2})
 
     def test_diagnostic_byte_budget_is_bounded_and_relay_closes(self):
         with Origin(self.DATA) as origin:

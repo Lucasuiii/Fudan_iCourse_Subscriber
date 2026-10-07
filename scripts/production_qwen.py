@@ -216,9 +216,14 @@ def validation_course():
     course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
     rank = validation_rank()
     source = os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip()
+    selection_source = os.environ.get('VALIDATION_SELECTION_RUN_ID', '').strip()
+    if selection_source and (not selection_source.isascii() or not selection_source.isdigit()):
+        raise ValueError('Invalid validation selection source')
+    if source and selection_source:
+        raise ValueError('Conflicting validation sources')
     if source and (not source.isascii() or not source.isdigit()):
         raise ValueError('Invalid validation source run')
-    if not course and (rank != 1 or validation_before_date() or source):
+    if not course and (rank != 1 or validation_before_date() or source or selection_source):
         raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
         courses = [item.strip() for item in course.split(',')]
@@ -285,6 +290,46 @@ def validation_source_queue(source):
         tasks[0][2]['_frozen_glossary'] = frozen
     tasks[0][2]['_validation']['source_run_id'] = source
     files['queue.json'] = shards.encoded(tasks)
+    return files
+
+
+def validation_selection_queue(source):
+    """Explicitly authorized fresh trial; freeze an ended pre-ASR batch selection.
+
+    This does not recover/repeat recognized blocks or reset cloud review quota.
+    Any existing ASR/gather/publication stage makes this entry ineligible.
+    """
+    from scripts import production_pool as pool
+    info=pool.api(f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{source}')
+    if info['status']!='completed' or info['path'].split('@')[0]!='.github/workflows/parallel_pilot.yml':
+        raise ValueError('Selection source must be an ended formal pilot')
+    store=pool.store_for(source)
+    try: state=pool.read_state(store)[1]
+    finally: store.close()
+    if state['run_id']!=source or state['sha']!=info['head_sha']:
+        raise ValueError('Selection source journal differs')
+    flags={key:os.environ.get(key,'false') for key in ('AUTO_COURSE_TERMS','PUBLISH_RESULTS','SEND_EMAIL')}
+    if state['flags']!=flags or flags['PUBLISH_RESULTS']!='false' or flags['SEND_EMAIL']!='false':
+        raise ValueError('Selection source flags differ')
+    for ticket in state['tickets']:
+        if ticket['stage']!='prepare' or not ticket.get('run'):
+            raise ValueError('Selection source has recognition or unresolved stages; reuse required')
+        child=pool.api(f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{ticket["run"]}')
+        if (child['status']!='completed' or child['head_sha']!=state['sha']
+                or child['path'].split('@')[0]!='.github/workflows/'+pool.WORKFLOW
+                or child['display_title']!=f'icourse-stage-{source}-{ticket["nonce"]}' or child['run_attempt']!=1):
+            raise ValueError('Selection source child still active or mismatched')
+    target=root()/'selection-source'
+    artifact('qwen-production-queue',target,run=source,required=True)
+    with shards.environment({'GITHUB_RUN_ID':source}):
+        files=decode(target/'queue.enc','queue')
+    tasks=read_json(files['queue.json'])
+    if len(tasks)!=state['task_count'] or any(not task[2].get('_validation') for task in tasks):
+        raise ValueError('Selection source is not an isolated validation queue')
+    for task in tasks:
+        task[2]['_validation'].pop('source_run_id',None)
+        task[2]['_validation']['selection_source_run_id']=source
+    files['queue.json']=shards.encoded(tasks)
     return files
 
 
@@ -363,6 +408,10 @@ def plan():
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
         files = decode(root()/'previous'/'queue.enc', 'queue')
+    elif os.environ.get('VALIDATION_SELECTION_RUN_ID', '').strip():
+        if int(os.environ.get('GITHUB_RUN_ATTEMPT','1'))>1:
+            raise ValueError('Rerun has lost its queue checkpoint; refusing a new selection')
+        files=validation_selection_queue(os.environ['VALIDATION_SELECTION_RUN_ID'].strip())
     elif os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
         if int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')) > 1:
             raise ValueError('Rerun has lost its queue checkpoint; refusing a new selection')
@@ -422,6 +471,8 @@ def plan():
                 raise ValueError('Validation queue does not match the requested recording')
             if audit.get('source_run_id', '') != os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip():
                 raise ValueError('Validation queue does not match its source run')
+            if audit.get('selection_source_run_id','')!=os.environ.get('VALIDATION_SELECTION_RUN_ID','').strip():
+                raise ValueError('Validation queue does not match its selection source')
             if not lecture_is_selected(course, lecture, {}, exclusions=config.COURSE_SESSION_EXCLUSIONS):
                 raise ValueError('Frozen validation lesson is now excluded')
         selection = tasks[0][2]['_validation'] if len(tasks) == 1 else {'courses': [

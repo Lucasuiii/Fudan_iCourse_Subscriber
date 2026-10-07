@@ -54,3 +54,8 @@ owner、派发日志及块队列都只存密文；代码分支只保存已有代
 这些测试不登录 iCourse、不调用模型、SMTP 或正式数据库，不证明新控制器的云端派发、速度及课堂准确率。旧共享队列的真实课堂证据不能替代新编排的验证。开发分支 push 可触发一个无密钥、无课堂操作的注册 Job；派发前仍通过 API 确认子入口已注册，不假定注册成功。按 GitHub 文档保证派发需默认分支存在该入口；正式启用后的首堂应观察全部子 run 和总成本，保留隔离发布/不发送邮件的试跑选项。
 
 GitHub 原生支持使用 `GITHUB_TOKEN` 触发 `workflow_dispatch`，不需要新增 PAT；控制器因此使用 `actions: write`，子任务只用 `actions: read`。参考 [token 触发规则](https://docs.github.com/en/actions/concepts/security/github_token) 和 [手动工作流条件](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)。
+
+
+显式修复后新试跑可用 `validation_selection_run_id` 锁定已经结束、仅准备阶段的隔离批次原选课和历史库。父 run、全部 prepare 子 run、SHA 和票据必须相符且结束，存在 ASR、汇总、发布或未知派发即拒绝此入口，避免重复成功识别或重置复核额度。普通工作流重试仍复用原检查点，不自动重新取音频。
+
+媒体 relay 对 HTTP 200 或重定向等未履行 Range 的响应不会读取或转发；最多三次重新签名、同偏移重试，并记录安全的 HTTP 状态计数。响应必须继续满足 Content-Range、长度、源 ETag/Last-Modified 一致性，源变更立即失败。有限重试提高临时拒绝的恢复能力，不保证服务端持续不支持范围读取时仍能成功，也不放宽音频完整性检查。

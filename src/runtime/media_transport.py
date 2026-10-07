@@ -47,7 +47,8 @@ class SignedRangeRelay:
         self._audit = dict(mode='signed_range_relay', range_requests=0,
                            range_verified=0, retries=0, signature_renewals=0,
                            upstream_bytes=0, source_total_bytes=None,
-                           validator_kind=None, terminal_error_code=None)
+                           validator_kind=None, terminal_error_code=None,
+                           upstream_status_counts={}, range_rejections=0)
         if not 4096 <= chunk_bytes <= 16*1024*1024 or not 1 <= attempts <= 4:
             raise ValueError('Invalid bounded media transport limits')
         if not 1 <= prefix_bytes <= chunk_bytes:
@@ -55,7 +56,7 @@ class SignedRangeRelay:
 
     def audit(self):
         with self._audit_lock:
-            return dict(self._audit)
+            return dict(self._audit, upstream_status_counts=dict(self._audit['upstream_status_counts']))
 
     def _count(self, key, amount=1):
         with self._audit_lock:
@@ -101,10 +102,20 @@ class SignedRangeRelay:
         return target, headers
 
     def _verify_response(self, response, start, end, *, open_ended=False):
+        with self._audit_lock:
+            counts=self._audit['upstream_status_counts']
+            label=str(response.status_code)
+            counts[label]=counts.get(label,0)+1
         if response.status_code == 412: self._fail('source_changed')
         if response.status_code in (401,403,408,429,500,502,503,504):
             raise MediaTransportError('upstream_retryable_http')
-        if response.status_code != 206: self._fail('range_not_honored')
+        if response.status_code != 206:
+            self._count('range_rejections')
+            # Never consume an ignored range or follow a login redirect. A
+            # fresh signature can recover transient anti-replay responses.
+            if response.status_code in (200,301,302,303,307,308):
+                raise MediaTransportError('range_not_honored')
+            self._fail('range_not_honored')
         match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
         if not match: self._fail('invalid_content_range')
         first,last,total = map(int,match.groups())
@@ -131,10 +142,11 @@ class SignedRangeRelay:
         return min(last,end)-first+1
 
     def _read_range(self, start, end, *, initial_probe=False):
-        data = bytearray()
+        data = bytearray(); last_error = None
         with self._fetch_lock:
             if self.audit()['terminal_error_code']: raise MediaTransportError('transport_failed')
             for attempt in range(self.attempts):
+                last_error=None
                 if self._stop.is_set(): raise MediaTransportError('stopped')
                 response = None
                 session = self.session_factory()
@@ -162,7 +174,8 @@ class SignedRangeRelay:
                         self._count('upstream_bytes',len(block))
                     return bytes(data)
                 except MediaTransportError as error:
-                    if error.code not in ('upstream_retryable_http','upstream_premature_eof'):
+                    last_error=error.code
+                    if self.audit()['terminal_error_code'] or error.code not in ('upstream_retryable_http','upstream_premature_eof','range_not_honored'):
                         raise
                 except (requests.RequestException, OSError):
                     pass
@@ -176,8 +189,11 @@ class SignedRangeRelay:
                         response.close()
                     session.close()
                 if self._stop.is_set(): raise MediaTransportError('stopped')
-                if attempt+1 < self.attempts: self._count('retries')
-            self._fail('upstream_retries_exhausted')
+                if attempt+1 < self.attempts:
+                    self._count('retries')
+                    if last_error == 'range_not_honored' and self._stop.wait(2*(attempt+1)):
+                        raise MediaTransportError('stopped')
+            self._fail('range_not_honored' if last_error == 'range_not_honored' else 'upstream_retries_exhausted')
 
     def start(self):
         try:
