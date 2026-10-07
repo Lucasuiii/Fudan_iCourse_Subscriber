@@ -92,3 +92,29 @@ def validate_prepared_audio(specification):
         raise ValueError('Production audio has invalid sample metadata')
     if media and duration < media-max(120, media*.05):
         raise ValueError('Production audio is incomplete')
+
+
+STARTUP_ERROR_CODES = frozenset({
+    'source_changed', 'source_validator_missing', 'invalid_content_length',
+    'invalid_content_range', 'invalid_read_length', 'media_redirect_untrusted',
+    'media_session_unavailable', 'media_session_refresh_needed', 'range_not_honored',
+    'upstream_timeout', 'upstream_connection_error', 'upstream_premature_eof',
+    'upstream_http_rejected', 'upstream_retryable_http', 'transport_internal_error',
+    'transport_failed', 'diagnostic_byte_limit', 'stopped', 'service_unavailable',
+    'cold_session', 'cas_context_missing', 'api_verification_failed',
+    'authentication_rejected', 'password_method_missing', 'service_redirect_untrusted',
+    'service_http_rejected', 'public_key_missing', 'login_token_missing',
+    'cas_ticket_missing', 'ticket_destination_untrusted', 'media_auth_cancelled'})
+
+
+def startup_diagnostics(phase, error=None, transport=None):
+    """Keep pre-PCM failures without storing exception text or a traceback."""
+    from src.runtime.media_protocol import MediaTransportError
+    from src.api.webvpn import AuthenticationError
+    code = (error.code if isinstance(error, MediaTransportError) else
+            error.reason if isinstance(error, AuthenticationError) else None)
+    value = {'phase': phase, 'error_type': type(error).__name__ if error is not None else 'NoPlayableURL',
+             'error_code': code if code in STARTUP_ERROR_CODES else
+                'media_url_unavailable' if error is None else 'audio_startup_exception'}
+    if transport is not None: value['source_transport'] = transport.audit()
+    return value

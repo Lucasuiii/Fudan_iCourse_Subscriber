@@ -88,6 +88,7 @@ def failure_code(error):
         'Prior finalization quota is unknown; fresh review forbidden': 'quota_checkpoint_missing',
         'Recovery artifact is expired or ambiguous': 'recovery_expired',
         'Required recovery artifact is absent': 'recovery_missing',
+        'No playable production audio': 'audio_startup_failed',
         'Production audio is incomplete': 'incomplete_audio',
         'Production audio has read or decode errors': 'audio_decode_errors',
         'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
@@ -693,6 +694,8 @@ def preparation_failure_audit(specification, files, error, *, saved=False, secon
         'total_size_limit_bytes': bundle.MAX_BYTES, 'part_size_limit_bytes': bundle.PART_BYTES,
         'planned_blocks': len(specification.get('plan', {}).get('blocks', [])),
         'planned_workers': len(specification.get('plan', {}).get('shards', []))}
+    if specification.get('audio_startup_diagnostics'):
+        audit['audio_startup_diagnostics'] = specification['audio_startup_diagnostics']
     if full_counts is not None:
         audit.update(full_checkpoint_file_count=full_counts[0], full_checkpoint_content_bytes=full_counts[1])
     timing = specification.get('preparation_timing', {})
@@ -856,7 +859,9 @@ def prepare():
                 specification['prepare_phase'] = 'audio_download'
                 scheduler.audio_downloader.schedule(client, course, sub_id, preserve_timestamps=True)
                 handle = scheduler.audio_downloader.get(sub_id, timeout=180)
-                if handle is None: raise ValueError('No playable production audio')
+                if handle is None:
+                    specification['audio_startup_diagnostics'] = scheduler.audio_downloader.startup_failure(sub_id)
+                    raise ValueError('No playable production audio')
                 began = time.monotonic()
                 while not Path(handle.path).exists():
                     if handle.process.poll() is not None or time.monotonic()-began > 60:

@@ -17,6 +17,7 @@ on download completion.  See ``AudioDownloader`` below.
 from __future__ import annotations
 
 import os
+import copy
 import subprocess
 import threading
 import time
@@ -26,7 +27,7 @@ from typing import Callable, Optional
 
 from src.runtime import config
 from src.runtime.media_transport import SignedRangeRelay
-from src.runtime.audio_preparation import DecodeErrorScanner, record_decode_errors
+from src.runtime.audio_preparation import DecodeErrorScanner, record_decode_errors, startup_diagnostics
 from src.api import icourse
 
 
@@ -169,6 +170,7 @@ class AudioDownloader:
         self._active: dict[str, "AudioHandle | _PendingSpawn"] = {}
         self._lock = threading.Lock()
         self._reporter = reporter
+        self._startup_failures = {}
         os.makedirs(self._dir, exist_ok=True)
 
     @property
@@ -191,6 +193,7 @@ class AudioDownloader:
         with self._lock:
             if sub_id in self._active:
                 return
+            self._startup_failures.pop(sub_id, None)
             self._active[sub_id] = pending
 
         threading.Thread(
@@ -206,20 +209,35 @@ class AudioDownloader:
             if self._active.get(sub_id) is pending:
                 self._active.pop(sub_id, None)
 
+    def _record_startup_failure(self, sub_id, pending, diagnostics):
+        with self._lock:
+            if self._active.get(sub_id) is not pending: return
+            self._startup_failures[sub_id] = diagnostics
+            while len(self._startup_failures) > 128:
+                self._startup_failures.pop(next(iter(self._startup_failures)))
+
+    def startup_failure(self, sub_id):
+        with self._lock:
+            return copy.deepcopy(self._startup_failures.get(str(sub_id), {}))
+
     def _spawn_when_ready(self, client, course_id: str, sub_id: str,
                           pending: _PendingSpawn, preserve_timestamps=False):
         transport = None
         try:
             self._sem.acquire()
             try:
+                phase = 'media_lookup'
                 url = client.get_video_url(course_id, sub_id)
                 if not url:
+                    self._record_startup_failure(sub_id, pending, startup_diagnostics(phase))
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
                 if preserve_timestamps:
+                    phase = 'media_transport_start'
                     transport = SignedRangeRelay(client,url,allow_session_refresh=True,
-                                                 cache_bytes=16*1024*1024).start()
+                                                 cache_bytes=16*1024*1024)
+                    transport.start()
                     vpn_url, headers = transport.url, ''
                     # Bounded range recovery, old-session probes and one 75s
                     # fresh authentication fit within the 180s network window.
@@ -247,6 +265,7 @@ class AudioDownloader:
                     "-f", "f32le",
                     path,
                 ]
+                phase = 'decoder_spawn'
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -326,7 +345,8 @@ class AudioDownloader:
                     target=self._monitor, args=(handle,),
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
-            except Exception:
+            except Exception as error:
+                self._record_startup_failure(sub_id, pending, startup_diagnostics(phase, error, transport))
                 if transport is not None: transport.close()
                 self._pop_if_mine(sub_id, pending)
                 self._sem.release()
@@ -377,6 +397,7 @@ class AudioDownloader:
         """
         sub_id = str(sub_id)
         with self._lock:
+            self._startup_failures.pop(sub_id, None)
             handle = self._active.pop(sub_id, None)
         if not isinstance(handle, AudioHandle):
             return
@@ -402,6 +423,7 @@ class AudioDownloader:
             sub_ids = list(self._active.keys())
         for sub_id in sub_ids:
             self.release(sub_id)
+        with self._lock: self._startup_failures.clear()
 
 
 # ── Scheduler — single façade ──────────────────────────────────────────────

@@ -175,18 +175,28 @@ def fetch():
     began = time.monotonic()
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            audit['phase'] = 'authentication'
             vpn = authenticated_session()
+            audit['phase'] = 'audio_startup'
             downloader = AudioDownloader(str(pipeline.root()/'audio'), max_concurrent=1)
             downloader.schedule(ICourseClient(vpn, media_reauth_factory=fresh_media_session), course, lecture['sub_id'], preserve_timestamps=True)
             handle = downloader.get(lecture['sub_id'], timeout=180)
-            if handle is None: raise ValueError('No playable production audio')
+            if handle is None:
+                audit['audio_startup_diagnostics'] = downloader.startup_failure(lecture['sub_id'])
+                raise ValueError('No playable production audio')
+            audit['phase'] = 'audio_download'
             wait_audio(handle)
+            audit['phase'] = 'audio_retention'
             # Preserve actual samples/hash/diagnostics before testing completeness.
             pipeline.retain_prepared_audio(handle, spec, files)
+            audit['phase'] = 'audio_validation'
             validate_prepared_audio(spec)
-        audit['status'] = 'complete'
+        audit.update(status='complete', phase='complete')
     except Exception as error:
         audit.update(status='failed', error_type=type(error).__name__, error_code=pipeline.failure_code(error))
+        if audit.get('phase') == 'authentication':
+            from src.runtime.audio_preparation import startup_diagnostics
+            audit['authentication_diagnostics'] = startup_diagnostics('authentication', error)
         if handle is not None:
             try:
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
