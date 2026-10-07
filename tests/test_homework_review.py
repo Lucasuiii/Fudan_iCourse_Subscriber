@@ -174,17 +174,17 @@ class AssignmentLedgerTests(unittest.TestCase):
             self.assertTrue(result['homework']['candidates']); cloud.assert_not_called()
             self.assertNotIn('private data', str(state))
 
-    def test_twenty_short_clips_allowed_but_twenty_first_and_over_time_rejected(self):
-        for duration, expected in [(1, 20), (60, 10)]:
+    def test_forty_short_clips_allowed_but_forty_first_and_over_time_rejected(self):
+        for duration, expected in [(1, 40), (60, 15)]:
             state = {'intervals': [dict(start_ms=i*60000, end_ms=i*60000+duration*1000,
                                         quote_start_ms=i*60000, quote_end_ms=i*60000+duration*1000,
-                                        text='疑点') for i in range(25)]}
+                                        text='疑点') for i in range(45)]}
             data = dict(material(), full_chunks=[], transcript='')
             with patch('src.runtime.config.DOUBAO_ASR_API_KEY', 'fake'), \
                  patch('src.ai.doubao_asr.rescue_intervals_pcm', return_value=([], duration, False)) as cloud:
                 review_prepared(data, [], MagicMock(), state, lambda: None)
             self.assertEqual(cloud.call_count, expected)
-            self.assertLessEqual(state['seconds'], 600); validate_ledger(state)
+            self.assertLessEqual(state['seconds'], 900); validate_ledger(state)
             if duration == 1:
                 too_many = copy.deepcopy(state)
                 too_many['attempts'].append({'interval': {'start_ms': 9999999, 'end_ms': 10000999},
@@ -195,6 +195,40 @@ class AssignmentLedgerTests(unittest.TestCase):
         extra['attempts'].append({'interval': {'start_ms': 9999999, 'end_ms': 10000999}, 'seconds': 1, 'status': 'reserved'})
         extra['seconds'] += 1
         with self.assertRaises(ValueError): validate_ledger(extra)
+
+    def test_existing_reservations_consume_new_shared_budget_on_resume(self):
+        # Old weak/homework requests, including unknown outcomes, remain charged.
+        for duration, prior_count, expected in [(1, 20, 20), (60, 10, 5)]:
+            intervals = [dict(start_ms=i*60000, end_ms=i*60000+duration*1000,
+                              quote_start_ms=i*60000, quote_end_ms=i*60000+duration*1000,
+                              text='疑点') for i in range(50)]
+            attempts = [dict(interval=dict(intervals[i], chunk_id=i, kind='homework' if i%2 else 'weak'),
+                             seconds=duration, status='reserved' if i%2 else 'complete')
+                        for i in range(prior_count)]
+            state = {'attempts': attempts, 'seconds': prior_count*duration,
+                     'intervals': intervals, 'weak_intervals': [],
+                     'homework': {'candidates': [], 'intervals': [], 'visual': {'status': 'unavailable'}}}
+            data = dict(material(), full_chunks=[], transcript='')
+            with patch('src.runtime.config.DOUBAO_ASR_API_KEY', 'fake'), \
+                 patch('src.ai.doubao_asr.rescue_intervals_pcm', return_value=([], duration, False)) as cloud:
+                review_prepared(data, [], MagicMock(), state, lambda: None)
+            self.assertEqual(cloud.call_count, expected)
+            self.assertEqual(len(state['attempts']), prior_count+expected)
+            self.assertEqual(state['seconds'], (prior_count+expected)*duration)
+            self.assertEqual(state['attempts'][1]['status'], 'reserved')
+            validate_ledger(state)
+
+    def test_completed_old_twenty_clip_checkpoint_is_not_reopened(self):
+        attempts = [dict(interval=dict(start_ms=i*30000, end_ms=i*30000+10000),
+                         seconds=10, status='complete') for i in range(20)]
+        result = {'transcript': '已有结果'}
+        state = {'attempts': attempts, 'seconds': 200, 'complete': True, 'material': result}
+        saved = copy.deepcopy(state)
+        with patch('src.runtime.config.DOUBAO_ASR_API_KEY', 'fake'), \
+             patch('src.ai.doubao_asr.rescue_intervals_pcm') as cloud:
+            self.assertEqual(review_prepared(material(), [], MagicMock(), state, lambda: None), result)
+        cloud.assert_not_called()
+        self.assertEqual(state, saved)
 
     def test_failed_ocr_preserves_audio_review_and_does_not_expose_transport_details(self):
         state = {'intervals': []}

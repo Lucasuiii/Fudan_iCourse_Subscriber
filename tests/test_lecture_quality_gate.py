@@ -273,7 +273,7 @@ class LectureQualityGateIntegrationTests(unittest.TestCase):
             runner._refine_unclear_transcript(local[0]["text"], local, [],
                                               course_title="高等代数Ⅰ")
         self.assertEqual(rescue.call_args.kwargs,
-                     {"max_seconds": 30, "max_clips": 12})
+                     {"max_seconds": 330, "max_clips": 32})
         self.assertEqual(runner._cloud_seconds, 590)
         self.assertEqual(summarizer.find_unclear_windows.call_args.kwargs,
                          {"course_title": "高等代数Ⅰ"})

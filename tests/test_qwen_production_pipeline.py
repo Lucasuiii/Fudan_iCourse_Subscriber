@@ -952,8 +952,8 @@ class RecoveryBoundaryTests(unittest.TestCase):
         with patch('src.ai.qwen_review_ledger.config.DOUBAO_ASR_API_KEY','fake'), \
              patch('src.ai.doubao_asr.rescue_intervals_pcm',return_value=([],60,False)) as recognize:
             review_prepared(material,[],MagicMock(),state,lambda:None)
-        self.assertEqual(recognize.call_count,10);self.assertEqual(state['seconds'],600)
-        self.assertLessEqual(len(state['attempts']),20)
+        self.assertEqual(recognize.call_count,15);self.assertEqual(state['seconds'],900)
+        self.assertLessEqual(len(state['attempts']),40)
 
     def test_saved_review_variants_survive_missing_api_key(self):
         Runner=_load_runner_class();plan,results=fixture();material=assemble_material(plan,results)
