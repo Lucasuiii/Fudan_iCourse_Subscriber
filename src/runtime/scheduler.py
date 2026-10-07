@@ -235,9 +235,10 @@ class AudioDownloader:
                 if preserve_timestamps:
                     transport = SignedRangeRelay(client,url,allow_session_refresh=True).start()
                     vpn_url, headers = transport.url, ''
-                    # Three bounded upstream connect/read attempts can take
-                    # about 77s; allow them to finish before FFmpeg gives up.
-                    network_options = ['-rw_timeout','90000000']
+                    # Three 10/15s range attempts plus the one-time 5/10s
+                    # connect/read SSO probes and backoff fit within 120s.
+                    # The existing 5-minute PCM-stall gate still applies.
+                    network_options = ['-rw_timeout','120000000']
                 else:
                     vpn_url, headers = client.get_stream_params(url)
                     network_options = ['-reconnect','1','-reconnect_streamed','1','-reconnect_delay_max','5']
