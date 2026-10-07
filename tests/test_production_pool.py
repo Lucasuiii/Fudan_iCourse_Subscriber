@@ -434,6 +434,67 @@ class AudioAndStorageTests(unittest.TestCase):
 
 
 
+class SummarySourceTests(unittest.TestCase):
+    def completed_course(self):
+        state = journal(2)
+        state['courses']['0']['phase'] = 'failed'
+        state['courses']['1']['phase'] = 'done'
+        children = {}
+        for index, stage in enumerate(('gather', 'publish')):
+            ticket = pool.reserve(state, 1, stage, 1)
+            ticket.update(status='completed', conclusion='success', run=str(101+index))
+            children[ticket['run']] = {'path': '.github/workflows/'+pool.WORKFLOW,
+                'status': 'completed', 'conclusion': 'success', 'head_sha': state['sha'],
+                'display_title': 'icourse-stage-99-'+ticket['nonce'], 'run_attempt': 1}
+        state['courses']['1']['phase'] = 'done'
+        info = {'path': '.github/workflows/parallel_pilot.yml', 'status': 'completed',
+                'conclusion': 'failure', 'head_sha': state['sha']}
+        return info, state, children
+
+    def test_failed_batch_exports_only_independently_successful_course(self):
+        from scripts.production_result_export import validate_summary_source
+        info, state, children = self.completed_course()
+        validate_summary_source(info, '99', 1, read_pool=lambda: state, inspect_run=children.__getitem__)
+        for run, slot in [('99', 0), ('99', 2), ('100', 1)]:
+            with self.assertRaises(ValueError):
+                validate_summary_source(info, run, slot, read_pool=lambda: state, inspect_run=children.__getitem__)
+        for changes in ({'status': 'in_progress'}, {'conclusion': 'cancelled'},
+                        {'path': '.github/workflows/check.yml'}, {'head_sha': 'b'*40}):
+            with self.assertRaises(ValueError):
+                validate_summary_source(dict(info, **changes), '99', 1,
+                    read_pool=lambda: state, inspect_run=children.__getitem__)
+
+    def test_child_identity_and_latest_stage_completion_cannot_be_bypassed(self):
+        from scripts.production_result_export import validate_summary_source
+        info, state, children = self.completed_course()
+        for stage_index in range(2):
+            for changes in ({'status': 'in_progress'}, {'conclusion': 'failure'},
+                            {'head_sha': 'b'*40}, {'run_attempt': 2}, {'display_title': 'wrong'},
+                            {'path': '.github/workflows/check.yml'}):
+                altered = copy.deepcopy(children)
+                altered[str(101+stage_index)].update(changes)
+                with self.assertRaises(ValueError):
+                    validate_summary_source(info, '99', 1, read_pool=lambda: state,
+                                            inspect_run=altered.__getitem__)
+        for changes in ({'status': 'reserved'}, {'run': None}, {'conclusion': 'failure'}):
+            altered = copy.deepcopy(state); altered['tickets'][-1].update(changes)
+            with self.assertRaises(ValueError):
+                validate_summary_source(info, '99', 1, read_pool=lambda: altered,
+                                        inspect_run=children.__getitem__)
+        altered = copy.deepcopy(state)
+        pool.reserve(altered, 1, 'gather', 2)
+        with self.assertRaises(ValueError):
+            validate_summary_source(info, '99', 1, read_pool=lambda: altered,
+                                    inspect_run=children.__getitem__)
+
+    def test_successful_legacy_summary_needs_no_pool(self):
+        from scripts.production_result_export import validate_summary_source
+        info = {'path': '.github/workflows/parallel_pilot.yml', 'status': 'completed', 'conclusion': 'success'}
+        read = MagicMock()
+        validate_summary_source(info, '99', 0, read_pool=read)
+        read.assert_not_called()
+
+
 class InspectionSourceTests(unittest.TestCase):
     def test_live_parent_allows_only_confirmed_ended_preparation_child(self):
         from scripts.production_result_export import validate_inspection_source

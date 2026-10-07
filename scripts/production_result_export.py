@@ -135,6 +135,43 @@ def validate_inspection_source(info, run, slot, *, read_pool=None, inspect_run=N
         raise ValueError('Prepared child identity mismatch')
 
 
+def validate_summary_source(info, run, slot, *, read_pool=None, inspect_run=None):
+    """A failed batch may still contain an independently completed course."""
+    if (info['status'] != 'completed'
+            or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml'):
+        raise ValueError('Source is not a completed production pilot')
+    if info['conclusion'] == 'success': return
+    if info['conclusion'] != 'failure':
+        raise ValueError('Source batch did not finish normally')
+    from scripts import production_pool as pool
+    if read_pool is None:
+        store = pool.store_for(run)
+        try: state = pool.read_state(store)[1]
+        finally: store.close()
+    else: state = read_pool()
+    pool.validate(state)
+    if (state['run_id'] != run or state['sha'] != info['head_sha']
+            or state['courses'].get(str(slot), {}).get('phase') != 'done'):
+        raise ValueError('Summary course is not independently complete')
+    tickets = [t for t in state['tickets'] if t['slot'] == slot]
+    if any(t['status'] != 'completed' for t in tickets):
+        raise ValueError('Summary course still has active stages')
+    inspect_run = inspect_run or (lambda child: pool.api(
+        f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{child}'))
+    for stage in ('gather', 'publish'):
+        history = [t for t in tickets if t['stage'] == stage]
+        if not history or not history[-1].get('run') or history[-1].get('conclusion') != 'success':
+            raise ValueError('Completed summary stage unavailable')
+        ticket = history[-1]
+        child = inspect_run(ticket['run'])
+        if (child['status'] != 'completed' or child['conclusion'] != 'success'
+                or child['head_sha'] != state['sha']
+                or child['path'].split('@')[0] != '.github/workflows/'+pool.WORKFLOW
+                or child['display_title'] != f'icourse-stage-{run}-{ticket["nonce"]}'
+                or child['run_attempt'] != 1):
+            raise ValueError('Completed summary child identity mismatch')
+
+
 def export():
     from scripts import production_qwen as pipeline
     from scripts import sharded_qwen_pilot as shards
@@ -144,9 +181,7 @@ def export():
     if len(recipient) != 32: raise ValueError('Invalid recipient public key')
     info = json.loads(subprocess.check_output(['gh','api',
         f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run}'], stderr=subprocess.PIPE, timeout=60))
-    if (info['status'] != 'completed' or info['conclusion'] != 'success'
-            or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml'):
-        raise ValueError('Source is not a completed production pilot')
+    validate_summary_source(info, run, slot)
     target = pipeline.root()/'export-source'
     pipeline.artifact(f'qwen-production-state-{slot}', target, run=run, required=True)
     with shards.environment({'GITHUB_RUN_ID':run, 'COURSE_SLOT':str(slot)}):
