@@ -8,10 +8,10 @@ from src.ai import doubao_asr
 
 class DoubaoASRTests(unittest.TestCase):
     def test_profiles_enforce_shared_time_and_clip_caps(self):
-        for profile, seconds_cap, clips_cap in [('production', 600, 20), ('pilot15', 900, 18)]:
+        for profile, seconds_cap, clips_cap in [('production', 900, 40), ('pilot15', 900, 18)]:
             for seconds in (1, 60):
                 intervals = [{'start_ms': i*60000, 'end_ms': i*60000+seconds*1000, 'text': ''}
-                             for i in range(25)]
+                             for i in range(45)]
                 with patch.object(doubao_asr, '_encode_chunk', return_value=b'audio'), \
                      patch.object(doubao_asr, '_recognize_chunk', return_value=[{'text': '矩阵'}]):
                     results, spent, failed = doubao_asr.rescue_intervals_pcm(
@@ -21,7 +21,7 @@ class DoubaoASRTests(unittest.TestCase):
                 self.assertLessEqual(spent, seconds_cap)
                 self.assertFalse(failed)
         from src.ai.segment_rescue import cloud_budget_limits
-        self.assertEqual(cloud_budget_limits(), (600, 20))
+        self.assertEqual(cloud_budget_limits(), (900, 40))
         with self.assertRaises(ValueError):
             cloud_budget_limits('unbounded')
 
@@ -165,31 +165,31 @@ class DoubaoASRTests(unittest.TestCase):
         self.assertEqual(recognize.call_count, 2)
         self.assertEqual(encode.call_args_list[0].args, ("unused", 30, 10))
 
-    def test_rescue_hard_duration_cap_is_ten_minutes(self):
+    def test_rescue_hard_duration_cap_is_fifteen_minutes(self):
         intervals = [{"start_ms": i * 60_000, "end_ms": (i + 1) * 60_000,
-                      "text": ""} for i in range(12)]
+                      "text": ""} for i in range(18)]
         with patch.object(doubao_asr, "_encode_chunk", return_value=b"mp3"), \
              patch.object(doubao_asr, "_recognize_chunk", return_value=[]):
             rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
                 "unused", "key", intervals, session=MagicMock(),
                 max_seconds=9999, max_clips=99,
             )
-        self.assertEqual(attempted, 600)
-        self.assertEqual(len(rescues), 10)
+        self.assertEqual(attempted, 900)
+        self.assertEqual(len(rescues), 15)
         self.assertFalse(failed)
 
-    def test_rescue_hard_clip_cap_is_twenty_even_for_short_windows(self):
+    def test_rescue_hard_clip_cap_is_forty_even_for_short_windows(self):
         intervals = [{'start_ms': i * 20_000, 'end_ms': (i + 1) * 20_000,
-                      'text': ''} for i in range(25)]
+                      'text': ''} for i in range(45)]
         with patch.object(doubao_asr, '_encode_chunk', return_value=b'mp3'), \
              patch.object(doubao_asr, '_recognize_chunk', return_value=[]) as recognize:
             rescues, attempted, failed = doubao_asr.rescue_intervals_pcm(
                 'unused', 'key', intervals, session=MagicMock(),
                 max_seconds=9999, max_clips=99,
             )
-        self.assertEqual(len(rescues), 20)
-        self.assertEqual(recognize.call_count, 20)
-        self.assertEqual(attempted, 400)
+        self.assertEqual(len(rescues), 40)
+        self.assertEqual(recognize.call_count, 40)
+        self.assertEqual(attempted, 800)
         self.assertFalse(failed)
 
     def test_rescue_respects_remaining_shared_budget(self):

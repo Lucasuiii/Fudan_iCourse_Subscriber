@@ -6,12 +6,12 @@ silent stretches are never sent to the cloud merely because the transcript is
 sparse.  The budget is per lecture, not per retry or account.
 """
 
-MAX_CLOUD_SECONDS = 10 * 60
-MAX_CLOUD_CLIPS = 20
+MAX_CLOUD_SECONDS = 15 * 60
+MAX_CLOUD_CLIPS = 40
 
 
 def cloud_budget_limits(profile='production'):
-    """Explicit isolated experiment; production defaults stay unchanged."""
+    """Whole-lecture defaults and the preserved historical experiment profile."""
     if profile == 'production':
         return MAX_CLOUD_SECONDS, MAX_CLOUD_CLIPS
     if profile == 'pilot15':
