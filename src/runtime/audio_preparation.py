@@ -116,5 +116,8 @@ def startup_diagnostics(phase, error=None, transport=None):
     value = {'phase': phase, 'error_type': type(error).__name__ if error is not None else 'NoPlayableURL',
              'error_code': code if code in STARTUP_ERROR_CODES else
                 'media_url_unavailable' if error is None else 'audio_startup_exception'}
+    if phase == 'authentication' and error is not None:
+        from src.api.webvpn import authentication_failure
+        value['authentication_failure'] = authentication_failure(error)
     if transport is not None: value['source_transport'] = transport.audit()
     return value

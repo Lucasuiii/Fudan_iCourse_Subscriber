@@ -109,11 +109,12 @@ class ICourseClient:
             self._media_owned_session.close()
             self._media_owned_session = None
 
-    def _verified_media_user(self, vpn):
+    def _verified_media_user(self, vpn, *, audit=None):
+        audit = self.media_auth_audit if audit is None else audit
         response = vpn.get(f'{self.base_url}/userapi/v1/infosimple',
                            allow_redirects=False, timeout=10)
         try:
-            self.media_auth_audit['api_status'] = response.status_code
+            audit['api_status'] = response.status_code
             if response.status_code != 200: return None
             payload = response.json()
             if payload.get('code') not in (0, 200): return None
@@ -122,7 +123,7 @@ class ICourseClient:
             for key in ('id', 'tenant_id'):
                 if (self._userinfo and self._userinfo.get(key) is not None
                         and str(self._userinfo[key]) != str(user.get(key))):
-                    self.media_auth_audit['failure'] = 'identity_mismatch'
+                    audit['failure'] = 'identity_mismatch'
                     return None
             return user
         finally:
@@ -167,35 +168,49 @@ class ICourseClient:
                                      reauth_successes=0)
         def authenticate():
             candidate = None
+            phase = 'fresh_session_factory'
+            audit = {}
             try:
                 candidate = self._media_reauth_factory(cancelled, deadline)
                 if cancelled.is_set() or stopped.is_set() or time.monotonic() >= deadline: return
-                user = self._verified_media_user(candidate)
+                phase = 'media_identity_verification'
+                for key, attribute in (('probe_attempts','auth_probe_attempts'),
+                                       ('probe_transient_failures','auth_probe_transient_failures')):
+                    value = getattr(candidate,attribute,None)
+                    if type(value) is int and 0 <= value <= 3: audit[key] = value
+                user = self._verified_media_user(candidate, audit=audit)
+                if user is None:
+                    audit.setdefault('failure','api_verification_failed')
+                    audit['failure_phase'] = phase
                 if user is None: return
                 with lock:
                     if not cancelled.is_set() and not stopped.is_set() and time.monotonic() < deadline:
                         result.update(vpn=candidate, user=user)
                         candidate = None
             except Exception as error:
-                # Only our own fixed enum is allowed; never provider text.
-                from src.api.webvpn import AuthenticationError
-                allowed = {'service_unavailable', 'cold_session', 'cas_context_missing',
-                           'api_verification_failed', 'authentication_rejected',
-                           'password_method_missing', 'media_auth_cancelled'}
-                reason = error.reason if isinstance(error, AuthenticationError) else None
-                self.media_auth_audit['failure'] = reason if reason in allowed else 'fresh_session_exception'
+                from src.api.webvpn import authentication_failure
+                audit.update(authentication_failure(error, phase))
             finally:
                 if candidate is not None: candidate.session.close()
+                with lock:
+                    # An abandoned auth worker cannot mutate the public audit
+                    # after the caller has published timeout/cancellation.
+                    if not cancelled.is_set() and not stopped.is_set() and time.monotonic() < deadline:
+                        result['audit'] = audit
                 ready.set()
         threading.Thread(target=authenticate, daemon=True).start()
         while not ready.wait(.05):
             if stopped.is_set() or time.monotonic() >= deadline: break
         with lock:
             cancelled.set()
+            self.media_auth_audit.update(result.get('audit',{}))
             candidate = result.get('vpn')
             if candidate is None or stopped.is_set() or time.monotonic() >= deadline:
                 if candidate is not None: candidate.session.close()
-                self.media_auth_audit.setdefault('failure', 'fresh_session_unavailable')
+                self.media_auth_audit.setdefault('failure',
+                    'media_auth_cancelled' if stopped.is_set() else
+                    'media_auth_deadline' if time.monotonic() >= deadline else 'fresh_session_unavailable')
+                self.media_auth_audit.setdefault('failure_phase','fresh_session_factory')
                 return False
             # Session stays usable after recovery; keep its cancellation separate
             # from the finished auth wait and retain a lifetime request deadline.
