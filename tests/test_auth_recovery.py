@@ -69,6 +69,39 @@ class AuthRecoveryTests(unittest.TestCase):
         with self.assertRaises(AuthenticationError):authenticated_session(factory=lambda:vpn)
         vpn.login.assert_not_called();response.close.assert_called_once()
 
+    def test_explicit_default_port_login_is_same_origin_but_other_ports_are_not(self):
+        from src.runtime.media_protocol import redirect_kind, redirect_observation
+        for location, trusted in (
+                ('https://webvpn.fudan.edu.cn:443/login', True),
+                ('https://webvpn.fudan.edu.cn:444/login', False),
+                ('https://webvpn.fudan.edu.cn:443/wengine-vpn/user/session', True),
+                ('https://webvpn.fudan.edu.cn:444/wengine-vpn/user/session', False),
+                ('https://webvpn.fudan.edu.cn.foreign.invalid:443/login', False),
+                ('https://private@webvpn.fudan.edu.cn:443/login', False),
+                ('http://webvpn.fudan.edu.cn:80/login', False)):
+            with self.subTest(location=location):
+                vpn=WebVPNSession();vpn.session.close();vpn.session=MagicMock()
+                response=SimpleNamespace(status_code=302,text='',history=[],
+                    url='https://webvpn.fudan.edu.cn/',headers={'Location':location},close=MagicMock())
+                vpn.session.get.return_value=response
+                if trusted:vpn.probe_login_service()
+                else:
+                    with self.assertRaises(AuthenticationError):vpn.probe_login_service()
+                response.close.assert_called_once()
+                self.assertFalse(vpn.logged_in)
+                if location.endswith(':443/login') and trusted:
+                    self.assertEqual(redirect_kind(response),'login')
+                    self.assertEqual(redirect_observation(response)['authority'],'same_origin')
+
+    def test_configured_wrapped_sso_accepts_only_equivalent_default_port(self):
+        from src.api.webvpn import get_vpn_url
+        from src.runtime.media_protocol import redirect_kind
+        known=get_vpn_url('https://id.fudan.edu.cn/idp/authCenter/authenticate')
+        for port,expected in ((443,'login'),(444,'other')):
+            location=known.replace('webvpn.fudan.edu.cn/',f'webvpn.fudan.edu.cn:{port}/')
+            response=SimpleNamespace(url='https://webvpn.fudan.edu.cn/media',headers={'Location':location})
+            self.assertEqual(redirect_kind(response,login_urls=(known,)),expected)
+
     def test_invalid_attempt_limits_fail_before_constructing_session(self):
         for value in (0,11,True,2.5):
             factory=MagicMock()

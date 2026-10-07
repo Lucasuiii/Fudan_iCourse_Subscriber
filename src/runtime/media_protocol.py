@@ -96,6 +96,13 @@ LOGIN_PATHS = ('/login', '/wengine-vpn/login', '/cas/login', '/authserver/login'
                '/authserver/authenticate', '/idp/authCenter/authenticate')
 
 
+def http_origin(parts):
+    """Compare HTTP origins using the effective port, including explicit defaults."""
+    return (parts.scheme.lower(), parts.hostname,
+            parts.port if parts.port is not None else
+            443 if parts.scheme.lower() == 'https' else 80 if parts.scheme.lower() == 'http' else None)
+
+
 def redirect_kind(response, *, login_urls=()):
     """Classify safely; never follow or export a replacement signed URL."""
     location = response.headers.get('Location')
@@ -106,9 +113,9 @@ def redirect_kind(response, *, login_urls=()):
         if (target.scheme not in ('http', 'https') or target.username or target.password
                 or source.scheme == 'https' and target.scheme != 'https'):
             return 'other'
-        same_origin = (source.scheme, source.netloc) == (target.scheme, target.netloc)
+        same_origin = http_origin(source) == http_origin(target)
         login_path = target.path.rstrip('/') in LOGIN_PATHS
-        if login_path and (same_origin or (target.scheme, target.netloc) == ('https', 'id.fudan.edu.cn')):
+        if login_path and (same_origin or http_origin(target) == ('https', 'id.fudan.edu.cn', 443)):
             return 'login'
         # The API adapter supplies exact, configured WebVPN encodings of SSO
         # entrypoints. A login-looking suffix inside an arbitrary proxy route
@@ -117,8 +124,8 @@ def redirect_kind(response, *, login_urls=()):
             for url in login_urls[:16]:
                 known = urlsplit(url)
                 if (not known.username and not known.password
-                        and (target.scheme, target.netloc, target.path.rstrip('/'))
-                        == (known.scheme, known.netloc, known.path.rstrip('/'))):
+                        and (http_origin(target), target.path.rstrip('/'))
+                        == (http_origin(known), known.path.rstrip('/'))):
                     return 'login'
         if same_origin and source.path == target.path: return 'same_media'
     except ValueError:
@@ -132,14 +139,14 @@ def redirect_observation(response):
     try:
         source = urlsplit(response.url)
         target = urlsplit(urljoin(response.url, response.headers.get('Location', '')))
-        same_origin = (source.scheme, source.netloc) == (target.scheme, target.netloc)
+        same_origin = http_origin(source) == http_origin(target)
         route = ('login_path' if target.path.rstrip('/') in LOGIN_PATHS else
                  'root' if target.path in ('', '/') else
                  'vpn_wrapped' if target.path.startswith(('/https/', '/http/')) else
                  'vpn_control' if target.path.startswith('/wengine-vpn/') else
                  'same_media' if same_origin and target.path == source.path else 'other')
         row.update(authority=('same_origin' if same_origin else
-                   'fudan_sso' if (target.scheme, target.netloc) == ('https', 'id.fudan.edu.cn') else 'other'),
+                   'fudan_sso' if http_origin(target) == ('https', 'id.fudan.edu.cn', 443) else 'other'),
                    route=route, https=target.scheme == 'https',
                    downgrade=source.scheme == 'https' and target.scheme != 'https',
                    credential_authority=bool(target.username or target.password),
