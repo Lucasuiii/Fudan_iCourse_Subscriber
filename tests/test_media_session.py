@@ -53,16 +53,19 @@ class SessionOrigin:
                     elif owner.mode=='wrapped_foreign':location=get_vpn_url('https://untrusted.invalid/cas/login')+'?private-ticket'
                     else:location='/media?t=untrusted-ticket'
                     self.reply(302,b'private-login-html',[('Location',location)]);return
-                if start and owner.mode in ('login','cold','persistent','changed','wrapped_login'):
-                    if owner.token!='refreshed' or owner.mode=='persistent':
+                if start and owner.mode in ('login','cold','persistent','changed','wrapped_login',
+                                           'control','control_persistent','control_changed','root'):
+                    if owner.token!='refreshed' or owner.mode in ('persistent','control_persistent'):
                         location = (get_vpn_url('https://id.fudan.edu.cn/idp/authCenter/authenticate')
                                     if owner.mode=='wrapped_login' else '/login')
+                        if owner.mode.startswith('control'):location='/wengine-vpn/session'
+                        if owner.mode=='root':location='/'
                         self.reply(302,b'private-login-html',[('Location',location+'?private-ticket')]);return
                 expected='' if owner.token is None else 'media_token='+owner.token
                 if cookie!=expected:
                     self.reply(401,b'private-login-html');return
                 headers=[('Content-Range',f'bytes {start}-{end}/{len(owner.DATA)}'),
-                         ('ETag','"changed"' if start and owner.mode=='changed' else '"immutable"')]
+                         ('ETag','"changed"' if start and owner.mode in ('changed','control_changed') else '"immutable"')]
                 if start==0 and owner.mode=='rotate':
                     owner.token='second';headers.append(('Set-Cookie','media_token=second; Path=/'))
                 elif start==0 and owner.mode=='delete':
@@ -172,6 +175,39 @@ class MediaSessionTests(unittest.TestCase):
             self.assertEqual(audit['session_refresh_attempts'],0)
             self.assertNotIn('/',origin.calls)
             self.assertNotIn('untrusted.invalid',json.dumps(audit))
+
+    def test_native_control_redirect_only_probes_original_session_and_resumes_original_range(self):
+        for mode in ('control','root'):
+            with self.subTest(mode=mode), SessionOrigin(mode) as origin, self.relay(origin,allow_session_refresh=True) as relay:
+                self.assertEqual(requests.get(relay.url,timeout=15).content,origin.DATA)
+                audit=relay.audit()
+                self.assertEqual(audit['session_refresh_attempts'],1)
+                self.assertEqual(audit['session_refresh_successes'],1)
+                self.assertEqual(audit['upstream_bytes'],len(origin.DATA))
+                self.assertEqual(audit['last_failure_offset'],4096)
+                self.assertEqual(audit['last_redirect']['classification'],'other')
+                self.assertEqual(audit['last_redirect']['recovery'],'probe_original_session')
+                self.assertNotIn('/wengine-vpn/session',origin.calls)
+                self.assertNotIn('private',json.dumps(audit))
+
+    def test_native_redirect_probe_cannot_override_source_change_or_repeat_forever(self):
+        for mode,code in [('control_changed','source_changed'),('control_persistent','media_redirect_untrusted')]:
+            with self.subTest(mode=mode), SessionOrigin(mode) as origin, self.relay(origin,allow_session_refresh=True) as relay:
+                with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+                audit=relay.audit()
+                self.assertEqual(audit['terminal_error_code'],code)
+                self.assertEqual(audit['session_refresh_attempts'],1)
+                self.assertEqual(audit['upstream_bytes'],4096)
+                self.assertNotIn('/wengine-vpn/session',origin.calls)
+
+    def test_native_redirect_probe_refuses_a_different_verified_account(self):
+        with SessionOrigin('control') as origin, self.relay(origin,allow_session_refresh=True) as relay:
+            origin.client._userinfo={'id':'different-private-user'}
+            with self.assertRaises(requests.RequestException):requests.get(relay.url,timeout=15)
+            audit=relay.audit()
+            self.assertEqual(audit['terminal_error_code'],'media_session_unavailable')
+            self.assertEqual(audit['session_refresh_successes'],0)
+            self.assertEqual(audit['upstream_bytes'],4096)
 
     def test_cold_or_repeated_login_redirect_does_not_loop_or_forward_html(self):
         for mode in ('cold','persistent'):

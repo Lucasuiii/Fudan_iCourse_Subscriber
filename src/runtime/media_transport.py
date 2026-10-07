@@ -175,6 +175,19 @@ class SignedRangeRelay:
                     self._audit['last_redirect'] = dict(redirect_observation(response), classification=kind)
                 if kind == 'login':
                     raise MediaTransportError('media_session_refresh_needed')
+                observed = redirect_observation(response)
+                if (self.allow_session_refresh and not self._session_refreshed
+                        and observed.get('authority') == 'same_origin'
+                        and observed.get('route') in ('root', 'vpn_control')
+                        and not observed.get('downgrade')
+                        and not observed.get('credential_authority')
+                        and callable(getattr(self.client, 'refresh_media_session', None))):
+                    # An unknown native WebVPN route is never followed or
+                    # trusted as media. Probe our original portal/API once;
+                    # only a fresh 206 with the frozen validator can resume.
+                    with self._audit_lock:
+                        self._audit['last_redirect']['recovery'] = 'probe_original_session'
+                    raise MediaTransportError('media_session_refresh_needed')
                 if kind != 'same_media': raise MediaTransportError('media_redirect_untrusted')
                 raise MediaTransportError('range_not_honored')
             if response.status_code == 200:

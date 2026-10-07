@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+import requests
 from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 from src.runtime import config
@@ -97,7 +98,8 @@ class ICourseClient:
         If either is unavailable, the caller must stop and retain its input.
         """
         try:
-            response = self.vpn.session.get(config.WEBVPN_BASE+'/',
+            portal = config.ICOURSE_BASE if getattr(self.vpn, 'access_mode', None) == 'direct' else config.WEBVPN_BASE
+            response = self.vpn.session.get(portal+'/',
                                             allow_redirects=False, timeout=5)
             if response.status_code != 200:
                 return False
@@ -124,7 +126,8 @@ class ICourseClient:
     def trusted_media_login_urls(self) -> tuple[str, ...]:
         """Exact WebVPN SSO routes; no request or credential access here."""
         from src.runtime.media_protocol import LOGIN_PATHS
-        return tuple(get_vpn_url(config.IDP_BASE + path) for path in LOGIN_PATHS
+        route = (lambda url: url) if getattr(self.vpn, 'access_mode', None) == 'direct' else get_vpn_url
+        return tuple(route(config.IDP_BASE + path) for path in LOGIN_PATHS
                      if not path.startswith('/wengine-vpn/'))
 
     def sign_video_url(
@@ -601,10 +604,11 @@ class ICourseClient:
         Returns:
             (vpn_url, http_headers) where http_headers is ffmpeg-compatible.
         """
-        vpn_url = get_vpn_url(video_url)
-        cookies = "; ".join(
-            f"{c.name}={c.value}" for c in self.vpn.session.cookies
-        )
+        vpn_url = video_url if getattr(self.vpn, 'access_mode', None) == 'direct' else get_vpn_url(video_url)
+        if getattr(self.vpn, 'access_mode', None) == 'direct':
+            cookies = self.vpn.session.prepare_request(requests.Request('GET', video_url)).headers.get('Cookie', '')
+        else:
+            cookies = "; ".join(f"{c.name}={c.value}" for c in self.vpn.session.cookies)
         headers = f"Cookie: {cookies}\r\nUser-Agent: {config.USER_AGENT}\r\n"
         return vpn_url, headers
 
