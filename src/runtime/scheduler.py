@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 from src.runtime import config
 from src.runtime.media_transport import SignedRangeRelay
+from src.runtime.audio_preparation import DecodeErrorScanner, record_decode_errors
 from src.api import icourse
 
 
@@ -138,22 +139,6 @@ class AudioHandle:
     media_transport: Optional[SignedRangeRelay] = None
 
 
-def record_decode_errors(chunk: bytes, counts: dict[str, int]) -> None:
-    """Keep fixed error categories even when the private stderr tail rotates."""
-    text = chunk.lower()
-    patterns = {
-        'premature_eof': (b'stream ends prematurely', b'partial file'),
-        'input_read_error': (b'input/output error', b'error during demuxing',
-                             b'error opening input', b'connection timed out',
-                             b'connection reset by peer'),
-        'decode_error': (b'error while decoding', b'error decoding',
-                         b'corrupt input packet', b'packet corrupt'),
-    }
-    for code, needles in patterns.items():
-        if any(needle in text for needle in needles):
-            counts[code] = min(1_000_000, counts.get(code, 0)+1)
-
-
 class _PendingSpawn:
     """Per-schedule placeholder stored in ``_active`` while the background
     spawn is still working.  A unique instance per ``schedule()`` call lets
@@ -233,7 +218,8 @@ class AudioDownloader:
                     self._sem.release()
                     return
                 if preserve_timestamps:
-                    transport = SignedRangeRelay(client,url,allow_session_refresh=True).start()
+                    transport = SignedRangeRelay(client,url,allow_session_refresh=True,
+                                                 cache_bytes=16*1024*1024).start()
                     vpn_url, headers = transport.url, ''
                     # Three 10/15s range attempts plus the one-time 5/10s
                     # connect/read SSO probes and backoff fit within 120s.
@@ -270,12 +256,13 @@ class AudioDownloader:
                 # for diagnostics if ffmpeg dies.
                 stderr_chunks: list[bytes] = []
                 decode_error_counts: dict[str, int] = {}
+                error_scanner = DecodeErrorScanner(decode_error_counts)
                 stderr_done = threading.Event()
 
                 def _drain():
                     try:
                         for chunk in proc.stderr:
-                            record_decode_errors(chunk, decode_error_counts)
+                            error_scanner.feed(chunk)
                             stderr_chunks.append(chunk)
                             if len(stderr_chunks) > 2048:
                                 # Preserve the input header (Duration) and a

@@ -25,7 +25,7 @@ ENTRIES = ('format=start_time,duration,size:'
 
 def safe_probe_errors(stderr):
     """Diagnostic reason codes only, never echo a signed URL or header."""
-    from src.runtime.scheduler import record_decode_errors
+    from src.runtime.audio_preparation import record_decode_errors
     counts = {}
     record_decode_errors(stderr, counts)
     lowered = stderr.lower()

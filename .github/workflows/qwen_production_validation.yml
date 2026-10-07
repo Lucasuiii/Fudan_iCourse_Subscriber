@@ -55,6 +55,10 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/segment_rescue.py'
     - 'src/runtime/scheduler.py'
     - 'src/runtime/media_transport.py'
+    - 'src/runtime/media_protocol.py'
+    - 'src/runtime/audio_preparation.py'
+    - 'tests/test_media_acquisition.py'
+    - 'tests/test_media_session.py'
     - 'src/api/icourse.py'
     - 'tests/test_media_transport.py'
     - 'src/api/webvpn.py'
@@ -78,6 +82,10 @@ name: Qwen Production Pipeline Validation
     - 'scripts/production_*.py'
     - 'src/runtime/scheduler.py'
     - 'src/runtime/media_transport.py'
+    - 'src/runtime/media_protocol.py'
+    - 'src/runtime/audio_preparation.py'
+    - 'tests/test_media_acquisition.py'
+    - 'tests/test_media_session.py'
     - 'src/api/icourse.py'
     - 'tests/test_media_transport.py'
     - 'src/api/webvpn.py'
@@ -263,6 +271,6 @@ jobs:
     - name: Original shard invariants and independent course scheduling
       run: PYTHONPATH=tests python -m unittest test_audio_timeline test_audio_preparation_budget test_qwen_sharding.ShardPlanTests test_qwen_workflow_schedule.CourseScheduleTests
     - name: Authentication verification and bounded HTTP source diagnostics
-      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
+      run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport test_media_session test_media_acquisition
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_production_pool test_automatic_glossary test_summarizer_prompt

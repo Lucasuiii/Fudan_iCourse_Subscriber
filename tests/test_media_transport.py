@@ -20,10 +20,11 @@ from src.runtime.scheduler import AudioDownloader
 
 
 class Origin:
-    def __init__(self,data,*,drop_start=None,change=False,ignore=False,validator=True,expired=False,persistent=False,ignored_once_start=None):
+    def __init__(self,data,*,drop_start=None,change=False,ignore=False,validator=True,expired=False,persistent=False,ignored_once_start=None,rejected_status=None):
         self.data=data;self.drop_start=drop_start;self.change=change
         self.ignore=ignore;self.validator=validator;self.expired=expired;self.persistent=persistent
         self.ignored_once_start=ignored_once_start;self.ignored_once=False
+        self.rejected_status=rejected_status
         self.requests=[];self.dropped=False;self.tickets=set();self.error=None
     def __enter__(self):
         owner=self
@@ -36,6 +37,8 @@ class Origin:
                 if not match:self.send_error(400);return
                 start=int(match[1]);end=min(int(match[2]) if match[2] else len(owner.data)-1,len(owner.data)-1)
                 owner.requests.append((start,end,query.get('t',[''])[0]))
+                if owner.rejected_status is not None:
+                    self.send_error(owner.rejected_status);return
                 if self.headers.get('Cookie')!='fake-private-cookie':
                     owner.error='missing_cookie';self.send_error(403);return
                 ticket=query.get('t',[''])[0]

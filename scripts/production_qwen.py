@@ -24,8 +24,8 @@ from scripts.parallel_courses import configured_courses
 from scripts.production_db import load_remote, snapshot, lecture_snapshot, merge_lecture, publish
 from src.data.database import Database
 
-PREPARE_STREAM_TIMEOUT = 90 * 60
-PREPARE_IDLE_TIMEOUT = 5 * 60
+from src.runtime.audio_preparation import (PREPARE_STREAM_TIMEOUT, PREPARE_IDLE_TIMEOUT,
+    collect_decode_diagnostics, validate_prepared_audio)
 _POOL_RUNS = set()
 
 
@@ -91,6 +91,7 @@ def failure_code(error):
         'Production audio is incomplete': 'incomplete_audio',
         'Production audio has read or decode errors': 'audio_decode_errors',
         'Production audio diagnostics are incomplete': 'audio_diagnostics_incomplete',
+        'Production audio has invalid sample metadata': 'audio_sample_metadata_invalid',
         'Subscribed course enumeration incomplete': 'course_enumeration_failed',
         'Audio preparation deadline exceeded': 'preparation_deadline',
         'Audio preparation stalled': 'preparation_stalled',
@@ -643,32 +644,11 @@ def retain_prepared_audio(handle, specification, files):
             handle.process.kill(); handle.process.wait(timeout=5)
         specification['decode_interrupted'] = True
     pcm = Path(handle.path)
-    # A process can exit before the drain thread consumes its final error.
-    done = getattr(handle, 'stderr_done', None)
-    diagnostics_complete = done is None or done.wait(timeout=5)
-    size = pcm.stat().st_size if pcm.exists() else 0
-    stderr = b''.join(handle.stderr_chunks).decode(errors='replace')
-    match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
-    media = specification.get('media_seconds')
-    if not media and match:
-        media = int(match[1])*3600+int(match[2])*60+float(match[3])
-    duration = size/64000
-    specification.update(audio_seconds=duration, media_seconds=media)
-    diagnostics = {'pcm_bytes': size, 'pcm_sample_aligned': size % 4 == 0,
-                   'audio_seconds': duration, 'media_seconds': media,
-                   'duration_gap_seconds': max(0, media-duration) if media else None,
-                   'decode_return_code': handle.process.returncode,
-                   'decode_interrupted': bool(specification.get('decode_interrupted')),
-                   'timeline_preserved': bool(getattr(handle, 'timeline_preserved', False)),
-                   'stderr_complete': diagnostics_complete,
-                   'decode_error_counts': {code: count for code, count in
-                       getattr(handle, 'decode_error_counts', {}).copy().items()
-                       if code in {'premature_eof', 'input_read_error', 'decode_error', 'stderr_read_error'}
-                       and type(count) is int and 0 < count <= 1_000_000},
-                   'audio_retained': 'lecture.flac' in files}
-    transport = getattr(handle, 'media_transport', None)
-    if transport is not None:
-        diagnostics['source_transport'] = transport.audit()
+    diagnostics = collect_decode_diagnostics(handle,
+        media_seconds=specification.get('media_seconds'),
+        interrupted=bool(specification.get('decode_interrupted')), retained='lecture.flac' in files)
+    size = diagnostics['pcm_bytes']
+    specification.update(audio_seconds=diagnostics['audio_seconds'], media_seconds=diagnostics['media_seconds'])
     specification['audio_diagnostics'] = diagnostics
     if not size or size % 4:
         return
@@ -678,20 +658,6 @@ def retain_prepared_audio(handle, specification, files):
                         '-i', str(pcm), '-c:a', 'flac', '-y', str(flac)], timeout=300)
         files['lecture.flac'] = flac.read_bytes()
     diagnostics.update(audio_retained=True, audio_sha256=hashlib.sha256(files['lecture.flac']).hexdigest())
-
-
-def validate_prepared_audio(specification):
-    """Never turn a zero decoder exit into evidence of complete input."""
-    diagnostics = specification['audio_diagnostics']
-    if not diagnostics.get('stderr_complete', True):
-        raise ValueError('Production audio diagnostics are incomplete')
-    if (diagnostics.get('decode_error_counts') or diagnostics.get('decode_return_code') != 0
-            or diagnostics.get('decode_interrupted')
-            or diagnostics.get('source_transport',{}).get('terminal_error_code')):
-        raise ValueError('Production audio has read or decode errors')
-    duration, media = specification['audio_seconds'], specification.get('media_seconds')
-    if media and duration < media-max(120, media*.05):
-        raise ValueError('Production audio is incomplete')
 
 
 def prepare_audio_stream(transcriber, handle, specification):

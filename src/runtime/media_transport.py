@@ -11,32 +11,30 @@ import re
 import secrets
 import threading
 import time
-from urllib.parse import parse_qsl, urlsplit, urljoin
+from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
-
-class MediaTransportError(RuntimeError):
-    def __init__(self, code):
-        self.code = code
-        super().__init__(code)  # Fixed codes only; never provider messages.
+from src.runtime.media_protocol import (MediaTransportError, MediaSource,
+    RangeRecoveryPolicy, RecoveryAction, VerifiedRangeBuffer, redirect_kind,
+    media_identity, connection_failure_code)
 
 
 class SignedRangeRelay:
     def __init__(self, client, signed_url, *, chunk_bytes=8*1024*1024,
                  prefix_bytes=64*1024, attempts=3, max_upstream_bytes=None,
                  session_factory=requests.Session, timeout=(10, 15),
-                 allow_session_refresh=False):
+                 allow_session_refresh=False, cache_bytes=0):
         self.client, self.signed_url = client, signed_url
         self.chunk_bytes, self.prefix_bytes = chunk_bytes, prefix_bytes
         self.attempts, self.max_bytes = attempts, max_upstream_bytes
         self.session_factory, self.timeout = session_factory, timeout
         self.allow_session_refresh = allow_session_refresh
         self._session = None
-        self._target = None
+        self._source = MediaSource(signed_url)
+        self._recovery = RangeRecoveryPolicy(attempts)
+        self._buffer = VerifiedRangeBuffer(cache_bytes)
         self._session_refreshed = False
-        self.total = None
-        self._etag = self._modified = None
         self._prefix = b''
         self._stop = threading.Event()
         self._fetch_lock = threading.Lock()
@@ -56,11 +54,25 @@ class SignedRangeRelay:
                            upstream_status_counts={}, range_rejections=0,
                            redirect_counts={}, cookie_updates=0,
                            session_refresh_attempts=0, session_refresh_successes=0,
-                           last_failure_offset=None)
-        if not 4096 <= chunk_bytes <= 16*1024*1024 or not 1 <= attempts <= 4:
+                           last_failure_offset=None, last_error_code=None, state='idle',
+                           cache_hits=0, cached_bytes_served=0, cache_bytes=0,
+                           last_failure_stage=None)
+        if type(chunk_bytes) is not int or not 4096 <= chunk_bytes <= 16*1024*1024:
             raise ValueError('Invalid bounded media transport limits')
         if not 1 <= prefix_bytes <= chunk_bytes:
             raise ValueError('Invalid media prefix limit')
+
+    @property
+    def total(self):
+        return self._source.total
+
+    def _transition(self, state, *, error=None, offset=None):
+        with self._audit_lock:
+            if self._audit['state'] == 'closed': return
+            if error is not None: self._audit['last_failure_stage'] = self._audit['state']
+            self._audit['state'] = state
+            if error is not None: self._audit['last_error_code'] = error
+            if offset is not None: self._audit['last_failure_offset'] = offset
 
     def audit(self):
         with self._audit_lock:
@@ -75,7 +87,8 @@ class SignedRangeRelay:
     def _fail(self, code):
         if not self._stop.is_set():
             with self._audit_lock:
-                self._audit['terminal_error_code'] = code
+                self._audit['terminal_error_code'] = self._audit['terminal_error_code'] or code
+                self._audit['state'] = 'failed'
         raise MediaTransportError(code)
 
     def _signed_request(self, start, retry):
@@ -91,27 +104,16 @@ class SignedRangeRelay:
                 if self._stop.wait(.05): raise MediaTransportError('stopped')
                 now = int(time.time())
         fresh = self.client.renew_video_url(self.signed_url, now=now)
-        # Renewing authentication must never change the selected media path.
-        before, after = urlsplit(self.signed_url), urlsplit(fresh)
-        def selection_query(parts):
-            return sorted((k,v) for k,v in parse_qsl(parts.query,keep_blank_values=True)
-                          if k not in ('t','clientUUID'))
-        if ((before.scheme, before.netloc, before.path) != (after.scheme, after.netloc, after.path)
-                or selection_query(before) != selection_query(after)):
-            self._fail('source_changed')
+        if self._stop.is_set(): raise MediaTransportError('stopped')
+        if self._source.selected != media_identity(fresh):
+            raise MediaTransportError('source_changed')
         target, raw_headers = self.client.get_stream_params(fresh)
-        parts = urlsplit(target)
-        identity = (parts.scheme, parts.netloc, parts.path, selection_query(parts))
-        if self._target is not None and identity != self._target:
-            self._fail('source_changed')
-        self._target = identity
+        if self._stop.is_set(): raise MediaTransportError('stopped')
+        self._source.bind_request(fresh, target)
         headers = dict(line.split(':',1) for line in raw_headers.split('\r\n') if ':' in line)
         headers = {key.strip(): value.strip() for key,value in headers.items()}
         headers['Accept-Encoding'] = 'identity'
-        if self._etag and not self._etag.startswith('W/'):
-            headers['If-Match'] = self._etag
-        elif self._modified:
-            headers['If-Unmodified-Since'] = self._modified
+        headers.update(self._source.conditional_headers())
         self._count('signature_renewals')
         if start == 0: self._last_initial_time = now
         return target, headers
@@ -128,26 +130,7 @@ class SignedRangeRelay:
         return self._session, headers
 
     def _redirect_kind(self, response):
-        location = response.headers.get('Location')
-        if not location:
-            return 'missing'
-        try:
-            source = urlsplit(response.url)
-            target = urlsplit(urljoin(response.url, location))
-            if (target.scheme not in ('http','https') or target.username or target.password
-                    or source.scheme == 'https' and target.scheme != 'https'):
-                return 'other'
-            same_origin = (source.scheme, source.netloc) == (target.scheme, target.netloc)
-            login_path = target.path.rstrip('/') in (
-                '/login', '/wengine-vpn/login', '/cas/login', '/authserver/login')
-            if login_path and (same_origin or target.scheme == 'https' and target.hostname == 'id.fudan.edu.cn'):
-                return 'login'
-            if same_origin and source.path == target.path:
-                # Only classify; never follow a replacement signed URL.
-                return 'same_media'
-        except ValueError:
-            pass
-        return 'other'
+        return redirect_kind(response)
 
     def _refresh_session(self):
         refresh = getattr(self.client, 'refresh_media_session', None)
@@ -172,7 +155,7 @@ class SignedRangeRelay:
             counts=self._audit['upstream_status_counts']
             label=str(response.status_code)
             counts[label]=counts.get(label,0)+1
-        if response.status_code == 412: self._fail('source_changed')
+        if response.status_code == 412: raise MediaTransportError('source_changed')
         if response.status_code == 401:
             raise MediaTransportError('media_session_refresh_needed')
         if response.status_code in (403,408,429,500,502,503,504):
@@ -188,98 +171,100 @@ class SignedRangeRelay:
                     counts[kind] = counts.get(kind,0)+1
                 if kind == 'login':
                     raise MediaTransportError('media_session_refresh_needed')
-                if kind != 'same_media': self._fail('media_redirect_untrusted')
+                if kind != 'same_media': raise MediaTransportError('media_redirect_untrusted')
                 raise MediaTransportError('range_not_honored')
             if response.status_code == 200:
                 raise MediaTransportError('range_not_honored')
-            self._fail('range_not_honored')
-        match = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
-        if not match: self._fail('invalid_content_range')
-        first,last,total = map(int,match.groups())
-        expected_last = total-1 if open_ended else min(end,total-1)
-        if total <= 0 or first != start or last != expected_last or last < first:
-            self._fail('invalid_content_range')
-        etag, modified = response.headers.get('ETag'), response.headers.get('Last-Modified')
-        if self.total is None:
-            # Size alone cannot prevent splicing two same-size recordings.
-            if not (etag and not etag.startswith('W/') or modified):
-                self._fail('source_validator_missing')
-            self.total, self._etag, self._modified = total,etag,modified
-            with self._audit_lock:
-                self._audit.update(source_total_bytes=total,
-                                   validator_kind='etag' if etag and not etag.startswith('W/') else 'last_modified')
-        elif (total != self.total or etag != self._etag or modified != self._modified):
-            self._fail('source_changed')
-        if response.headers.get('Content-Encoding','identity').lower() not in ('','identity'):
-            self._fail('encoded_range')
-        length = response.headers.get('Content-Length')
-        if length is not None and (not length.isdigit() or int(length) != last-first+1):
-            self._fail('invalid_content_length')
+            raise MediaTransportError('upstream_http_rejected')
+        remaining = self._source.verify_range(response, start, end, open_ended=open_ended)
+        with self._audit_lock:
+            self._audit.update(source_total_bytes=self.total, validator_kind=self._source.validator_kind)
         self._count('range_verified')
-        return min(last,end)-first+1
+        return remaining
+
+    def _read_verified_body(self, response, remaining, data):
+        while remaining:
+            if self._stop.is_set(): raise MediaTransportError('stopped')
+            size = min(64*1024, remaining)
+            if self.max_bytes is not None:
+                budget = self.max_bytes-self.audit()['upstream_bytes']
+                if budget <= 0: raise MediaTransportError('diagnostic_byte_limit')
+                size = min(size, budget)
+            block = response.raw.read(size, decode_content=False)
+            if not block: raise MediaTransportError('upstream_premature_eof')
+            if len(block) > size: raise MediaTransportError('invalid_read_length')
+            data.extend(block); remaining -= len(block)
+            self._count('upstream_bytes', len(block))
 
     def _read_range(self, start, end, *, initial_probe=False):
-        data = bytearray(); last_error = None
+        # One lock protects source binding, session recovery and verified cache.
+        # Failed or closed relays never serve old cached bytes as a recovery.
         with self._fetch_lock:
+            if self._stop.is_set(): raise MediaTransportError('stopped')
             if self.audit()['terminal_error_code']: raise MediaTransportError('transport_failed')
-            for attempt in range(self.attempts):
-                last_error=None
+            cached = self._buffer.get(start, end)
+            if cached is not None:
+                self._count('cache_hits'); self._count('cached_bytes_served', len(cached))
+                return cached
+            data = bytearray()
+            for attempt in range(self._recovery.attempts):
                 if self._stop.is_set(): raise MediaTransportError('stopped')
                 response = None
-                refresh_needed = False
+                error_code = None
                 try:
                     offset = start+len(data)
+                    self._transition('signing')
                     target, headers = self._signed_request(offset, attempt > 0)
                     session, headers = self._request_session(headers)
                     before_cookies = [(c.domain,c.path,c.name,c.value,c.expires) for c in session.cookies]
                     self._count('range_requests')
                     open_ended = initial_probe and offset == 0
                     range_value = f'bytes={offset}-'+('' if open_ended else str(end))
+                    self._transition('requesting')
+                    if self._stop.is_set(): raise MediaTransportError('stopped')
                     response = session.get(target, headers={**headers,'Range':range_value},
                                            stream=True, timeout=self.timeout, allow_redirects=False)
                     with self._response_lock: self._responses.add(response)
                     after_cookies = [(c.domain,c.path,c.name,c.value,c.expires) for c in session.cookies]
                     if after_cookies != before_cookies: self._count('cookie_updates')
-                    remaining = self._verify_response(response, offset, end,open_ended=open_ended)
-                    while remaining:
-                        if self._stop.is_set(): raise MediaTransportError('stopped')
-                        size = min(64*1024, remaining)
-                        if self.max_bytes is not None:
-                            budget = self.max_bytes-self.audit()['upstream_bytes']
-                            if budget <= 0: self._fail('diagnostic_byte_limit')
-                            size = min(size,budget)
-                        block = response.raw.read(size, decode_content=False)
-                        if not block: raise MediaTransportError('upstream_premature_eof')
-                        if len(block) > size: self._fail('invalid_read_length')
-                        data.extend(block); remaining -= len(block)
-                        self._count('upstream_bytes',len(block))
-                    return bytes(data)
+                    self._transition('validating')
+                    remaining = self._verify_response(response, offset, end, open_ended=open_ended)
+                    self._transition('reading')
+                    self._read_verified_body(response, remaining, data)
+                    if self._stop.is_set(): raise MediaTransportError('stopped')
+                    result = bytes(data)
+                    self._buffer.put(start, result)
+                    with self._audit_lock: self._audit['cache_bytes'] = self._buffer.bytes
+                    self._transition('ready')
+                    return result
                 except MediaTransportError as error:
-                    last_error=error.code
-                    with self._audit_lock: self._audit['last_failure_offset'] = start+len(data)
-                    refresh_needed = error.code == 'media_session_refresh_needed'
-                    if self.audit()['terminal_error_code'] or error.code not in ('upstream_retryable_http','upstream_premature_eof','range_not_honored','media_session_refresh_needed'):
-                        raise
-                except (requests.RequestException, OSError):
-                    with self._audit_lock: self._audit['last_failure_offset'] = start+len(data)
+                    error_code = error.code
+                except (requests.RequestException, OSError) as error:
+                    error_code = connection_failure_code(error)
                 except Exception as error:
-                    # urllib3 may raise ProtocolError/IncompleteRead from raw.
                     from urllib3.exceptions import HTTPError
-                    if not isinstance(error,HTTPError): self._fail('transport_internal_error')
-                    with self._audit_lock: self._audit['last_failure_offset'] = start+len(data)
+                    error_code = connection_failure_code(error) if isinstance(error, HTTPError) else 'transport_internal_error'
                 finally:
                     if response is not None:
                         with self._response_lock: self._responses.discard(response)
                         response.close()
                 if self._stop.is_set(): raise MediaTransportError('stopped')
-                if refresh_needed:
-                    if attempt+1 >= self.attempts: self._fail('media_session_unavailable')
+                self._transition('recovering', error=error_code, offset=start+len(data))
+                # Header validation can already have marked a permanent failure.
+                if self.audit()['terminal_error_code']: self._fail(error_code)
+                can_refresh = (self.allow_session_refresh and not self._session_refreshed
+                               and callable(getattr(self.client, 'refresh_media_session', None)))
+                action = self._recovery.decide(error_code, attempt, can_refresh=can_refresh)
+                if action is RecoveryAction.STOP:
+                    self._fail(self._recovery.terminal_code(error_code))
+                if action is RecoveryAction.REFRESH:
+                    self._transition('refreshing')
                     self._refresh_session()
-                if attempt+1 < self.attempts:
-                    self._count('retries')
-                    if last_error == 'range_not_honored' and self._stop.wait(2*(attempt+1)):
-                        raise MediaTransportError('stopped')
-            self._fail('range_not_honored' if last_error == 'range_not_honored' else 'upstream_retries_exhausted')
+                self._count('retries')
+                self._transition('retrying')
+                if self._stop.wait(self._recovery.delay(error_code, attempt)):
+                    raise MediaTransportError('stopped')
+            raise AssertionError('Bounded recovery must return or stop')
 
     def start(self):
         try:
@@ -296,6 +281,8 @@ class SignedRangeRelay:
                     self.close_connection = True
                     if self.path != owner._path:
                         self.send_error(404); return
+                    if owner._stop.is_set() or owner.audit()['terminal_error_code']:
+                        self.send_error(503); return
                     value = self.headers.get('Range')
                     start,end = 0,owner.total-1
                     if value:
@@ -316,6 +303,7 @@ class SignedRangeRelay:
                     try:
                         position = start
                         while position <= end and not owner._stop.is_set():
+                            if owner.audit()['terminal_error_code']: return
                             if position < len(owner._prefix):
                                 data = owner._prefix[position:min(len(owner._prefix),end+1)]
                             else:
@@ -350,6 +338,9 @@ class SignedRangeRelay:
                 self._server.server_close()
             if self._thread is not None:self._thread.join(timeout=2)
             if self._session is not None:self._session.close()
+            self._buffer.close()
+            with self._audit_lock: self._audit['cache_bytes'] = 0
+            self._transition('closed')
 
     def __enter__(self): return self.start()
     def __exit__(self,*args): self.close()
