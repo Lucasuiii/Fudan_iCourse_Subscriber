@@ -31,7 +31,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
@@ -64,6 +64,7 @@ name: Qwen Production Pipeline Validation
     - 'tests/test_audio_preparation_budget.py'
     - 'tests/test_homework_review.py'
     - 'tests/test_shared_asr_queue.py'
+    - 'tests/test_production_pool.py'
     - 'tests/test_automatic_glossary.py'
     - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
@@ -97,6 +98,7 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/segment_rescue.py'
     - 'tests/test_homework_review.py'
     - 'tests/test_shared_asr_queue.py'
+    - 'tests/test_production_pool.py'
     - 'tests/test_automatic_glossary.py'
     - 'tests/test_homework_vision.py'
     - 'tests/test_doubao_asr.py'
@@ -263,4 +265,4 @@ jobs:
     - name: Authentication verification and bounded HTTP source diagnostics
       run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_production_byte_ranges test_media_transport
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
-      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_automatic_glossary test_summarizer_prompt
+      run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_production_pool test_automatic_glossary test_summarizer_prompt

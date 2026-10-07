@@ -26,6 +26,7 @@ from src.data.database import Database
 
 PREPARE_STREAM_TIMEOUT = 90 * 60
 PREPARE_IDLE_TIMEOUT = 5 * 60
+_POOL_RUNS = set()
 
 
 def root():
@@ -44,10 +45,38 @@ def decode(path, role):
 
 def encode(files, role, path):
     shards.seal(files, role, Path(path), slot=0 if role == 'queue' else None)
+    if role == 'prepared' and os.environ.get('POOL_ARTIFACTS') == 'true':
+        spec = read_json(files['specification.json'])
+        thin = {'mode': spec['mode'], 'plan': spec.get('plan', {})}
+        shards.seal({'specification.json': shards.encoded(thin)}, 'worker-plan', out('worker-plan.enc'))
+        # Workers need original blocks, not another whole audio/database/PPT copy.
+        worker_files = {n: b for n, b in files.items()
+                        if n == 'specification.json' or re.fullmatch(r'chunk-[0-9]+\.flac|completed-[0-9]+\.json', n)}
+        shards.seal(worker_files, 'prepared', out('worker-input')/'prepared.enc')
 
 
 def read_json(blob):
     return json.loads(blob)
+
+
+def encode_audio_chunks(source, plan, files, destination):
+    """Seek exact samples in retained FLAC, including VAD overlaps and gaps."""
+    import soundfile as sf
+    validate_plan(plan)
+    with sf.SoundFile(str(source)) as audio:
+        if audio.samplerate != 16000 or audio.channels != 1 or audio.subtype != 'PCM_24':
+            raise ValueError('Retained FLAC format changed')
+        for block in plan['blocks']:
+            start = round(block['start']*16000)
+            audio.seek(start)
+            samples = audio.read(block['samples'], dtype='int32', always_2d=True)
+            if len(samples) != block['samples']:
+                raise ValueError('Retained audio has missing planned samples')
+            chunk = Path(destination)/f"chunk-{block['chunk_id']}.flac"
+            sf.write(str(chunk), samples, 16000, format='FLAC', subtype='PCM_24')
+            files[chunk.name] = chunk.read_bytes()
+            block['flac_sha256'] = hashlib.sha256(files[chunk.name]).hexdigest()
+    validate_plan(plan)
 
 
 def failure_code(error):
@@ -77,14 +106,22 @@ def failure_code(error):
     return reasons.get(str(error), 'missing_stage_input' if isinstance(error, FileNotFoundError) else 'stage_failure')
 
 
-def artifact(name, target, *, run=None, required=False):
+def artifact(name, target, *, run=None, required=False, _direct=False):
     """API failure or expiry is not equivalent to a confirmed absent checkpoint."""
     run = run or os.environ['GITHUB_RUN_ID']
     repo = os.environ['GITHUB_REPOSITORY']
     pages = json.loads(subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
         f'repos/{repo}/actions/runs/{run}/artifacts?per_page=100'], stderr=subprocess.PIPE, timeout=120))
+    if any(a['name'] == 'qwen-production-pool-audit' for page in pages for a in page['artifacts']):
+        _POOL_RUNS.add(str(run))
     found = [a for page in pages for a in page['artifacts'] if a['name'] == name]
     if not found:
+        pooled = os.environ.get('POOL_ARTIFACTS') == 'true' or any(a['name'] == 'qwen-production-pool-audit'
+                            for page in pages for a in page['artifacts'])
+        if pooled and not _direct and name not in ('qwen-production-queue', 'qwen-production-pool-audit'):
+            from scripts.production_pool import artifact_runs
+            for source in artifact_runs(str(run), name, allow_legacy=str(run) != os.environ['GITHUB_RUN_ID'] and str(run) not in _POOL_RUNS):
+                if artifact(name, target, run=source, _direct=True): return True
         if required: raise ValueError('Required recovery artifact is absent')
         return False
     if len(found) != 1 or found[0]['expired']:
@@ -97,10 +134,49 @@ def write_outputs(**values):
     shards.outputs(**values)
 
 
+def asr_cost(material):
+    import math
+    from src.ai.qwen_transcriber import MODEL, REVISION
+    rows = material.get('full_chunks', [])
+    known = [r for r in rows if isinstance(r.get('decode_seconds'), (int, float))
+             and math.isfinite(r['decode_seconds']) and r['decode_seconds'] > 0]
+    if len(known) < 5: return None
+    audio = sum(r['end']-r['start'] for r in known)
+    seconds = sum(r['decode_seconds'] for r in known)
+    if audio <= 0 or not math.isfinite(seconds): return None
+    return {'model': MODEL, 'revision': REVISION, 'audio_seconds': audio,
+            'decode_seconds': seconds, 'blocks': len(known)}
+
+
+def historical_asr_cost(db, course, date):
+    import math
+    import statistics
+    from scripts.production_pool import DEFAULT_RTF
+    from src.ai.qwen_transcriber import MODEL, REVISION
+    estimates = []
+    rows = db.conn.execute('''SELECT m.value FROM meta m JOIN lectures l
+        ON m.key = 'qwen_pipeline:' || l.sub_id WHERE l.course_id=? AND l.date < ?
+        AND l.processed_at IS NOT NULL AND l.deleted_at IS NULL ORDER BY l.date DESC LIMIT 10''', (str(course), date))
+    for row in rows:
+        try:
+            value = json.loads(row[0]); cost = value['asr_cost']
+            if not value.get('complete') or (cost['model'], cost['revision']) != (MODEL, REVISION) or cost['blocks'] < 5:
+                continue
+            ratio = cost['decode_seconds']/cost['audio_seconds']
+            if math.isfinite(ratio) and .25 <= ratio <= 10: estimates.append(ratio)
+        except (KeyError, ValueError, TypeError, ZeroDivisionError): continue
+    return statistics.median(estimates) if estimates else DEFAULT_RTF
+
+
 def last_finalization_attempt(run, slot, *, prior_only=False):
     """A lost runner checkpoint must not silently refund a later cloud attempt."""
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         return 0
+    if os.environ.get('POOL_ARTIFACTS') == 'true' or str(run) in _POOL_RUNS:
+        from scripts.production_pool import finalization_attempt
+        value = finalization_attempt(str(run), slot, prior_only,
+            allow_legacy=str(run) != os.environ['GITHUB_RUN_ID'] and str(run) not in _POOL_RUNS)
+        if value is not None: return value
     repo = os.environ['GITHUB_REPOSITORY']
     if run == os.environ['GITHUB_RUN_ID']:
         attempts = int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')) - int(prior_only)
@@ -274,6 +350,9 @@ def latest_validation_task(client, db, course, *, today=None, rank=1, before_dat
 
 
 def plan():
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        from scripts.production_pool import verify_previous_pool
+        verify_previous_pool()  # Also gate legacy mode after an orphaned pool.
     course = validation_course()
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
@@ -335,6 +414,23 @@ def plan():
             raise ValueError('Frozen validation lesson is now excluded')
         out('validation-selection.json').write_bytes(shards.encoded(tasks[0][2]['_validation']))
     encode(files, 'queue', out('queue.enc'))
+    if os.environ.get('SHARD_MODE') == 'shared' and tasks:
+        from scripts.production_pool import initial_state, read_state, save, store_for
+        flags = {key: os.environ.get(key, 'false') for key in ('AUTO_COURSE_TERMS', 'PUBLISH_RESULTS', 'SEND_EMAIL')}
+        expected = initial_state(os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_SHA'], len(tasks), flags)
+        store = store_for()
+        try:
+            revision, previous = store.read()
+            if previous is None:
+                if int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')) > 1:
+                    raise ValueError('Runner journal missing; refusing new reservations')
+                save(store, revision, expected)
+            else:
+                read_state(store)
+                if any(previous[k] != expected[k] for k in ('run_id', 'sha', 'task_count', 'flags')):
+                    raise ValueError('Frozen runner-pool configuration changed')
+        finally: store.close()
+        out('pool-audit.json').write_bytes(shards.encoded({'protocol': 1, 'parent_run_id': os.environ['GITHUB_RUN_ID']}))
     if 'enumeration.json' in files:
         out('plan-audit.json').write_bytes(files['enumeration.json'])
     write_outputs(tasks={'include': [{'task_slot': i} for i in range(len(tasks))]}, count=len(tasks))
@@ -736,7 +832,9 @@ def prepare():
                     time.sleep(.1)
                 transcriber = QwenTranscriber()
                 specification['prepare_phase'] = 'vad'
+                began_vad = time.monotonic()
                 windows = prepare_audio_stream(transcriber, handle, specification)
+                specification.setdefault('prepare_timings', {})['audio_and_vad_seconds'] = time.monotonic()-began_vad
                 duration = transcriber.last_audio_duration
                 media = transcriber.last_media_duration or 0
                 specification.update(audio_seconds=duration, media_seconds=media,
@@ -753,18 +851,13 @@ def prepare():
                     'audio_seconds': duration, 'full_chunks': [{'start': a, 'end': b} for a,b in windows],
                     'vad_windows': transcriber.last_vad_windows, 'recognition_terms': terms},
                     reference={'pipeline': 'production'}, course_slot=slot, run_id=os.environ['GITHUB_RUN_ID'],
-                    audio_sha256=digest, mode=os.environ.get('SHARD_MODE', '2'), production=True)
+                    audio_sha256=digest, mode=os.environ.get('SHARD_MODE', '2'), production=True,
+                    worker_cap=6 if os.environ.get('POOL_ARTIFACTS') == 'true' else 3,
+                    cost_rtf=historical_asr_cost(db, course, lecture.get('date', '')))
                 specification['prepare_phase'] = 'chunk_encoding'
-                for block in plan['blocks']:
-                    chunk = root()/f"chunk-{block['chunk_id']}.flac"
-                    # atrim operates on sample indices so FLAC preserves exact
-                    # original PCM boundaries, including overlapping VAD blocks.
-                    shards.command(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(flac), '-af',
-                        f"atrim=start_sample={round(block['start']*16000)}:end_sample={round(block['end']*16000)}",
-                        '-c:a', 'flac', '-y', str(chunk)])
-                    files[chunk.name] = chunk.read_bytes()
-                    block['flac_sha256'] = hashlib.sha256(files[chunk.name]).hexdigest()
-                validate_plan(plan)
+                began_chunks = time.monotonic()
+                encode_audio_chunks(flac, plan, files, root())
+                specification.setdefault('prepare_timings', {})['chunk_encoding_seconds'] = time.monotonic()-began_chunks
                 specification.update(mode='sharded', plan=plan, media_seconds=media)
             specification['prepare_phase'] = 'ppt_drain'
             ppt.drain()
@@ -788,7 +881,10 @@ def prepare():
             initialize(specification['plan'], files)
         specification['prepare_phase'] = 'checkpoint_write'
         files['specification.json'] = shards.encoded(specification)
+        began_bundle = time.monotonic()
         encode(files, 'prepared', out('prepared.enc'))
+        out('prepare-timing.json').write_bytes(shards.encoded({**specification.get('prepare_timings', {}),
+            'checkpoint_seconds': time.monotonic()-began_bundle}))
         specification['prepare_phase'] = 'outputs'
         write_outputs(workers={'shard_id': list(range(len(specification.get('plan', {}).get('shards', [])))) or [-1]})
     except Exception as error:
@@ -896,6 +992,8 @@ def gather():
                 if material:
                     metadata.update(audio_sha256=material['audio_sha256'], plan_hash=material['plan_hash'],
                                     audio_seconds=material['audio_seconds'])
+                    cost = asr_cost(material)
+                    if cost: metadata['asr_cost'] = cost
             db.write_meta('qwen_pipeline:'+sub_id, json.dumps(metadata, ensure_ascii=False))
         payload = {'specification.json': files['specification.json'], 'review.json': shards.encoded(review),
                    'attempt.json': shards.encoded(int(os.environ.get('GITHUB_RUN_ATTEMPT', '1'))),
@@ -1074,8 +1172,60 @@ def deliver():
             db.conn.close()
 
 
+def persist_pool_failures():
+    """Keep failed lecture progress without running gather or creating quota state."""
+    from scripts.production_pool import read_state, store_for
+    store = store_for()
+    try: _, state = read_state(store)
+    finally: store.close()
+    if any(t['status'] != 'completed' for t in state['tickets']):
+        raise ValueError('Cannot persist failures while children are active')
+    payload = {}
+    for raw, course_state in state['courses'].items():
+        if course_state['phase'] != 'failed': continue
+        slot = int(raw)
+        tickets = [t for t in state['tickets'] if t['slot'] == slot]
+        phase = tickets[-1]['stage']
+        with shards.environment({'COURSE_SLOT': raw}):
+            target = root()/'failed-input'/raw
+            if artifact(f'qwen-production-state-{slot}', target):
+                files = decode(target/'state.enc', 'state')
+            elif artifact(f'qwen-production-prepare-{slot}', target):
+                files = decode(target/'prepared.enc', 'prepared')
+            else:
+                db, course, title, lecture = task_files()
+                try:
+                    files = {'database.db': lecture_snapshot(db, root()/'failure-source.db', course, str(lecture['sub_id'])),
+                             'specification.json': shards.encoded({'course_id': course, 'lecture': lecture})}
+                finally: db.conn.close()
+            spec = read_json(files['specification.json'])
+            course, sub_id = spec['course_id'], str(spec['lecture']['sub_id'])
+            if course not in configured_courses(os.environ['COURSE_IDS']):
+                raise ValueError('Failure publication course is no longer subscribed')
+            delta = root()/'failure.db'; delta.write_bytes(files['database.db'])
+            db = Database(str(delta))
+            try:
+                if not db.get_lecture(sub_id).get('error_stage'):
+                    db.update_error(sub_id, 'pool_'+phase, 'stage_failure')
+                payload[f'failure-{slot}.db'] = lecture_snapshot(db, root()/'failure-snapshot.db', course, sub_id)
+            finally: db.conn.close()
+            # No state.enc or review.json is manufactured here. Missing quota
+            # checkpoints remain missing and continue to fence future review.
+            if os.environ.get('PUBLISH_RESULTS') == 'true':
+                publish(delta, course, sub_id)
+            else:
+                isolated = root()/'failure-isolated.db'
+                load_remote(isolated)
+                merge_lecture(delta, isolated, course, sub_id)
+    if payload:
+        with shards.environment({'COURSE_SLOT': '0'}):
+            encode(payload, 'pool-failures', out('pool-failures.enc'))
+
+
 def finalize():
     """Retain the ordinary catalog/subscription sync, including empty lecture queues."""
+    if os.environ.get('POOL_ARTIFACTS') == 'true':
+        persist_pool_failures()
     queue = decode(root()/'inbox'/'queue.enc', 'queue')
     delta = root()/'catalog.db'; delta.write_bytes(queue['database.db'])
     db = Database(str(delta))

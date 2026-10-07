@@ -111,6 +111,9 @@ class PreparedLectureTests(unittest.TestCase):
 
 
 class ClassroomSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch('scripts.production_pool.verify_previous_pool'))
+
     def test_new_fixed_trial_reuses_exact_failed_selection_and_frozen_terms(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
                 'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'100','GITHUB_REPOSITORY':'owner/repo',

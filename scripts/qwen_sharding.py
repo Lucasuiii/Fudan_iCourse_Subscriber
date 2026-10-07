@@ -50,7 +50,7 @@ def build_plan(baseline, *, reference, course_slot, run_id, audio_sha256, mode='
 
 
 def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mode='2', allow_partial=False,
-                     production=False):
+                     production=False, worker_cap=3, cost_rtf=2.0):
     """Plan independently acquired VAD blocks without claiming ASR is complete."""
     baseline = audio
     selection = baseline.get('selection') or {}
@@ -78,9 +78,16 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
     pending = sum(b['samples'] for b in blocks)/RATE
     if mode not in ('2', 'auto', 'shared'):
         raise ValueError('Unknown shard strategy')
-    # Shared workers target <=30 speech minutes each, bounded by the per-course
-    # reservation (3) and five active courses: total <=15 across all phases.
-    requested = min(3, max(1, math.ceil(pending/1800))) if mode == 'shared' else (2 if mode == '2' or pending <= 3600 else 3)
+    # Legacy workflows retain three slots. The global pool uses six immutable
+    # assembly slots; actual running workers are allocated by compute cost.
+    if type(worker_cap) is not int or worker_cap not in (3, 6) or (worker_cap == 6 and (mode != 'shared' or not production)):
+        raise ValueError('Invalid worker capacity')
+    if worker_cap == 6:
+        from scripts.production_pool import desired_workers
+        desired_workers(pending, len(blocks), cost_rtf)
+        requested = 6  # Immutable assembly slots; the pool starts only needed workers.
+    else:
+        requested = min(3, max(1, math.ceil(pending/1800))) if mode == 'shared' else (2 if mode == '2' or pending <= 3600 else 3)
     count = min(len(blocks), requested)
     groups, loads = [[] for _ in range(count)], [0]*count
     for block in sorted(blocks, key=lambda b: (-b['samples'], b['chunk_id'])):
@@ -103,6 +110,8 @@ def build_audio_plan(audio, *, reference, course_slot, run_id, audio_sha256, mod
         if not production:
             raise ValueError('Shared queue requires the production checkpoint boundary')
         plan['execution'] = 'shared_queue'
+        if worker_cap == 6:
+            plan['runner_policy'] = {'kind': 'global_pool', 'worker_cap': 6, 'target_seconds': 4500, 'cost_rtf': cost_rtf}
     if allow_partial:
         plan['allow_partial_comparison'] = True
     return plan
@@ -118,7 +127,17 @@ def validate_plan(plan):
     blocks, shards = plan['blocks'], plan['shards']
     if (not blocks or not shards) and plan.get('pipeline') != 'production':
         raise ValueError('Invalid shard plan')
-    if not 0 <= len(shards) <= 3 or bool(blocks) != bool(shards):
+    policy = plan.get('runner_policy')
+    if policy is not None:
+        if (not isinstance(policy, dict) or policy.get('kind') != 'global_pool'
+                or policy.get('worker_cap') != 6 or policy.get('target_seconds') != 4500
+                or plan.get('pipeline') != 'production' or plan.get('execution') != 'shared_queue'
+                or plan.get('strategy') != 'shared'
+                or not isinstance(policy.get('cost_rtf'), (int, float))
+                or not math.isfinite(policy['cost_rtf']) or not .25 <= policy['cost_rtf'] <= 10):
+            raise ValueError('Invalid runner policy')
+    cap = 6 if plan.get('pipeline') == 'production' and plan.get('runner_policy', {}).get('kind') == 'global_pool' and plan.get('execution') == 'shared_queue' else 3
+    if not 0 <= len(shards) <= cap or bool(blocks) != bool(shards):
         raise ValueError('Invalid shard plan')
     for i, block in enumerate(blocks):
         if (type(block['chunk_id']) is not int or block['chunk_id'] != i
