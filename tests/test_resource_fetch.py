@@ -108,10 +108,10 @@ class ResourceFetchTests(unittest.TestCase):
             self.assertFalse(resource.fetch())
             login.assert_not_called();save.assert_called_once()
 
-    def test_manual_workflow_has_one_acquisition_slot_and_no_model_or_publish_secrets(self):
+    def test_manual_workflow_has_four_parallel_slots_and_no_model_or_publish_secrets(self):
         path=Path(__file__).resolve().parents[1]/'.github/workflows/qwen_production_resources.yml'
         workflow=yaml.safe_load(path.read_text())
-        self.assertEqual(workflow['jobs']['fetch']['strategy']['max-parallel'],2)
+        self.assertEqual(workflow['jobs']['fetch']['strategy']['max-parallel'],4)
         self.assertFalse(workflow['jobs']['fetch']['strategy']['fail-fast'])
         self.assertEqual(workflow['permissions']['contents'],'read')
         text=path.read_text()
