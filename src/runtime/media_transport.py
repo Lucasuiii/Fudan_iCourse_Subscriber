@@ -17,7 +17,7 @@ import requests
 
 from src.runtime.media_protocol import (MediaTransportError, MediaSource,
     RangeRecoveryPolicy, RecoveryAction, VerifiedRangeBuffer, redirect_kind,
-    media_identity, connection_failure_code)
+    media_identity, connection_failure_code, redirect_observation)
 
 
 class SignedRangeRelay:
@@ -56,7 +56,7 @@ class SignedRangeRelay:
                            session_refresh_attempts=0, session_refresh_successes=0,
                            last_failure_offset=None, last_error_code=None, state='idle',
                            cache_hits=0, cached_bytes_served=0, cache_bytes=0,
-                           last_failure_stage=None)
+                           last_failure_stage=None, last_redirect={})
         if type(chunk_bytes) is not int or not 4096 <= chunk_bytes <= 16*1024*1024:
             raise ValueError('Invalid bounded media transport limits')
         if not 1 <= prefix_bytes <= chunk_bytes:
@@ -78,7 +78,8 @@ class SignedRangeRelay:
         with self._audit_lock:
             return dict(self._audit,
                         upstream_status_counts=dict(self._audit['upstream_status_counts']),
-                        redirect_counts=dict(self._audit['redirect_counts']))
+                        redirect_counts=dict(self._audit['redirect_counts']),
+                        last_redirect=dict(self._audit['last_redirect']))
 
     def _count(self, key, amount=1):
         with self._audit_lock:
@@ -130,7 +131,9 @@ class SignedRangeRelay:
         return self._session, headers
 
     def _redirect_kind(self, response):
-        return redirect_kind(response)
+        routes = getattr(self.client, 'trusted_media_login_urls', None)
+        login_urls = routes() if callable(routes) else ()
+        return redirect_kind(response, login_urls=login_urls)
 
     def _refresh_session(self):
         refresh = getattr(self.client, 'refresh_media_session', None)
@@ -169,6 +172,7 @@ class SignedRangeRelay:
                 with self._audit_lock:
                     counts = self._audit['redirect_counts']
                     counts[kind] = counts.get(kind,0)+1
+                    self._audit['last_redirect'] = dict(redirect_observation(response), classification=kind)
                 if kind == 'login':
                     raise MediaTransportError('media_session_refresh_needed')
                 if kind != 'same_media': raise MediaTransportError('media_redirect_untrusted')

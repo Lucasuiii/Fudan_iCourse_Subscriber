@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import requests
 from src.api.icourse import ICourseClient
+from src.api.webvpn import get_vpn_url
 from src.runtime.media_transport import SignedRangeRelay, MediaTransportError
 
 
@@ -47,13 +48,16 @@ class SessionOrigin:
                 match=re.fullmatch(r'bytes=(\d+)-(\d*)',self.headers.get('Range',''))
                 if not match: self.reply(400);return
                 start=int(match[1]);end=min(int(match[2]) if match[2] else len(owner.DATA)-1,len(owner.DATA)-1)
-                if start and owner.mode in ('foreign','same_media'):
+                if start and owner.mode in ('foreign','same_media','wrapped_foreign'):
                     if owner.mode=='foreign':location='https://untrusted.invalid/login?private-ticket'
+                    elif owner.mode=='wrapped_foreign':location=get_vpn_url('https://untrusted.invalid/cas/login')+'?private-ticket'
                     else:location='/media?t=untrusted-ticket'
                     self.reply(302,b'private-login-html',[('Location',location)]);return
-                if start and owner.mode in ('login','cold','persistent','changed'):
+                if start and owner.mode in ('login','cold','persistent','changed','wrapped_login'):
                     if owner.token!='refreshed' or owner.mode=='persistent':
-                        self.reply(302,b'private-login-html',[('Location','/login?private-ticket')]);return
+                        location = (get_vpn_url('https://id.fudan.edu.cn/idp/authCenter/authenticate')
+                                    if owner.mode=='wrapped_login' else '/login')
+                        self.reply(302,b'private-login-html',[('Location',location+'?private-ticket')]);return
                 expected='' if owner.token is None else 'media_token='+owner.token
                 if cookie!=expected:
                     self.reply(401,b'private-login-html');return
@@ -144,6 +148,30 @@ class MediaSessionTests(unittest.TestCase):
             with self.assertRaises(requests.RequestException): requests.get(relay.url,timeout=15)
             self.assertNotIn('/',origin.calls);self.assertNotIn('/api',origin.calls)
             self.assertEqual(relay.audit()['terminal_error_code'],'media_session_unavailable')
+
+    def test_exact_wrapped_sso_route_refreshes_once_without_following_ticket(self):
+        with SessionOrigin('wrapped_login') as origin, self.relay(origin,allow_session_refresh=True) as relay:
+            self.assertEqual(requests.get(relay.url,timeout=15).content,origin.DATA)
+            self.assertEqual(origin.calls.count('/'),1)
+            self.assertEqual(origin.calls.count('/api'),1)
+            audit = relay.audit()
+            self.assertEqual(audit['session_refresh_attempts'],1)
+            self.assertEqual(audit['last_redirect']['classification'],'login')
+            self.assertEqual(audit['last_redirect']['route'],'vpn_wrapped')
+            self.assertNotIn('private',json.dumps(audit))
+            audit['last_redirect']['route']='modified'
+            self.assertEqual(relay.audit()['last_redirect']['route'],'vpn_wrapped')
+
+    def test_wrapped_foreign_login_suffix_cannot_trigger_refresh(self):
+        with SessionOrigin('wrapped_foreign') as origin, self.relay(origin,allow_session_refresh=True) as relay:
+            with self.assertRaises(requests.RequestException): requests.get(relay.url,timeout=15)
+            audit = relay.audit()
+            self.assertEqual(audit['terminal_error_code'],'media_redirect_untrusted')
+            self.assertEqual(audit['last_redirect']['classification'],'other')
+            self.assertEqual(audit['last_redirect']['route'],'vpn_wrapped')
+            self.assertEqual(audit['session_refresh_attempts'],0)
+            self.assertNotIn('/',origin.calls)
+            self.assertNotIn('untrusted.invalid',json.dumps(audit))
 
     def test_cold_or_repeated_login_redirect_does_not_loop_or_forward_html(self):
         for mode in ('cold','persistent'):

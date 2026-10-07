@@ -92,7 +92,11 @@ class MediaSource:
         return min(last, end)-first+1
 
 
-def redirect_kind(response):
+LOGIN_PATHS = ('/login', '/wengine-vpn/login', '/cas/login', '/authserver/login',
+               '/authserver/authenticate', '/idp/authCenter/authenticate')
+
+
+def redirect_kind(response, *, login_urls=()):
     """Classify safely; never follow or export a replacement signed URL."""
     location = response.headers.get('Location')
     if not location: return 'missing'
@@ -103,14 +107,46 @@ def redirect_kind(response):
                 or source.scheme == 'https' and target.scheme != 'https'):
             return 'other'
         same_origin = (source.scheme, source.netloc) == (target.scheme, target.netloc)
-        login_path = target.path.rstrip('/') in (
-            '/login', '/wengine-vpn/login', '/cas/login', '/authserver/login')
+        login_path = target.path.rstrip('/') in LOGIN_PATHS
         if login_path and (same_origin or (target.scheme, target.netloc) == ('https', 'id.fudan.edu.cn')):
             return 'login'
+        # The API adapter supplies exact, configured WebVPN encodings of SSO
+        # entrypoints. A login-looking suffix inside an arbitrary proxy route
+        # is insufficient; do not decode or follow an untrusted destination.
+        if isinstance(login_urls, (tuple, list)):
+            for url in login_urls[:16]:
+                known = urlsplit(url)
+                if (not known.username and not known.password
+                        and (target.scheme, target.netloc, target.path.rstrip('/'))
+                        == (known.scheme, known.netloc, known.path.rstrip('/'))):
+                    return 'login'
         if same_origin and source.path == target.path: return 'same_media'
     except ValueError:
         pass
     return 'other'
+
+
+def redirect_observation(response):
+    """Enum/boolean evidence only: never expose Location, paths or query values."""
+    row = {'location_present': bool(response.headers.get('Location'))}
+    try:
+        source = urlsplit(response.url)
+        target = urlsplit(urljoin(response.url, response.headers.get('Location', '')))
+        same_origin = (source.scheme, source.netloc) == (target.scheme, target.netloc)
+        route = ('login_path' if target.path.rstrip('/') in LOGIN_PATHS else
+                 'root' if target.path in ('', '/') else
+                 'vpn_wrapped' if target.path.startswith(('/https/', '/http/')) else
+                 'vpn_control' if target.path.startswith('/wengine-vpn/') else
+                 'same_media' if same_origin and target.path == source.path else 'other')
+        row.update(authority=('same_origin' if same_origin else
+                   'fudan_sso' if (target.scheme, target.netloc) == ('https', 'id.fudan.edu.cn') else 'other'),
+                   route=route, https=target.scheme == 'https',
+                   downgrade=source.scheme == 'https' and target.scheme != 'https',
+                   credential_authority=bool(target.username or target.password),
+                   query_present=bool(target.query))
+    except (ValueError, TypeError):
+        row['malformed'] = True
+    return row
 
 
 class RecoveryAction(Enum):

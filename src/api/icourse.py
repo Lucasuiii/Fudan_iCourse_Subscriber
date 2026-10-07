@@ -121,6 +121,12 @@ class ICourseClient:
         except Exception:
             return False
 
+    def trusted_media_login_urls(self) -> tuple[str, ...]:
+        """Exact WebVPN SSO routes; no request or credential access here."""
+        from src.runtime.media_protocol import LOGIN_PATHS
+        return tuple(get_vpn_url(config.IDP_BASE + path) for path in LOGIN_PATHS
+                     if not path.startswith('/wengine-vpn/'))
+
     def sign_video_url(
         self, video_url: str, now: int | None = None
     ) -> str:

@@ -71,6 +71,34 @@ class AcquisitionProtocolTests(unittest.TestCase):
             response = SimpleNamespace(url='https://vpn.example/media', headers={'Location': target})
             self.assertEqual(redirect_kind(response), 'other')
 
+    def test_wrapped_login_matches_exact_configured_route_not_just_suffix(self):
+        from src.api.icourse import ICourseClient
+        from src.api.webvpn import get_vpn_url
+        client = ICourseClient(None)
+        routes = client.trusted_media_login_urls()
+        source = get_vpn_url('https://icourse.fudan.edu.cn/media')
+        good = get_vpn_url('https://id.fudan.edu.cn/idp/authCenter/authenticate')
+        for target, expected in [(good+'?ticket=private','login'),
+                                 (good+'/', 'login'),
+                                 (good+'/unexpected','other'),
+                                 (get_vpn_url('https://foreign.invalid/idp/authCenter/authenticate'),'other'),
+                                 (good.replace('webvpn.fudan.edu.cn','webvpn.fudan.edu.cn.evil.test'),'other'),
+                                 (good.replace('https://webvpn','http://webvpn'),'other')]:
+            response = SimpleNamespace(url=source,headers={'Location':target})
+            self.assertEqual(redirect_kind(response,login_urls=routes),expected)
+
+    def test_redirect_evidence_never_exports_authority_path_or_ticket(self):
+        from src.runtime.media_protocol import redirect_observation
+        response = SimpleNamespace(url='https://vpn.example/private-media',headers={
+            'Location':'https://private-user:private-pass@unknown.example/private-path?ticket=private-ticket'})
+        row = redirect_observation(response)
+        self.assertTrue(row['credential_authority'])
+        self.assertTrue(row['query_present'])
+        self.assertEqual(row['authority'],'other')
+        self.assertEqual(row['route'],'other')
+        for secret in ('unknown.example','private-path','private-user','private-pass','private-ticket'):
+            self.assertNotIn(secret,json.dumps(row))
+
 
 class AcquisitionHTTPTests(unittest.TestCase):
     DATA = bytes(range(256))*4096
