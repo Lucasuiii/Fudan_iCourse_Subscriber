@@ -10,6 +10,21 @@ RETRYABLE_AUTH_REASONS = frozenset(('service_unavailable', 'cold_session',
                                   'cas_context_missing', 'api_verification_failed'))
 
 
+def retryable_auth_response(error):
+    """Malformed transient replies restart the flow, never repeat its POST."""
+    if not isinstance(error, requests.exceptions.JSONDecodeError): return False
+    audit = authentication_failure(error)
+    if audit['failure_phase'] not in ('webvpn_auth_methods', 'webvpn_public_key',
+            'webvpn_auth_execute', 'icourse_auth_methods', 'icourse_public_key',
+            'icourse_auth_execute'): return False
+    reply = audit.get('response', {})
+    if reply.get('challenge_hint') is not False or reply.get('redirected') is not False:
+        return False
+    status, kind = reply.get('http_status'), reply.get('body_kind')
+    return (status in (408, 429, 500, 502, 503, 504) and kind in ('empty', 'html', 'json', 'other')
+            or status == 200 and kind in ('empty', 'json'))
+
+
 def authenticated_session(*, max_attempts=3, student_id=None, password=None,
                           factory=WebVPNSession, sleep=time.sleep, probe_attempts=1):
     if type(max_attempts) is not int or not 1 <= max_attempts <= 10:
@@ -62,7 +77,8 @@ def authenticated_session(*, max_attempts=3, student_id=None, password=None,
                          and error.reason in RETRYABLE_AUTH_REASONS
                          or isinstance(error, (requests.exceptions.Timeout,
                                                requests.exceptions.ConnectionError))
-                         and not isinstance(error, requests.exceptions.SSLError))
+                         and not isinstance(error, requests.exceptions.SSLError)
+                         or retryable_auth_response(error))
             if not retryable or attempt == max_attempts-1:
                 raise
             # The next attempt gets a new Session and a new one-use ticket.

@@ -47,6 +47,20 @@ AUTH_ERROR_TYPES = frozenset(('AuthenticationError', 'ReadTimeout', 'ConnectTime
     'TypeError', 'RuntimeError', 'Exception'))
 
 
+def safe_auth_response(value):
+    """Carry only response shape, never headers, body, URL or auth context."""
+    if not isinstance(value, dict): return {}
+    clean = {}
+    status = value.get('http_status')
+    if type(status) is int and 100 <= status <= 599: clean['http_status'] = status
+    kind = value.get('body_kind')
+    if isinstance(kind, str) and kind in ('empty', 'html', 'json', 'other'):
+        clean['body_kind'] = kind
+    for key in ('challenge_hint', 'redirected'):
+        if type(value.get(key)) is bool: clean[key] = value[key]
+    return clean
+
+
 def authentication_failure(error, phase='unknown', vpn=None):
     """Safe fixed fields, including a request that failed before any response."""
     kinds = ((AuthenticationError, 'AuthenticationError', 'auth_internal_error'),
@@ -77,6 +91,8 @@ def authentication_failure(error, phase='unknown', vpn=None):
         for key in ('probe_attempts', 'probe_transient_failures'):
             value = inherited.get(key)
             if type(value) is int and 0 <= value <= 3: result[key] = value
+        response = safe_auth_response(inherited.get('response'))
+        if response: result['response'] = response
         attempts = inherited.get('auth_attempts')
         if type(attempts) is int and 1 <= attempts <= 10:
             result['auth_attempts'] = attempts
@@ -91,6 +107,8 @@ def authentication_failure(error, phase='unknown', vpn=None):
                 for name in ('probe_attempts', 'probe_transient_failures'):
                     value = row.get(name)
                     if type(value) is int and 0 <= value <= 3: clean[name] = value
+                response = safe_auth_response(row.get('response'))
+                if response: clean['response'] = response
                 safe_history.append(clean)
             result['attempt_failures'] = safe_history
     if vpn is not None:
@@ -239,6 +257,25 @@ class WebVPNSession:
     def _record_icourse_auth(self, stage, response, data=None, **flags):
         self.auth_diagnostics.append(auth_observation(stage,response,data,**flags))
         self.auth_diagnostics = self.auth_diagnostics[-32:]
+
+    def _auth_json(self, response):
+        try:
+            return response.json()
+        except requests.exceptions.JSONDecodeError as error:
+            text = response.text[:100_000].strip().lower()
+            kind = ('empty' if not text else 'html' if text.startswith('<')
+                    else 'json' if text.startswith(('{', '[')) else 'other')
+            observed = auth_observation('invalid_json', response)
+            challenge = (observed['captcha_page_hint'] or observed['mfa_page_hint']
+                or bool(re.search(r'"(?:needverifycode|needmfa|needotp)"\s*:\s*true', text))
+                or any(hint in text for hint in ('one-time password', 'two-factor')))
+            audit = authentication_failure(error, vpn=self)
+            audit['response'] = safe_auth_response({
+                'http_status': response.status_code, 'body_kind': kind,
+                'challenge_hint': challenge,
+                'redirected': bool(response.history)})
+            error.auth_failure_diagnostics = audit
+            raise
 
     def probe_login_service(self):
         """Reachability before sending credentials; HTTP 200 is not login proof."""
@@ -397,7 +434,7 @@ class WebVPNSession:
             timeout=60,
         )
         self._record_icourse_auth('auth_methods_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         auth_method_list = data.get("data", [])
         request_type = data.get("requestType", "chain_type")
 
@@ -422,7 +459,7 @@ class WebVPNSession:
             timeout=60,
         )
         self._record_icourse_auth('public_key_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         pub_key_b64 = data.get("data", "")
         if not pub_key_b64:
             self._record_icourse_auth('public_key',resp,data,public_key_found=False)
@@ -462,7 +499,7 @@ class WebVPNSession:
             timeout=60,
         )
         self._record_icourse_auth('auth_execute_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         self._record_icourse_auth('auth_execute',resp,data,
                                  login_token_found=bool(data.get('loginToken')))
 
@@ -619,7 +656,7 @@ class WebVPNSession:
             timeout=60,
         )
         self._record_icourse_auth('webvpn_auth_methods_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         # data["data"] is a list of auth methods; pick the userAndPwd one
         # authChainCode for userAndPwd is in the list items;
         # requestType is at the top level
@@ -650,7 +687,7 @@ class WebVPNSession:
             },
             timeout=60,
         )
-        data = resp.json()
+        data = self._auth_json(resp)
         pub_key_b64 = data.get("data", "")
         self._record_icourse_auth('webvpn_public_key',resp,data,public_key_found=bool(pub_key_b64))
         if not pub_key_b64:
@@ -706,7 +743,7 @@ class WebVPNSession:
             },
             timeout=60,
         )
-        data = resp.json()
+        data = self._auth_json(resp)
         self._record_icourse_auth('webvpn_auth_execute',resp,data,
                                  login_token_found=bool(data.get('loginToken')))
         if str(data.get("code")) != "200":
