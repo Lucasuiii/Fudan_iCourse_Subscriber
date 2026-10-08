@@ -18,6 +18,7 @@ RATE=16000
 NORMAL_TOKENS=2048
 UNHINTED_TOKENS=256
 RESCUE_SECONDS=600
+MAX_BLOCK_ATTEMPTS=32
 
 
 class QwenTokenBudgetError(RuntimeError):
@@ -89,33 +90,46 @@ class QwenTranscriber:
         import torch
         from transformers import StoppingCriteriaList
         context=('术语：'+'、'.join(self._terms)) if self._terms and not unhinted else ''
-        limit = (bounded_retry(self._model,StoppingCriteriaList,
-                    seconds=max(0,deadline-time.monotonic()),tokens=NORMAL_TOKENS,
-                    clock=time.monotonic) if deadline is not None else nullcontext({'timed_out':False}))
-        with limit as state, generation_audit(self._model) as generations, torch.inference_mode():
-            result=self._model.transcribe(audio=(samples,RATE),context=context,language='Chinese')[0]
-        if state['timed_out'] or deadline is not None and time.monotonic() >= deadline:
-            return {'text':'','quality_state':'retry_timeout'}
-        row={'text':result.text,'quality_state':'recognized'}
+        evidence=[]
+        def capture(generations,phase,timed_out):
+            for item in generations:
+                record=dict(item,generation_phase=phase)
+                if timed_out: record['stop_reason']='deadline'
+                evidence.append(record)
         def check(result, phase, limit, generations):
             tokens=len(self._model.processor.tokenizer.encode(result.text,add_special_tokens=False))
             capped=next((g for g in generations if g['generated_tokens']>=g['token_limit']),None)
             if capped or tokens>=limit-8:
-                raise QwenTokenBudgetError(phase,capped['token_limit'] if capped else limit,tokens,
+                error=QwenTokenBudgetError(phase,capped['token_limit'] if capped else limit,tokens,
                     capped['generated_tokens'] if capped else None)
-        check(result,'normal',NORMAL_TOKENS,generations)
+                error.diagnostic['generation_diagnostics']=list(evidence)
+                raise error
+        limit = (bounded_retry(self._model,StoppingCriteriaList,
+                    seconds=max(0,deadline-time.monotonic()),tokens=NORMAL_TOKENS,
+                    clock=time.monotonic) if deadline is not None else nullcontext({'timed_out':False}))
+        with limit as state, generation_audit(self._model,clock=time.monotonic) as generations, torch.inference_mode():
+            result=self._model.transcribe(audio=(samples,RATE),context=context,language='Chinese')[0]
+        expired=state['timed_out'] or deadline is not None and time.monotonic() >= deadline
+        capture(generations,'unhinted' if unhinted else 'normal',expired)
+        if expired:
+            return {'text':'','quality_state':'retry_timeout','generation_diagnostics':evidence}
+        row={'text':result.text,'quality_state':'recognized','generation_diagnostics':evidence}
+        check(result,'unhinted' if unhinted else 'normal',NORMAL_TOKENS,generations)
         if context and context_echo(result.text,context):
             if deadline is not None and time.monotonic() >= deadline:
-                return {'text':'','quality_state':'retry_timeout'}
+                return {'text':'','quality_state':'retry_timeout','generation_diagnostics':evidence}
             with bounded_retry(self._model,StoppingCriteriaList,
                     seconds=min(60,max(0,deadline-time.monotonic())) if deadline is not None else 60,
                     clock=time.monotonic) as state, \
-                    generation_audit(self._model) as generations, torch.inference_mode():
+                    generation_audit(self._model,clock=time.monotonic) as generations, torch.inference_mode():
                 result=self._model.transcribe(audio=(samples,RATE),context='',language='Chinese')[0]
-            check(result,'unhinted_echo_retry',UNHINTED_TOKENS,generations)
-            row.update(text=result.text,quality_state='unhinted_retry')
-            if state['timed_out']:
+            expired=state['timed_out'] or deadline is not None and time.monotonic() >= deadline
+            capture(generations,'unhinted_echo_retry',expired)
+            if expired:
                 row.update(text='',quality_state='retry_timeout')
+            else:
+                check(result,'unhinted_echo_retry',UNHINTED_TOKENS,generations)
+                row.update(text=result.text,quality_state='unhinted_retry')
         if context and context_echo(row['text'],context):
             row.update(text='',quality_state='unresolved_context_echo')
         if low_information(row['text']):
@@ -125,65 +139,89 @@ class QwenTranscriber:
         return row
 
     def _recognize_resilient(self, samples, block, deadline):
-        """At most one full unhinted retry, then 30s clips and 15s leaves.
+        """Bounded full retry -> 30s -> 15s -> one final 5–7.5s bisection.
 
-        Immutable block identity and sample coverage are kept. Failed generations
-        contribute no text; successful subclips survive with explicit gaps.
-        Model/setup, corrupt audio and coordination failures still propagate.
+        A failed <=10s leaf is final. Every sample remains accounted for; a
+        cumulative block deadline and call cap limit even permanent failures.
         """
         attempts=[]
         offset=round(block['start']*RATE)
+        began=time.monotonic()
+        # Preserve the existing per-rescue cap. These are new cumulative caps,
+        # not promises that a native forward pass can be forcibly interrupted.
+        block_seconds=min(2400,max(900,600+12*len(samples)/RATE))
+        block_deadline=min(deadline,began+block_seconds)
+        def stopped(issue):
+            return issue.get('error_code')=='worker_deadline' or issue.get('stop_reason') in ('block_deadline','attempt_limit')
         def attempt(a,b,*,rescue=False,kind='original'):
             start=block['start'] if a==0 else (offset+a)/RATE
             end=block['end'] if b==len(samples) else (offset+b)/RATE
-            if time.monotonic()>=deadline:
+            now=time.monotonic()
+            if now>=deadline:
                 return None, {'start':start,'end':end,'error_code':'worker_deadline'}
+            if now>=block_deadline or len(attempts)>=MAX_BLOCK_ATTEMPTS:
+                return None, {'start':start,'end':end,'error_code':'retry_timeout',
+                    'stop_reason':'block_deadline' if now>=block_deadline else 'attempt_limit'}
+            budget=min(RESCUE_SECONDS,60+8*(b-a)/RATE,block_deadline-now)
+            stats={'start':start,'end':end,'attempt_kind':kind,'audio_seconds':(b-a)/RATE,
+                   'budget_seconds':budget}
+            row=None
             try:
                 if rescue:
                     from transformers import StoppingCriteriaList
-                    # Separate bounds from the echo retry's small 256-token cap.
-                    with bounded_retry(self._model,StoppingCriteriaList,
-                            seconds=min(RESCUE_SECONDS,60+8*(b-a)/RATE,max(0,deadline-time.monotonic())),
+                    with bounded_retry(self._model,StoppingCriteriaList,seconds=budget,
                             tokens=NORMAL_TOKENS,clock=time.monotonic) as state:
                         row=self._recognize(samples[a:b],unhinted=True)
                     if state['timed_out']:
-                        row={'text':'','quality_state':'retry_timeout'}
+                        row=dict(row,text='',quality_state='retry_timeout')
                 else:
-                    row=self._recognize(samples[a:b],deadline=deadline)
-                if time.monotonic() >= deadline:
-                    row={'text':'','quality_state':'retry_timeout'}
-                if row.get('quality_state') in ('retry_timeout','unresolved_context_echo'):
-                    issue={'error_code':row['quality_state']}
-                else:
-                    return row,None
+                    row=self._recognize(samples[a:b],deadline=now+budget)
+                ended=time.monotonic()
+                if ended>=deadline:
+                    issue={'error_code':'worker_deadline','stop_reason':'worker_deadline'}
+                elif ended>=block_deadline:
+                    issue={'error_code':'retry_timeout','stop_reason':'block_deadline'}
+                elif ended>=now+budget or row.get('quality_state')=='retry_timeout':
+                    issue={'error_code':'retry_timeout','stop_reason':'attempt_deadline'}
+                elif row.get('quality_state')=='unresolved_context_echo':
+                    issue={'error_code':'unresolved_context_echo','stop_reason':'context_echo'}
+                else: issue=None
+                generations=row.get('generation_diagnostics',[])
             except QwenTokenBudgetError as error:
-                issue=error.diagnostic
-            issue=dict(issue,start=start,end=end,attempt_kind=kind)
-            attempts.append(issue)
-            return None,issue
+                issue=dict(error.diagnostic,stop_reason='token_limit')
+                generations=issue.pop('generation_diagnostics',[])
+            stats['elapsed_seconds']=max(0,time.monotonic()-now)
+            stats['outcome']=issue['error_code'] if issue else 'success'
+            stats['stop_reason']=issue['stop_reason'] if issue else (
+                generations[-1]['stop_reason'] if generations else 'model_returned')
+            if generations: stats['generation_diagnostics']=generations
+            if issue: stats.update(issue)
+            attempts.append(stats)
+            if issue: return None,dict(stats)
+            return row,None
         row,issue=attempt(0,len(samples))
-        if row is not None: return row
-        row,issue=attempt(0,len(samples),rescue=True,kind='unhinted_full_retry')
         if row is not None:
-            return dict(row,quality_state='bounded_retry',recognition_attempts=attempts)
-        if len(samples)<=15*RATE or issue['error_code']=='worker_deadline':
-            return {'text':'','quality_state':'missing_audio','missing_intervals':[issue],
-                    'recognition_attempts':attempts}
-        parts=[];missing=[]
-        step=(15 if len(samples)<=30*RATE else 30)*RATE
-        for a in range(0,len(samples),step):
-            b=min(len(samples),a+step)
-            row,issue=attempt(a,b,rescue=True,kind='split_15s' if step==15*RATE else 'split_30s')
+            return dict(row,recognition_attempts=attempts)
+        if not stopped(issue):
+            row,issue=attempt(0,len(samples),rescue=True,kind='unhinted_full_retry')
             if row is not None:
-                parts.append(row['text']);continue
-            # Never retry an exhausted deadline or an already short leaf.
-            if b-a<=15*RATE or issue['error_code']=='worker_deadline':
-                missing.append(issue);continue
-            for c in range(a,b,15*RATE):
-                d=min(b,c+15*RATE)
-                row,issue=attempt(c,d,rescue=True,kind='split_15s')
-                if row is None: missing.append(issue)
-                else: parts.append(row['text'])
+                return dict(row,quality_state='bounded_retry',recognition_attempts=attempts)
+        parts=[];missing=[]
+        def recover(a,b,issue):
+            if stopped(issue) or b-a<=10*RATE:
+                missing.append(issue);return
+            if b-a<=15*RATE:
+                midpoint=a+(b-a)//2
+                intervals=[(a,midpoint,'split_short'),(midpoint,b,'split_short')]
+            else:
+                step=(15 if b-a<=30*RATE else 30)*RATE
+                intervals=[(c,min(b,c+step),'split_15s' if step==15*RATE else 'split_30s')
+                           for c in range(a,b,step)]
+            for c,d,kind in intervals:
+                row,issue=attempt(c,d,rescue=True,kind=kind)
+                if row is None:recover(c,d,issue)
+                else:parts.append(row['text'])
+        recover(0,len(samples),issue)
         return {'text':'\n'.join(t for t in parts if t),
                 'quality_state':'missing_audio' if missing else 'split_retry',
                 'missing_intervals':missing,'recognition_attempts':attempts}

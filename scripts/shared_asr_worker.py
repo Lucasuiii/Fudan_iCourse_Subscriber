@@ -126,6 +126,8 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
                  'unused_input_audio_bytes': max(0, input_audio_bytes-claimed_audio_bytes),
                  'phase': phase if failure else 'cleanup' if cleanup_errors else 'complete',
                  'local_completed_blocks': sum(not r.get('missing_intervals') for r in local_rows),
+                 'local_recognition_complete': not any(r.get('missing_intervals') for r in local_rows),
+                 'local_failed_blocks': sum(bool(r.get('missing_intervals')) for r in local_rows),
                  'local_terminal_blocks': len(local_rows), 'queue_snapshot_saved': snapshot_saved,
                  'active_block': active_block if failure else None,
                  'block_diagnostics': [{'chunk_id':r['chunk_id'], 'start':r['start'], 'end':r['end'],

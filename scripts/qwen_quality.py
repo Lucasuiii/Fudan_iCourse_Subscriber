@@ -28,13 +28,14 @@ def low_information(text):
 
 
 @contextmanager
-def generation_audit(model):
+def generation_audit(model, *, clock=None):
     """Count actual generated IDs before Qwen strips special tokens/text prefixes."""
     original=model.model.generate
     had_override=('generate' in model.model.__dict__ or
                   not any('generate' in cls.__dict__ for cls in type(model.model).__mro__))
     calls=[]
     def generate(*args,**kwargs):
+        began=clock() if clock is not None else None
         output=original(*args,**kwargs)
         inputs=kwargs.get('input_ids')
         sequences=getattr(output,'sequences',output)
@@ -44,7 +45,19 @@ def generation_audit(model):
         limit=kwargs.get('max_new_tokens',model.max_new_tokens)
         if count<0 or type(limit) is not int or limit<=0:
             raise RuntimeError('Unable to inspect Qwen generation completion')
-        calls.append({'generated_tokens':count,'token_limit':limit})
+        record={'generated_tokens':count,'token_limit':limit}
+        if clock is not None:
+            record['elapsed_seconds']=max(0,clock()-began)
+            record['stop_reason']='token_limit' if count>=limit else 'model_returned'
+            eos=kwargs.get('eos_token_id')
+            if eos is None:
+                eos=getattr(getattr(model.model,'generation_config',None),'eos_token_id',None)
+            eos=[eos] if type(eos) is int else eos
+            if count and isinstance(eos,(list,tuple)) and all(type(i) is int for i in eos):
+                if int(sequences[0,-1].item()) in eos:
+                    record['eos_observed']=True
+                    if count<limit: record['stop_reason']='eos'
+        calls.append(record)
         return output
     model.model.generate=generate
     try:

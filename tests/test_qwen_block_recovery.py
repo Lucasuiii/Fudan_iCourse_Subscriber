@@ -130,15 +130,15 @@ class BlockRecoveryTests(unittest.TestCase):
             rows=t.recognize_blocks(blocks,lambda b:np.arange(round((b['end']-b['start'])*RATE),dtype=np.float32)+(1 if b['chunk_id']==4 else 0),checkpoint=lambda rows:checkpoints.append(copy.deepcopy(rows)))
         self.assertEqual(len(rows),2);self.assertEqual(len(checkpoints),2)
         self.assertEqual(rows[0]['missing_intervals'][0]['start'],10)
-        self.assertEqual(rows[0]['missing_intervals'][0]['end'],25)
+        self.assertEqual(rows[0]['missing_intervals'][0]['end'],17.5)
         self.assertEqual(rows[0]['quality_state'],'missing_audio')
-        self.assertEqual(rows[0]['text'].count('可用片段'),7)
-        self.assertEqual(rows[1]['text'],'可用片段');self.assertEqual(len(calls),15)
+        self.assertEqual(rows[0]['text'].count('可用片段'),8)
+        self.assertEqual(rows[1]['text'],'可用片段');self.assertEqual(len(calls),17)
 
     def test_permanent_limit_has_finite_attempts_and_no_text(self):
         from scripts.qwen_sharding import validate_block_row
         # Include the exact historical block 49 span (122s with overlap).
-        for seconds,start,calls,gaps in [(120,0,14,8),(122,5508.555,15,9)]:
+        for seconds,start,calls,gaps in [(120,0,30,16),(122,5508.555,31,17)]:
             with self.subTest(seconds=seconds):
                 t=recognizer();t._recognize=MagicMock(side_effect=QwenTokenBudgetError('normal',2048,2040))
                 block={'chunk_id':49,'start':start,'end':start+seconds}
