@@ -220,11 +220,12 @@ class QwenTranscriber:
             for c,d,kind in intervals:
                 row,issue=attempt(c,d,rescue=True,kind=kind)
                 if row is None:recover(c,d,issue)
-                else:parts.append(row['text'])
+                else:parts.append({'start':block['start'] if c==0 else (offset+c)/RATE,
+                    'end':block['end'] if d==len(samples) else (offset+d)/RATE,'text':row['text']})
         recover(0,len(samples),issue)
-        return {'text':'\n'.join(t for t in parts if t),
+        return {'text':'\n'.join(p['text'] for p in parts if p['text']),
                 'quality_state':'missing_audio' if missing else 'split_retry',
-                'missing_intervals':missing,'recognition_attempts':attempts}
+                'missing_intervals':missing,'recognized_segments':parts,'recognition_attempts':attempts}
 
     def _drain_vad(self, vad, windows):
         while not vad.empty():

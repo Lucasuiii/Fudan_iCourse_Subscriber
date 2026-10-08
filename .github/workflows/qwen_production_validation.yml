@@ -48,6 +48,9 @@ name: Qwen Production Pipeline Validation
     - 'scripts/sharded_qwen_pilot.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
+    - 'src/ai/qwen_missing_fallback.py'
+    - 'tests/test_qwen_missing_fallback.py'
+    - 'tests/test_qwen_short_rescue.py'
     - 'src/ai/homework_review.py'
     - 'prompts/lecture_summary.md'
     - 'tests/test_summarizer_prompt.py'
@@ -105,6 +108,9 @@ name: Qwen Production Pipeline Validation
     - 'scripts/shared_asr_worker.py'
     - 'src/pipeline/**'
     - 'src/ai/qwen_review_ledger.py'
+    - 'src/ai/qwen_missing_fallback.py'
+    - 'tests/test_qwen_missing_fallback.py'
+    - 'tests/test_qwen_short_rescue.py'
     - 'src/ai/homework_review.py'
     - 'src/ai/automatic_glossary.py'
     - 'src/ai/qwen_transcriber.py'
@@ -311,6 +317,6 @@ jobs:
     - name: Authentication verification and bounded HTTP source diagnostics
       run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_auth_recovery test_production_byte_ranges test_media_transport test_media_session test_media_acquisition
     - name: Coordination retries, primary errors and pre-worker diagnostics
-      run: PYTHONPATH=tests python -m unittest test_coordination_recovery test_qwen_block_recovery
+      run: PYTHONPATH=tests python -m unittest test_coordination_recovery test_qwen_block_recovery test_qwen_short_rescue test_qwen_missing_fallback
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_production_pool test_automatic_glossary test_summarizer_prompt

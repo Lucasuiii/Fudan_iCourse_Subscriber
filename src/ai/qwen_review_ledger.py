@@ -44,7 +44,9 @@ def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_
         variants, weak, homework_cloud = [], [], []
         for item in attempts:
             interval, segments = item['interval'], item.get('segments', [])
-            if interval.get('kind') == 'weak':
+            if interval.get('kind') == 'missing_asr':
+                continue  # Already incorporated into the verified transcript.
+            elif interval.get('kind') == 'weak':
                 if segments: weak.append((interval, segments))
             elif interval.get('kind') == 'homework':
                 from src.ai.homework_visual_evidence import candidate_key
@@ -74,7 +76,8 @@ def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_
             # or generic suspect clip. Existing checkpoints keep their quota.
             if any(interval['start_ms'] < a['interval']['end_ms']
                    and a['interval']['start_ms'] < interval['end_ms']
-                   and (interval.get('kind') == 'homework' or a['interval'].get('kind') == 'homework')
+                   and (interval.get('kind') in ('homework','missing_asr')
+                        or a['interval'].get('kind') in ('homework','missing_asr'))
                    for a in attempts):
                 continue
             if len(attempts) >= MAX_CLOUD_CLIPS or state.get('seconds', 0)+seconds > MAX_CLOUD_SECONDS:

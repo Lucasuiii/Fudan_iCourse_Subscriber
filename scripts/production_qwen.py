@@ -1035,6 +1035,7 @@ def gather():
             raise ValueError('Prior finalization quota is unknown; fresh review forbidden')
         review = spec.get('review', {})
     from src.ai.qwen_review_ledger import validate_ledger
+    from src.runtime import config
     validate_ledger(review)
     (root()/'course.db').write_bytes(files['database.db'])
     db = CheckpointDatabase(str(root()/'course.db'))
@@ -1091,6 +1092,12 @@ def gather():
                 review_seconds=review.get('seconds', 0), review_clips=len(review.get('attempts', [])),
                 review_complete=bool(review.get('complete')), review_failed=bool(review.get('failed')),
                 review_error_type=review.get('error_type'),
+                fallback_configured=bool(config.DOUBAO_ASR_API_KEY),
+                fallback_clips=sum(a['interval'].get('kind') == 'missing_asr' for a in review.get('attempts', [])),
+                fallback_seconds=sum(a['seconds'] for a in review.get('attempts', []) if a['interval'].get('kind') == 'missing_asr'),
+                fallback_completed_clips=sum(a['interval'].get('kind') == 'missing_asr' and a['status'] == 'complete' for a in review.get('attempts', [])),
+                fallback_uncertain_clips=sum(a['interval'].get('kind') == 'missing_asr' and a['status'] == 'reserved' for a in review.get('attempts', [])),
+                fallback_failed_clips=sum(a['interval'].get('kind') == 'missing_asr' and a['status'] == 'failed' for a in review.get('attempts', [])),
                 homework_candidates=len(review.get('homework', {}).get('candidates', [])),
                 homework_deferred=review.get('homework', {}).get('deferred_count', 0),
                 homework_clips=sum(a['interval'].get('kind') == 'homework' for a in review.get('attempts', [])),
@@ -1109,7 +1116,7 @@ def gather():
         checkpoint()
         if spec['mode'] == 'failed': raise ValueError('Preparation failed')
         if spec['mode'] == 'sharded':
-            from src.pipeline.prepared_lecture import assemble_material
+            from src.pipeline.prepared_lecture import assemble_material, validate_audio_duration
             plan = spec['plan']
             if plan.get('execution') == 'shared_queue':
                 results = shared_results(plan, require_complete=False)
@@ -1123,11 +1130,10 @@ def gather():
             missing_intervals = [dict(gap,chunk_id=row['chunk_id'])
                 for result in results for row in result['chunks']
                 for gap in row.get('missing_intervals',[])]
-            if missing_intervals:
+            if missing_intervals and not config.DOUBAO_ASR_API_KEY:
+                print('[Doubao fallback] API unavailable; Qwen missing intervals retained.', flush=True)
                 from src.ai.qwen_transcriber import IncompleteQwenRecognitionError
                 raise IncompleteQwenRecognitionError(missing_intervals)
-            for result in results:
-                validate_result(plan,result,result['shard_id'],require_complete=True)
             if hashlib.sha256(files['lecture.flac']).hexdigest() != plan['audio_sha256']:
                 raise ValueError('Prepared audio hash changed')
             flac = root()/'lecture.flac'; flac.write_bytes(files['lecture.flac'])
@@ -1136,6 +1142,19 @@ def gather():
                             '-ac', '1', '-ar', '16000', '-y', str(raw)], timeout=300)
             if abs(raw.stat().st_size/64000-plan['audio_seconds']) > .1:
                 raise ValueError('Decoded finalization audio differs from the immutable plan')
+            validate_audio_duration(plan['audio_seconds'], spec.get('media_seconds'))
+            if missing_intervals:
+                from src.ai.qwen_missing_fallback import repair_missing
+                results = repair_missing(plan, results, str(raw), review, checkpoint,
+                                         api_key=config.DOUBAO_ASR_API_KEY)
+                missing_intervals = [dict(gap,chunk_id=row['chunk_id'])
+                    for result in results for row in result['chunks']
+                    for gap in row.get('missing_intervals',[])]
+                if missing_intervals:
+                    from src.ai.qwen_transcriber import IncompleteQwenRecognitionError
+                    raise IncompleteQwenRecognitionError(missing_intervals)
+            for result in results:
+                validate_result(plan,result,result['shard_id'],require_complete=True)
             material = assemble_material(plan, results, audio_path=str(raw), media_seconds=spec['media_seconds'])
             material['official_support'] = spec.get('official_support', [])
         row = db.get_lecture(sub_id)
