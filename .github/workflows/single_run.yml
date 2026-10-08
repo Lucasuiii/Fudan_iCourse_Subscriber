@@ -4,6 +4,7 @@ permissions:
 concurrency:
   group: icourse-data-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 jobs:
   run:
     runs-on: ubuntu-latest

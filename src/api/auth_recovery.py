@@ -16,6 +16,7 @@ def authenticated_session(*, max_attempts=3, student_id=None, password=None,
         raise ValueError('Invalid bounded authentication attempts')
     if type(probe_attempts) is not int or not 1 <= probe_attempts <= 3:
         raise ValueError('Invalid bounded preflight attempts')
+    history = []
     for attempt in range(max_attempts):
         vpn = factory()
         try:
@@ -52,6 +53,10 @@ def authenticated_session(*, max_attempts=3, student_id=None, password=None,
             return vpn
         except Exception as error:
             error.auth_failure_diagnostics = authentication_failure(error, vpn=vpn)
+            history.append({k: v for k, v in error.auth_failure_diagnostics.items()
+                            if k not in ('auth_attempts', 'attempt_failures')})
+            error.auth_failure_diagnostics.update(auth_attempts=attempt+1,
+                                                  attempt_failures=list(history))
             vpn.session.close()
             retryable = (isinstance(error, AuthenticationError)
                          and error.reason in RETRYABLE_AUTH_REASONS

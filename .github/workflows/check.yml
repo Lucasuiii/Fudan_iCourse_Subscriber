@@ -83,3 +83,4 @@ jobs:
 concurrency:
   group: icourse-data-${{ github.repository }}
   cancel-in-progress: false
+  queue: max

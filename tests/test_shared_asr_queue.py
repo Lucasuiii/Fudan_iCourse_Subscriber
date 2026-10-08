@@ -158,7 +158,7 @@ class SharedQueueTests(unittest.TestCase):
             self.assertEqual(len(blocks), 1); self.assertEqual(len(load(blocks[0])), 960000)
             checkpoint([decoded(blocks[0])])
         model.recognize_blocks.side_effect = recognize
-        with patch('scripts.shared_asr_worker.shards.seal') as seal, patch('scripts.shared_asr_worker.shards.root', return_value=Path('/unused')):
+        with tempfile.TemporaryDirectory() as tmp, patch('scripts.shared_asr_worker.shards.seal') as seal, patch('scripts.shared_asr_worker.shards.root', return_value=Path(tmp)):
             report = run_worker(plan, files, store, 0, 2, transcriber=model)
             model.recognize_blocks.assert_called_once(); self.assertEqual(seal.call_count, 3)
             self.assertEqual(report['decoded_chunk_ids'], [1])
@@ -179,7 +179,7 @@ class SharedQueueTests(unittest.TestCase):
                 saved.append(json.loads(files['local.json']))
         model = MagicMock()
         model.recognize_blocks.side_effect = lambda blocks, load, checkpoint, **kw: checkpoint([decoded(blocks[0])])
-        with patch('scripts.shared_asr_worker.shards.seal', side_effect=seal), patch('scripts.shared_asr_worker.shards.root', return_value=Path('/unused')):
+        with tempfile.TemporaryDirectory() as tmp, patch('scripts.shared_asr_worker.shards.seal', side_effect=seal), patch('scripts.shared_asr_worker.shards.root', return_value=Path(tmp)):
             with patch.object(SharedQueue, 'finish', side_effect=ConnectionError('transport failed')):
                 with self.assertRaises(ConnectionError):
                     run_worker(plan, {'chunk-0.flac': blob}, store, 0, 1, transcriber=model)

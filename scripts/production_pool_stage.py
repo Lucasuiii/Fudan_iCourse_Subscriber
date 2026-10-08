@@ -89,8 +89,24 @@ def execute():
     if result.returncode: raise SystemExit(result.returncode)
 
 
+def main(command):
+    try:
+        {'bootstrap': bootstrap, 'execute': execute}[command]()
+    except Exception as error:
+        # Authorization/API/artifact failures occur before production_qwen's
+        # own exception boundary. Keep their fixed diagnostics as well.
+        from scripts import production_qwen as pipeline
+        from scripts.coordination_transport import diagnostic
+        audit = {'entry': command if command in ('bootstrap', 'execute') else 'unknown',
+                 'error_code': pipeline.failure_code(error)}
+        if diagnostic(error): audit['coordination'] = diagnostic(error)
+        try: pipeline.out('stage-failure.json').write_bytes(pipeline.shards.encoded(audit))
+        except Exception: pass  # Diagnostic writes must preserve the primary error.
+        raise
+
+
 if __name__ == '__main__':
-    try: {'bootstrap': bootstrap, 'execute': execute}[sys.argv[1]]()
+    try: main(sys.argv[1])
     except Exception as error:
         print(f'Reserved stage failed ({type(error).__name__}); private details withheld')
         raise SystemExit(1)

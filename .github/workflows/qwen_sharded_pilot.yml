@@ -45,6 +45,7 @@ permissions:
 concurrency:
   group: icourse-data-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 env:
   HF_HUB_DISABLE_TELEMETRY: '1'
   TOKENIZERS_PARALLELISM: 'false'

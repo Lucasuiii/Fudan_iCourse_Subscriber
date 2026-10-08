@@ -15,6 +15,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from scripts.asr_queue_store import GitHubQueueStore
+from scripts.coordination_transport import CoordinationError, diagnostic, read_json, read_with_retry
 
 MAX_TOTAL = 15
 MAX_JOBS = MAX_TOTAL - 1  # The controller itself consumes a Runner.
@@ -155,12 +156,21 @@ def save(store, revision, state):
 def api(path, *, payload=None, allow_404=False):
     args = ['gh', 'api', path]
     if payload is not None: args += ['--method', 'POST', '--input', '-']
-    result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
-                            text=True, capture_output=True, timeout=120)
-    if result.returncode:
-        if allow_404 and '(HTTP 404)' in result.stderr: return None
-        raise RuntimeError('GitHub stage API failed; response withheld')
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    def request():
+        result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
+                                text=True, capture_output=True, timeout=120)
+        if result.returncode:
+            if allow_404 and '(HTTP 404)' in result.stderr: return None
+            raise subprocess.CalledProcessError(result.returncode, args, stderr=result.stderr)
+        return json.loads(result.stdout) if result.stdout.strip() else None
+    # Dispatch/creation can succeed with a lost response. Never repeat a POST.
+    if payload is None:
+        return read_with_retry('github_read', request)
+    try:
+        return request()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        from scripts.coordination_transport import transport_code
+        raise CoordinationError('github_dispatch', transport_code(error), 1) from error
 
 
 def artifact_sources(state, name):
@@ -255,7 +265,7 @@ class Actions:
             'ref': ref, 'inputs': {'parent_run_id': self.state['run_id'], 'ticket': ticket['nonce']}})
 
     def poll(self, state):
-        pages = json.loads(subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
+        pages = read_json(lambda: subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
             f'repos/{self.repo}/actions/workflows/{WORKFLOW}/runs?event=workflow_dispatch&created=%3E%3D{state["created_at"]}&per_page=100'],
             stderr=subprocess.PIPE, timeout=120))
         matches = {}
@@ -428,10 +438,13 @@ def public_audit(state, ended, error=None):
         'GitHub stage API failed; response withheld': 'github_api_failure',
         'One or more course stages failed; checkpoints retained': 'course_stage_failure',
     }
-    return {'protocol': 1, 'parent_run_id': state['run_id'], 'all_ended': ended,
+    result = {'protocol': 1, 'parent_run_id': state['run_id'], 'all_ended': ended,
             'error_code': reasons.get(str(error), 'controller_failure') if error else None,
             'children': [{k: t.get(k) for k in ('slot', 'stage', 'worker', 'attempt', 'run', 'status', 'conclusion')}
                          for t in state['tickets']]}
+    if diagnostic(error):
+        result.update(error_code='coordination_failure', coordination=diagnostic(error))
+    return result
 
 
 def main():

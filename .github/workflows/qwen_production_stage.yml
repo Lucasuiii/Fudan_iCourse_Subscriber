@@ -174,10 +174,13 @@ jobs:
         overwrite: true
         if-no-files-found: ignore
     - uses: actions/upload-artifact@v4
-      if: ${{ always() && steps.authorize.outcome == 'success' }}
+      if: ${{ always() }}
       with:
         name: qwen-production-stage-audit
-        path: ${{ runner.temp }}/qwen-shards/out/stage-audit.json
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/stage-audit.json
+          ${{ runner.temp }}/qwen-shards/out/pipeline-failure.json
+          ${{ runner.temp }}/qwen-shards/out/stage-failure.json
         retention-days: 7
         if-no-files-found: ignore
     - uses: actions/upload-artifact@v4

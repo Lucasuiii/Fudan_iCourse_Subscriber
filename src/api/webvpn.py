@@ -77,6 +77,22 @@ def authentication_failure(error, phase='unknown', vpn=None):
         for key in ('probe_attempts', 'probe_transient_failures'):
             value = inherited.get(key)
             if type(value) is int and 0 <= value <= 3: result[key] = value
+        attempts = inherited.get('auth_attempts')
+        if type(attempts) is int and 1 <= attempts <= 10:
+            result['auth_attempts'] = attempts
+        history = inherited.get('attempt_failures')
+        if isinstance(history, list) and len(history) <= 10:
+            safe_history = []
+            for row in history:
+                if not isinstance(row, dict): continue
+                clean = {k: row[k] for k, allowed in (
+                    ('failure_phase', AUTH_PHASES), ('error_type', AUTH_ERROR_TYPES),
+                    ('failure', AUTH_FAILURE_CODES)) if isinstance(row.get(k), str) and row[k] in allowed}
+                for name in ('probe_attempts', 'probe_transient_failures'):
+                    value = row.get(name)
+                    if type(value) is int and 0 <= value <= 3: clean[name] = value
+                safe_history.append(clean)
+            result['attempt_failures'] = safe_history
     if vpn is not None:
         for key, attribute in (('probe_attempts','auth_probe_attempts'),
                                ('probe_transient_failures','auth_probe_transient_failures')):

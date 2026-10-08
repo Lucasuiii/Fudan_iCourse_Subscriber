@@ -82,7 +82,14 @@ def encode_audio_chunks(source, plan, files, destination):
 def failure_code(error):
     # Whitelisted internal reasons only; provider/media exceptions may contain
     # private URLs or credentials and must never be printed verbatim.
+    from scripts.coordination_transport import CoordinationError
+    if isinstance(error, CoordinationError): return 'coordination_failure'
     reasons = {
+        'Qwen chunk reached its token budget': 'qwen_token_budget',
+        'Incomplete Qwen audio block': 'qwen_incomplete_block',
+        'Shared worker time budget reached': 'worker_deadline',
+        'Qwen shard timeout': 'worker_deadline',
+        'Queue conflict retry budget exhausted': 'queue_conflicts',
         'A later finalization lost its quota checkpoint; automatic refund forbidden': 'quota_checkpoint_lost',
         'Prior finalization has no quota checkpoint; fresh review forbidden': 'quota_checkpoint_missing',
         'Prior finalization quota is unknown; fresh review forbidden': 'quota_checkpoint_missing',
@@ -112,7 +119,8 @@ def artifact(name, target, *, run=None, required=False, _direct=False):
     """API failure or expiry is not equivalent to a confirmed absent checkpoint."""
     run = run or os.environ['GITHUB_RUN_ID']
     repo = os.environ['GITHUB_REPOSITORY']
-    pages = json.loads(subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
+    from scripts.coordination_transport import read_json as coordination_json
+    pages = coordination_json(lambda: subprocess.check_output(['gh', 'api', '--paginate', '--slurp',
         f'repos/{repo}/actions/runs/{run}/artifacts?per_page=100'], stderr=subprocess.PIPE, timeout=120))
     if any(a['name'] == 'qwen-production-pool-audit' for page in pages for a in page['artifacts']):
         _POOL_RUNS.add(str(run))
@@ -696,6 +704,10 @@ def preparation_failure_audit(specification, files, error, *, saved=False, secon
         'planned_workers': len(specification.get('plan', {}).get('shards', []))}
     if specification.get('audio_startup_diagnostics'):
         audit['audio_startup_diagnostics'] = specification['audio_startup_diagnostics']
+    if phase == 'login':
+        from src.api.webvpn import authentication_failure
+        audit['authentication'] = authentication_failure(error)
+        audit['error_code'] = audit['authentication']['failure']
     if full_counts is not None:
         audit.update(full_checkpoint_file_count=full_counts[0], full_checkpoint_content_bytes=full_counts[1])
     timing = specification.get('preparation_timing', {})
@@ -1294,9 +1306,18 @@ def main():
         shutil.rmtree(root(), ignore_errors=True); return
     # Existing components log private course names. Keep their output inside
     # the process; only the enclosing workflow gets sanitized completion info.
-    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        {'plan': plan, 'prepare': prepare, 'worker': worker, 'gather': gather,
-         'publish': publish_result, 'deliver': deliver, 'finalize': finalize}[mode]()
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            {'plan': plan, 'prepare': prepare, 'worker': worker, 'gather': gather,
+             'publish': publish_result, 'deliver': deliver, 'finalize': finalize}[mode]()
+    except Exception as error:
+        from scripts.coordination_transport import diagnostic
+        audit = {'mode': mode if mode in ('plan', 'prepare', 'worker', 'gather', 'publish', 'deliver', 'finalize') else 'unknown',
+                 'error_code': failure_code(error)}
+        if diagnostic(error): audit['coordination'] = diagnostic(error)
+        try: out('pipeline-failure.json').write_bytes(shards.encoded(audit))
+        except Exception: pass  # Preserve the processing exception on a full disk.
+        raise
     print(f'Production pilot {mode} completed', flush=True)
 
 

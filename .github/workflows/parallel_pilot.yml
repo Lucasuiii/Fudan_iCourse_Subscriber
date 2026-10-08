@@ -126,6 +126,7 @@ concurrency:
     || inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
     || format('icourse-data-{0}', github.repository) }}
   cancel-in-progress: false
+  queue: max
 jobs:
   register:
     if: ${{ github.event_name == 'push' }}
