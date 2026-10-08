@@ -324,6 +324,7 @@ jobs:
       run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   pool:
+    name: 课堂并发进度（获取 → 识别 → 汇总）
     concurrency:
       group: icourse-runner-controller-${{ github.repository }}
       cancel-in-progress: false
@@ -349,14 +350,16 @@ jobs:
       with:
         python-version: '3.12'
     - run: python -m pip install cryptography pycryptodome requests
-    - name: Coordinate bounded production stages
+    - name: 实时课堂进度（展开查看块数与 Worker 链接）
       id: controller
       run: python -m scripts.production_pool
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
         name: qwen-production-pool-audit
-        path: ${{ runner.temp }}/qwen-shards/out/pool-audit.json
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/pool-audit.json
+          ${{ runner.temp }}/qwen-shards/out/pool-progress.json
         retention-days: 7
         overwrite: true
         if-no-files-found: ignore

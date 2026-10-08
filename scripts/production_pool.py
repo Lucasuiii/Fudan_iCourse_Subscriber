@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from scripts.asr_queue_store import GitHubQueueStore
 from scripts.coordination_transport import CoordinationError, diagnostic, read_json, read_with_retry
+from scripts.pool_progress import PoolProgress, show_progress
 
 MAX_TOTAL = 15
 MAX_JOBS = MAX_TOTAL - 1  # The controller itself consumes a Runner.
@@ -324,7 +325,10 @@ def workload(slot, course, attempt):
         if row['status'] == 'failed': failed.append(row['result']); continue
         remaining.append(b)
         if row['status'] == 'pending' or row.get('attempt', attempt) < attempt: pending.append(b)
-    return {'complete': not remaining and not failed, 'settled': not remaining, 'failed_blocks': len(failed), 'pending_blocks': len(pending), 'remaining_blocks': len(remaining),
+    return {'complete': not remaining and not failed, 'settled': not remaining,
+            'total_blocks': len(plan['blocks']), 'completed_blocks': len(rows),
+            'claimed_blocks': len(remaining)-len(pending),
+            'failed_blocks': len(failed), 'pending_blocks': len(pending), 'remaining_blocks': len(remaining),
             'remaining_seconds': sum(b['end']-b['start'] for b in remaining),
             'worker_cap': len(plan['shards']), 'rtf': estimate_rtf(rows, plan.get('runner_policy', {}).get('cost_rtf', DEFAULT_RTF)), 'attempt': attempt}
 
@@ -348,7 +352,7 @@ def refresh_phases(state, works):
 
 
 def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.sleep, timeout=5.5*3600,
-               get_work=workload, acquire=acquire_owner):
+               get_work=workload, acquire=acquire_owner, progress=None):
     _, identity = read_state(store)
     acquire(identity, store.key)
     began = clock(); actions.source_ref()  # Freeze before any model/prepare job dispatch.
@@ -370,6 +374,7 @@ def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.slee
                 works[int(raw)] = get_work(int(raw), course, attempt)
         refresh_phases(state, works)
         validate(state); save(store, revision, state)
+        show_progress(progress, state, works)
         if all(c['phase'] in ('done', 'failed') for c in state['courses'].values()):
             return state
         while True:
@@ -394,6 +399,7 @@ def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.slee
             save(store, revision, state)  # Durable reservation before dispatch.
             actions.dispatch(ticket, 'codex/runner-source-'+state['run_id'])
             # Successful response still leaves a reservation until discoverable.
+        show_progress(progress, state, works)
         sleep(30)
     raise TimeoutError('Controller budget exhausted; child runs remain preserved')
 
@@ -451,10 +457,16 @@ def public_audit(state, ended, error=None):
 def main():
     from scripts import production_qwen as pipeline
     store = store_for()
+    progress = None
+    try:
+        progress = PoolProgress(pipeline.out('pool-progress.json'), repository=os.environ['GITHUB_REPOSITORY'],
+                                summary=os.environ.get('GITHUB_STEP_SUMMARY'))
+    except Exception:
+        print('进度显示暂不可用；调度与检查点继续按原流程处理。', flush=True)
     ended = False; error = None; state = {'run_id': os.environ['GITHUB_RUN_ID'], 'tickets': []}
     try:
         _, state = read_state(store)
-        result = controller(store, Actions(state), attempt=int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')))
+        result = controller(store, Actions(state), attempt=int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')), progress=progress)
         ended = all(t['status'] == 'completed' for t in result['tickets'])
         if any(c['phase'] == 'failed' for c in result['courses'].values()):
             raise ValueError('One or more course stages failed; checkpoints retained')
@@ -464,6 +476,7 @@ def main():
     finally:
         try: _, state = read_state(store)
         except Exception: pass  # Still retain a safe failure marker on transport errors.
+        show_progress(progress, state, {}, final=True, error=error is not None)
         pipeline.out('pool-audit.json').write_text(json.dumps(public_audit(state, ended, error)))
         pipeline.write_outputs(all_ended=ended)
         store.close()
