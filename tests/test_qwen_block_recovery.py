@@ -136,12 +136,18 @@ class BlockRecoveryTests(unittest.TestCase):
         self.assertEqual(rows[1]['text'],'可用片段');self.assertEqual(len(calls),15)
 
     def test_permanent_limit_has_finite_attempts_and_no_text(self):
-        t=recognizer();t._recognize=MagicMock(side_effect=QwenTokenBudgetError('normal',2048,2040))
-        with patch.dict(sys.modules,MODULES):
-            rows=t.recognize_blocks([{'chunk_id':0,'start':0,'end':120}],lambda b:np.zeros(120*RATE))
-        self.assertEqual(t._recognize.call_count,14);self.assertEqual(rows[0]['text'],'')
-        self.assertEqual(len(rows[0]['missing_intervals']),8)
-        self.assertEqual(sum(g['end']-g['start'] for g in rows[0]['missing_intervals']),120)
+        from scripts.qwen_sharding import validate_block_row
+        # Include the exact historical block 49 span (122s with overlap).
+        for seconds,start,calls,gaps in [(120,0,14,8),(122,5508.555,15,9)]:
+            with self.subTest(seconds=seconds):
+                t=recognizer();t._recognize=MagicMock(side_effect=QwenTokenBudgetError('normal',2048,2040))
+                block={'chunk_id':49,'start':start,'end':start+seconds}
+                with patch.dict(sys.modules,MODULES):
+                    rows=t.recognize_blocks([block],lambda b:np.zeros(seconds*RATE))
+                self.assertEqual(t._recognize.call_count,calls);self.assertEqual(rows[0]['text'],'')
+                self.assertEqual(len(rows[0]['missing_intervals']),gaps)
+                self.assertAlmostEqual(sum(g['end']-g['start'] for g in rows[0]['missing_intervals']),seconds)
+                validate_block_row(block,rows[0])
 
     def test_cooperative_retry_timeout_never_accepts_partial_text(self):
         t=recognizer();t._recognize=MagicMock(side_effect=[QwenTokenBudgetError('normal',2048,2040)]+[{'text':'截断'}]*2)
