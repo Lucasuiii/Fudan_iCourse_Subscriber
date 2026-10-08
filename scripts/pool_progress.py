@@ -18,6 +18,10 @@ STATUSES = {'reserved': '等待登记', 'queued': '排队', 'in_progress': '运�
             'completed': '已结束'}
 CONCLUSIONS = {'success', 'failure', 'cancelled', 'skipped', 'timed_out',
                'action_required', 'startup_failure', 'stale', 'neutral'}
+LABELS = {'running': '进行中', 'running_with_failures': '进行中（部分课次失败）',
+          'running_incomplete': '进行中（已有缺失块，整堂不完整）',
+          'success': '完成', 'failed': '失败', 'incomplete': '不完整',
+          'controller_stopped': '控制器停止；子任务状态需核验'}
 
 
 class PoolProgress:
@@ -63,7 +67,12 @@ class PoolProgress:
                             'workers_waiting': sum(t['status'] != 'in_progress' for t in workers),
                             'children': children})
         phases = [c['phase'] for c in courses]
-        status = ('incomplete' if any(c.get('failed_blocks', 0) for c in courses)
+        incomplete = any(c.get('failed_blocks', 0) for c in courses)
+        active = any(p not in ('done', 'failed') for p in phases)
+        status = ('controller_stopped' if final and error and active
+                  else 'running_incomplete' if incomplete and active
+                  else 'running_with_failures' if 'failed' in phases and active
+                  else 'incomplete' if incomplete
                   else 'failed' if 'failed' in phases
                   else 'controller_stopped' if final and error
                   else 'success' if courses and all(p == 'done' for p in phases) else 'running')
@@ -74,16 +83,19 @@ class PoolProgress:
 
     @staticmethod
     def block_text(course):
-        if 'total_blocks' not in course: return '块数待音频准备完成后确定'
+        if 'total_blocks' not in course:
+            if course['phase'] == 'failed':
+                children = course.get('children', [])
+                return ('音频准备失败；未进入分块识别' if children and all(c['stage'] == 'prepare' for c in children)
+                        else '暂无分块计数')
+            return '块数待音频准备完成后确定'
         return (f"成功 {course.get('completed_blocks', 0)}/{course['total_blocks']}，"
                 f"缺失 {course.get('failed_blocks', 0)}，"
                 f"待领取 {course.get('pending_blocks', 0)}，"
                 f"识别中 {course.get('claimed_blocks', 0)}")
 
     def markdown(self, snapshot):
-        labels = {'running': '进行中', 'success': '完成', 'failed': '失败',
-                  'incomplete': '不完整', 'controller_stopped': '控制器停止；子任务状态需核验'}
-        lines = [f"## 课堂并发进度：{labels[snapshot['status']]}", '',
+        lines = [f"## 课堂并发进度：{LABELS[snapshot['status']]}", '',
                  '实时进度请展开“实时课堂进度”步骤日志；此摘要在步骤结束后显示。', '',
                  '| 课次 | 阶段 | 音频块 | Worker 运行 / 等待 |',
                  '| --- | --- | --- | --- |']
@@ -110,7 +122,7 @@ class PoolProgress:
         if fingerprint != self.fingerprint or now-self.last_emit >= 120 or final:
             self.output.parent.mkdir(parents=True, exist_ok=True)
             self.output.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2)+'\n')
-            lines = [f"课堂进度 · 已运行 {snapshot['elapsed_seconds']//60} 分钟 · {snapshot['status']}"]
+            lines = [f"课堂进度 · 已运行 {snapshot['elapsed_seconds']//60} 分钟 · {LABELS[snapshot['status']]}"]
             for c in snapshot['courses']:
                 lines.append(f"课次 {c['slot']+1} | {c['label']} | {self.block_text(c)} | "
                              f"Worker 运行 {c['workers_running']} / 等待 {c['workers_waiting']}")

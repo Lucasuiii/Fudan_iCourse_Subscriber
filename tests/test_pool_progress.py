@@ -140,3 +140,15 @@ class ProgressTests(unittest.TestCase):
         outputs.assert_called_once_with(all_ended=True)
         self.assertIsNone(json.loads((Path(self.temp.name)/'pool-audit.json').read_text())['error_code'])
         self.assertNotIn('private path', output.getvalue())
+
+    def test_partial_failure_keeps_other_course_running_and_prepare_failure_stops_waiting(self):
+        state = journal(2)
+        ticket = pool.reserve(state, 0, 'prepare', 1); ticket.update(status='completed', conclusion='failure')
+        state['courses']['0']['phase'] = 'failed'; state['courses']['1']['phase'] = 'asr'
+        snapshot = self.reporter.snapshot(state, {})
+        self.assertEqual(snapshot['status'], 'running_with_failures')
+        self.assertIn('进行中（部分课次失败）', self.reporter.markdown(snapshot))
+        self.assertEqual(self.reporter.block_text(snapshot['courses'][0]), '音频准备失败；未进入分块识别')
+        with_gaps = self.reporter.snapshot(state, {1: {'failed_blocks': 1}})
+        self.assertEqual(with_gaps['status'], 'running_incomplete')
+        self.assertEqual(self.reporter.snapshot(state, {}, final=True, error=True)['status'], 'controller_stopped')
