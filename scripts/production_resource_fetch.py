@@ -1,0 +1,260 @@
+"""Manual full-audio acquisition only: frozen latest lessons, no model or publication."""
+from contextlib import redirect_stdout, redirect_stderr
+import base64
+import io
+import json
+import math
+import os
+import re
+import subprocess
+from pathlib import Path
+import sys
+import time
+
+from scripts import production_qwen as pipeline
+from scripts import sharded_qwen_pilot as shards
+from scripts.parallel_courses import configured_courses
+from scripts.production_db import load_remote
+from scripts.production_result_export import encrypt
+from src.api.auth_recovery import authenticated_session, fresh_media_session
+from src.api.icourse import ICourseClient
+from src.api.webvpn import WebVPNSession
+from src.data.database import Database
+from src.runtime.audio_preparation import PREPARE_STREAM_TIMEOUT, PREPARE_IDLE_TIMEOUT, validate_prepared_audio
+from src.runtime.scheduler import AudioDownloader
+
+
+def check_request():
+    if os.environ.get('GITHUB_RUN_ATTEMPT', '1') != '1':
+        raise ValueError('Resource rerun requires fresh explicit authorization')
+    recipient = base64.b64decode(os.environ['RECIPIENT_PUBLIC_KEY'], validate=True)
+    if len(recipient) != 32:
+        raise ValueError('Invalid recipient key')
+    return recipient
+
+
+def save_result(row, slot):
+    recipient = check_request()
+    pipeline.out('resource-result.enc').write_bytes(encrypt(
+        shards.encoded(row), recipient, os.environ['GITHUB_RUN_ID'], slot))
+    # Only the fixed safe audit is public; lesson names/IDs remain encrypted.
+    pipeline.out('resource-audit.json').write_bytes(shards.encoded(public_resource_audit(row['audit'])))
+
+
+def select_latest(client, db, courses):
+    """Resolve each subscribed course independently; unavailable is not a fake success."""
+    rows = []
+    for slot, course in enumerate(courses):
+        row = {'task_slot': slot, 'course_id': course}
+        try:
+            task, teacher = pipeline.latest_validation_task(client, db, course)
+            row.update(status='selected', task=task, teacher=teacher)
+        except Exception as error:
+            row.update(status='selection_failed', error_type=type(error).__name__)
+        rows.append(row)
+    return rows
+
+
+def selection_audit(rows):
+    return {'resource_only': True, 'course_count': len(rows), 'courses': [
+        public_resource_audit(dict(task_slot=r['task_slot'], status=r['status'],
+            **({'error_code': 'selection_failed'} if r['status'] != 'selected' else {}))) for r in rows]}
+
+
+def public_resource_audit(audit):
+    """Explicit public schema: never copy provider fields or nested diagnostics."""
+    result = {}
+    if type(audit.get('task_slot')) is int and audit['task_slot'] in range(4):
+        result['task_slot'] = audit['task_slot']
+    if audit.get('status') in ('selected', 'selection_failed', 'complete', 'failed', 'selecting'):
+        result['status'] = audit['status']
+    if audit.get('phase') in ('authentication', 'audio_startup', 'audio_download',
+            'audio_retention', 'audio_validation', 'complete'):
+        result['phase'] = audit['phase']
+    for key in ('resource_only', 'publication', 'emailed', 'audio_retained'):
+        if type(audit.get(key)) is bool: result[key] = audit[key]
+    if type(audit.get('model_calls')) is int and audit['model_calls'] >= 0:
+        result['model_calls'] = audit['model_calls']
+    seconds = audit.get('seconds')
+    if type(seconds) in (float, int) and math.isfinite(seconds) and seconds >= 0:
+        result['seconds'] = seconds
+    if 'error_code' in audit:
+        codes = {'selection_failed', 'audio_startup_failed', 'incomplete_audio', 'audio_decode_errors',
+            'audio_diagnostics_incomplete', 'audio_sample_metadata_invalid', 'preparation_deadline',
+            'preparation_stalled', 'auth_invalid_response', 'authentication_failed', 'coordination_failure'}
+        result['error_code'] = audit['error_code'] if audit['error_code'] in codes else 'resource_failure'
+    return result
+
+
+def requested_slots():
+    value = os.environ.get('RESOURCE_SLOTS', '').strip()
+    if not value: return list(range(4))
+    if not re.fullmatch(r'[0-3](,[0-3])*', value):
+        raise ValueError('Invalid resource slots')
+    slots = [int(i) for i in value.split(',')]
+    if len(set(slots)) != len(slots): raise ValueError('Duplicate resource slot')
+    return slots
+
+
+def frozen_resource_selection(source):
+    if not re.fullmatch(r'[1-9][0-9]{0,19}', source) or source == os.environ['GITHUB_RUN_ID']:
+        raise ValueError('Invalid resource selection source')
+    repo = os.environ['GITHUB_REPOSITORY']
+    info = json.loads(subprocess.check_output(['gh','api',
+        f'repos/{repo}/actions/runs/{source}'], stderr=subprocess.PIPE, timeout=60))
+    if (info.get('status') != 'completed'
+            or info.get('path') != '.github/workflows/qwen_production_resources.yml'):
+        raise ValueError('Resource selection source must have ended')
+    target = pipeline.root()/'source-selection'
+    pipeline.artifact('icourse-resource-selection', target, run=source, required=True)
+    with shards.environment({'GITHUB_RUN_ID': source}):
+        files = shards.unseal(target/'selection.enc', 'resource-selection', slot=0)
+    rows = json.loads(files['selections.json'])
+    if (not isinstance(rows,list) or len(rows)!=4
+            or [r.get('task_slot') for r in rows] != list(range(4))
+            or len({r.get('course_id') for r in rows}) != 4):
+        raise ValueError('Invalid frozen resource selection')
+    for row in rows:
+        if row.get('status') == 'selected':
+            task = row['task']
+            if str(task[0]) != str(row['course_id']) or not task[2].get('sub_id'):
+                raise ValueError('Frozen resource identity differs')
+            task[2]['_validation']['selection_source_run_id'] = source
+        elif row.get('status') != 'selection_failed':
+            raise ValueError('Invalid frozen selection status')
+    return rows
+
+
+def plan():
+    check_request()
+    slots = requested_slots()
+    source = os.environ.get('RESOURCE_SELECTION_SOURCE_RUN_ID', '').strip()
+    vpn = db = None
+    sessions = []
+    def factory():
+        value = WebVPNSession()
+        sessions.append(value)
+        return value
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            if source:
+                rows = frozen_resource_selection(source)
+            else:
+                courses = configured_courses(os.environ['COURSE_IDS'])
+                pipeline.out('selection-audit.json').write_bytes(shards.encoded(
+                    {'resource_only': True, 'course_count': len(courses), 'status': 'selecting'}))
+                if len(courses) != 4:
+                    raise ValueError('Expected exactly four configured subscriptions')
+                load_remote(pipeline.root()/'resource-history.db')
+                db = Database(str(pipeline.root()/'resource-history.db'))
+                vpn = authenticated_session(factory=factory)
+                rows = select_latest(ICourseClient(vpn), db, courses)
+        shards.seal({'selections.json': shards.encoded(rows)}, 'resource-selection',
+                    pipeline.out('selection.enc'), slot=0)
+        pipeline.out('selection-export.enc').write_bytes(encrypt(
+            shards.encoded({'resource_only': True, 'selections': rows}), check_request(),
+            os.environ['GITHUB_RUN_ID'], 255))
+        audit = selection_audit(rows)
+        audit['requested_slots'] = slots
+        pipeline.out('selection-audit.json').write_bytes(shards.encoded(audit))
+        pipeline.write_outputs(tasks={'include': [{'task_slot': i} for i in slots]})
+    finally:
+        pipeline.out('authentication-audit.json').write_bytes(shards.encoded(
+            {'authenticated': vpn is not None, 'frozen_selection_reused': bool(source),
+             'attempts': [s.auth_diagnostics for s in sessions]}))
+        if db is not None: db.conn.close()
+        if vpn is not None: vpn.session.close()
+
+
+def wait_audio(handle, *, clock=time.monotonic, sleep=time.sleep):
+    began = changed = clock()
+    last_size = 0
+    while handle.process.poll() is None:
+        size = Path(handle.path).stat().st_size if Path(handle.path).exists() else 0
+        now = clock()
+        if size > last_size: last_size, changed = size, now
+        if now-began > PREPARE_STREAM_TIMEOUT:
+            raise TimeoutError('Audio preparation deadline exceeded')
+        if now-changed > PREPARE_IDLE_TIMEOUT:
+            raise TimeoutError('Audio preparation stalled')
+        sleep(.5)
+
+
+def fetch():
+    check_request()
+    slot = int(os.environ['COURSE_SLOT'])
+    if not 0 <= slot < 4: raise ValueError('Invalid resource slot')
+    pipeline.artifact('icourse-resource-selection', pipeline.root()/'selection', required=True)
+    rows = shards.unseal(pipeline.root()/'selection'/'selection.enc', 'resource-selection', slot=0)
+    selected = json.loads(rows['selections.json'])[slot]
+    if selected['task_slot'] != slot: raise ValueError('Frozen resource slot differs')
+    audit = dict(selection_audit([selected])['courses'][0], resource_only=True,
+                 model_calls=0, publication=False, emailed=False)
+    row = {'selection': selected, 'audit': audit}
+    if selected['status'] != 'selected':
+        save_result(row, slot)
+        return False
+    course, title, lecture = selected['task']
+    spec = {'mode': 'resources_only', 'course_id': course, 'sub_id': lecture['sub_id']}
+    files = {}; downloader = handle = vpn = None
+    began = time.monotonic()
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            audit['phase'] = 'authentication'
+            vpn = authenticated_session()
+            audit['phase'] = 'audio_startup'
+            downloader = AudioDownloader(str(pipeline.root()/'audio'), max_concurrent=1)
+            downloader.schedule(ICourseClient(vpn, media_reauth_factory=fresh_media_session), course, lecture['sub_id'], preserve_timestamps=True)
+            handle = downloader.get(lecture['sub_id'], timeout=180)
+            if handle is None:
+                audit['audio_startup_diagnostics'] = downloader.startup_failure(lecture['sub_id'])
+                raise ValueError('No playable production audio')
+            audit['phase'] = 'audio_download'
+            wait_audio(handle)
+            audit['phase'] = 'audio_retention'
+            # Preserve actual samples/hash/diagnostics before testing completeness.
+            pipeline.retain_prepared_audio(handle, spec, files)
+            audit['phase'] = 'audio_validation'
+            validate_prepared_audio(spec)
+        audit.update(status='complete', phase='complete')
+    except Exception as error:
+        audit.update(status='failed', error_type=type(error).__name__, error_code=pipeline.failure_code(error))
+        if audit.get('phase') == 'authentication':
+            from src.runtime.audio_preparation import startup_diagnostics
+            audit['authentication_diagnostics'] = startup_diagnostics('authentication', error)
+        if handle is not None:
+            try:
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    pipeline.retain_prepared_audio(handle, spec, files)
+            except Exception as retention_error:
+                audit['retention_error_type'] = type(retention_error).__name__
+    finally:
+        if downloader is not None: downloader.shutdown()
+        if vpn is not None: vpn.session.close()
+        audit.update(seconds=time.monotonic()-began, audio_retained='lecture.flac' in files)
+        row['specification'] = spec
+        audit['audio_diagnostics'] = spec.get('audio_diagnostics', {})
+        # Audio is protected by the existing run/task/stage-bound multipart codec.
+        if files:
+            files['specification.json'] = shards.encoded(spec)
+            try:
+                shards.seal(files, 'prepared', pipeline.out('resource-audio.enc'), slot=slot)
+            except Exception as checkpoint_error:
+                audit.update(status='failed', checkpoint_error_type=type(checkpoint_error).__name__)
+        save_result(row, slot)
+    return audit['status'] == 'complete'
+
+
+def main():
+    mode = sys.argv[1]
+    if mode == 'plan': plan()
+    elif mode == 'fetch':
+        if not fetch(): raise SystemExit(1)
+    else: raise ValueError('Invalid resource mode')
+
+
+if __name__ == '__main__':
+    try: main()
+    except Exception as error:
+        print('Resource-only verification failed ('+type(error).__name__+'); private details withheld', flush=True)
+        raise SystemExit(1)

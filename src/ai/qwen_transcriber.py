@@ -1,6 +1,7 @@
 """Qwen-only CPU recognizer: bounded two-minute blocks, silence-aware VAD."""
 from __future__ import annotations
 import gc
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import re
@@ -9,11 +10,33 @@ import time
 
 from src.runtime import config
 from scripts.qwen_segmentation import plan_long_chunks, deduplicated_chunk_rows
-from scripts.qwen_quality import context_echo, low_information, bounded_retry
+from scripts.qwen_quality import context_echo, low_information, bounded_retry, generation_audit
 
 MODEL='Qwen/Qwen3-ASR-1.7B'
 REVISION='7278e1e70fe206f11671096ffdd38061171dd6e5'
 RATE=16000
+NORMAL_TOKENS=2048
+UNHINTED_TOKENS=256
+RESCUE_SECONDS=600
+MAX_BLOCK_ATTEMPTS=32
+
+
+class QwenTokenBudgetError(RuntimeError):
+    """No generated text is retained when the conservative budget guard trips."""
+    def __init__(self, phase, limit, tokens, generated_tokens=None):
+        super().__init__('Qwen chunk reached its token budget')
+        self.diagnostic = {'error_code': 'qwen_token_budget', 'generation_phase': phase,
+                           'token_limit': limit, 'observed_text_tokens': tokens,
+                           'budget_guard': 'generated_limit' if generated_tokens is not None else 'text_margin'}
+        if generated_tokens is not None:
+            self.diagnostic['generated_tokens'] = generated_tokens
+
+
+class IncompleteQwenRecognitionError(RuntimeError):
+    def __init__(self, missing):
+        super().__init__('Qwen recognition incomplete; missing audio intervals')
+        self.missing_intervals = missing
+
 
 
 class QwenTranscriber:
@@ -57,31 +80,56 @@ class QwenTranscriber:
         except RuntimeError: pass
         path=snapshot_download(MODEL,revision=REVISION,allow_patterns=['*.json','*.safetensors','*.txt'])
         self._model=Qwen3ASRModel.from_pretrained(path,dtype=torch.float32,device_map='cpu',
-            attn_implementation='eager',max_inference_batch_size=1,max_new_tokens=2048)
+            attn_implementation='eager',max_inference_batch_size=1,max_new_tokens=NORMAL_TOKENS)
 
     def release_model(self):
         self._model=None
         gc.collect()
 
-    def _recognize(self, samples):
+    def _recognize(self, samples, *, unhinted=False, deadline=None):
         import torch
         from transformers import StoppingCriteriaList
-        context=('术语：'+'、'.join(self._terms)) if self._terms else ''
-        with torch.inference_mode():
+        context=('术语：'+'、'.join(self._terms)) if self._terms and not unhinted else ''
+        evidence=[]
+        def capture(generations,phase,timed_out):
+            for item in generations:
+                record=dict(item,generation_phase=phase)
+                if timed_out: record['stop_reason']='deadline'
+                evidence.append(record)
+        def check(result, phase, limit, generations):
+            tokens=len(self._model.processor.tokenizer.encode(result.text,add_special_tokens=False))
+            capped=next((g for g in generations if g['generated_tokens']>=g['token_limit']),None)
+            if capped or tokens>=limit-8:
+                error=QwenTokenBudgetError(phase,capped['token_limit'] if capped else limit,tokens,
+                    capped['generated_tokens'] if capped else None)
+                error.diagnostic['generation_diagnostics']=list(evidence)
+                raise error
+        limit = (bounded_retry(self._model,StoppingCriteriaList,
+                    seconds=max(0,deadline-time.monotonic()),tokens=NORMAL_TOKENS,
+                    clock=time.monotonic) if deadline is not None else nullcontext({'timed_out':False}))
+        with limit as state, generation_audit(self._model,clock=time.monotonic) as generations, torch.inference_mode():
             result=self._model.transcribe(audio=(samples,RATE),context=context,language='Chinese')[0]
-        row={'text':result.text,'quality_state':'recognized'}
-        limit=2048
+        expired=state['timed_out'] or deadline is not None and time.monotonic() >= deadline
+        capture(generations,'unhinted' if unhinted else 'normal',expired)
+        if expired:
+            return {'text':'','quality_state':'retry_timeout','generation_diagnostics':evidence}
+        row={'text':result.text,'quality_state':'recognized','generation_diagnostics':evidence}
+        check(result,'unhinted' if unhinted else 'normal',NORMAL_TOKENS,generations)
         if context and context_echo(result.text,context):
-            with bounded_retry(self._model,StoppingCriteriaList) as state, torch.inference_mode():
+            if deadline is not None and time.monotonic() >= deadline:
+                return {'text':'','quality_state':'retry_timeout','generation_diagnostics':evidence}
+            with bounded_retry(self._model,StoppingCriteriaList,
+                    seconds=min(60,max(0,deadline-time.monotonic())) if deadline is not None else 60,
+                    clock=time.monotonic) as state, \
+                    generation_audit(self._model,clock=time.monotonic) as generations, torch.inference_mode():
                 result=self._model.transcribe(audio=(samples,RATE),context='',language='Chinese')[0]
-            row.update(text=result.text,quality_state='unhinted_retry')
-            limit=256
-            if state['timed_out']:
+            expired=state['timed_out'] or deadline is not None and time.monotonic() >= deadline
+            capture(generations,'unhinted_echo_retry',expired)
+            if expired:
                 row.update(text='',quality_state='retry_timeout')
-        tokens=len(self._model.processor.tokenizer.encode(result.text,add_special_tokens=False))
-        if tokens>=limit-8:
-            # Never persist a token-limit-cut lecture as an apparently complete one.
-            raise RuntimeError('Qwen chunk reached its token budget')
+            else:
+                check(result,'unhinted_echo_retry',UNHINTED_TOKENS,generations)
+                row.update(text=result.text,quality_state='unhinted_retry')
         if context and context_echo(row['text'],context):
             row.update(text='',quality_state='unresolved_context_echo')
         if low_information(row['text']):
@@ -89,6 +137,95 @@ class QwenTranscriber:
                 row['quality_state']='low_information'
             row['text']=''
         return row
+
+    def _recognize_resilient(self, samples, block, deadline):
+        """Bounded full retry -> 30s -> 15s -> one final 5–7.5s bisection.
+
+        A failed <=10s leaf is final. Every sample remains accounted for; a
+        cumulative block deadline and call cap limit even permanent failures.
+        """
+        attempts=[]
+        offset=round(block['start']*RATE)
+        began=time.monotonic()
+        # Preserve the existing per-rescue cap. These are new cumulative caps,
+        # not promises that a native forward pass can be forcibly interrupted.
+        block_seconds=min(2400,max(900,600+12*len(samples)/RATE))
+        block_deadline=min(deadline,began+block_seconds)
+        def stopped(issue):
+            return issue.get('error_code')=='worker_deadline' or issue.get('stop_reason') in ('block_deadline','attempt_limit')
+        def attempt(a,b,*,rescue=False,kind='original'):
+            start=block['start'] if a==0 else (offset+a)/RATE
+            end=block['end'] if b==len(samples) else (offset+b)/RATE
+            now=time.monotonic()
+            if now>=deadline:
+                return None, {'start':start,'end':end,'error_code':'worker_deadline'}
+            if now>=block_deadline or len(attempts)>=MAX_BLOCK_ATTEMPTS:
+                return None, {'start':start,'end':end,'error_code':'retry_timeout',
+                    'stop_reason':'block_deadline' if now>=block_deadline else 'attempt_limit'}
+            budget=min(RESCUE_SECONDS,60+8*(b-a)/RATE,block_deadline-now)
+            stats={'start':start,'end':end,'attempt_kind':kind,'audio_seconds':(b-a)/RATE,
+                   'budget_seconds':budget}
+            row=None
+            try:
+                if rescue:
+                    from transformers import StoppingCriteriaList
+                    with bounded_retry(self._model,StoppingCriteriaList,seconds=budget,
+                            tokens=NORMAL_TOKENS,clock=time.monotonic) as state:
+                        row=self._recognize(samples[a:b],unhinted=True)
+                    if state['timed_out']:
+                        row=dict(row,text='',quality_state='retry_timeout')
+                else:
+                    row=self._recognize(samples[a:b],deadline=now+budget)
+                ended=time.monotonic()
+                if ended>=deadline:
+                    issue={'error_code':'worker_deadline','stop_reason':'worker_deadline'}
+                elif ended>=block_deadline:
+                    issue={'error_code':'retry_timeout','stop_reason':'block_deadline'}
+                elif ended>=now+budget or row.get('quality_state')=='retry_timeout':
+                    issue={'error_code':'retry_timeout','stop_reason':'attempt_deadline'}
+                elif row.get('quality_state')=='unresolved_context_echo':
+                    issue={'error_code':'unresolved_context_echo','stop_reason':'context_echo'}
+                else: issue=None
+                generations=row.get('generation_diagnostics',[])
+            except QwenTokenBudgetError as error:
+                issue=dict(error.diagnostic,stop_reason='token_limit')
+                generations=issue.pop('generation_diagnostics',[])
+            stats['elapsed_seconds']=max(0,time.monotonic()-now)
+            stats['outcome']=issue['error_code'] if issue else 'success'
+            stats['stop_reason']=issue['stop_reason'] if issue else (
+                generations[-1]['stop_reason'] if generations else 'model_returned')
+            if generations: stats['generation_diagnostics']=generations
+            if issue: stats.update(issue)
+            attempts.append(stats)
+            if issue: return None,dict(stats)
+            return row,None
+        row,issue=attempt(0,len(samples))
+        if row is not None:
+            return dict(row,recognition_attempts=attempts)
+        if not stopped(issue):
+            row,issue=attempt(0,len(samples),rescue=True,kind='unhinted_full_retry')
+            if row is not None:
+                return dict(row,quality_state='bounded_retry',recognition_attempts=attempts)
+        parts=[];missing=[]
+        def recover(a,b,issue):
+            if stopped(issue) or b-a<=10*RATE:
+                missing.append(issue);return
+            if b-a<=15*RATE:
+                midpoint=a+(b-a)//2
+                intervals=[(a,midpoint,'split_short'),(midpoint,b,'split_short')]
+            else:
+                step=(15 if b-a<=30*RATE else 30)*RATE
+                intervals=[(c,min(b,c+step),'split_15s' if step==15*RATE else 'split_30s')
+                           for c in range(a,b,step)]
+            for c,d,kind in intervals:
+                row,issue=attempt(c,d,rescue=True,kind=kind)
+                if row is None:recover(c,d,issue)
+                else:parts.append({'start':block['start'] if c==0 else (offset+c)/RATE,
+                    'end':block['end'] if d==len(samples) else (offset+d)/RATE,'text':row['text']})
+        recover(0,len(samples),issue)
+        return {'text':'\n'.join(p['text'] for p in parts if p['text']),
+                'quality_state':'missing_audio' if missing else 'split_retry',
+                'missing_intervals':missing,'recognized_segments':parts,'recognition_attempts':attempts}
 
     def _drain_vad(self, vad, windows):
         while not vad.empty():
@@ -171,14 +308,14 @@ class QwenTranscriber:
                 raise TimeoutError('Qwen shard timeout')
             self._init()
             for i, block in enumerate(blocks):
-                if time.monotonic()-began>timeout:
+                if time.monotonic()-began>=timeout:
                     raise TimeoutError('Qwen shard timeout')
                 samples=load_samples(block)
                 expected=round(block['end']*RATE)-round(block['start']*RATE)
                 if len(samples)!=expected:
                     raise RuntimeError('Incomplete Qwen audio block')
                 started=time.monotonic()
-                row=self._recognize(samples)
+                row=self._recognize_resilient(samples,block,began+timeout)
                 row.update(start=block['start'],end=block['end'],
                            chunk_id=block['chunk_id'],decode_seconds=time.monotonic()-started)
                 self.last_chunks.append(row)
@@ -211,6 +348,10 @@ class QwenTranscriber:
                 count=round(block['end']*RATE)-round(block['start']*RATE)
                 return np.frombuffer(audio.read(count*4),dtype=np.float32).copy()
             self.recognize_blocks(blocks,load,timeout=max(0,timeout-(time.monotonic()-began)))
+        missing=[dict(gap,chunk_id=row['chunk_id']) for row in self.last_chunks
+                 for gap in row.get('missing_intervals',[])]
+        if missing:
+            raise IncompleteQwenRecognitionError(missing)
         rows=deduplicated_chunk_rows(self.last_chunks)
         segments=[{'start_ms':round(r['start']*1000),'end_ms':round(r['end']*1000),'text':r['text']}
                   for r in rows]

@@ -17,15 +17,18 @@ on download completion.  See ``AudioDownloader`` below.
 from __future__ import annotations
 
 import os
+import copy
 import subprocess
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from src.runtime import config
 from src.runtime.media_transport import SignedRangeRelay
+from src.runtime.audio_preparation import DecodeErrorScanner, record_decode_errors, startup_diagnostics
 from src.api import icourse
 
 
@@ -138,27 +141,19 @@ class AudioHandle:
     media_transport: Optional[SignedRangeRelay] = None
 
 
-def record_decode_errors(chunk: bytes, counts: dict[str, int]) -> None:
-    """Keep fixed error categories even when the private stderr tail rotates."""
-    text = chunk.lower()
-    patterns = {
-        'premature_eof': (b'stream ends prematurely', b'partial file'),
-        'input_read_error': (b'input/output error', b'error during demuxing',
-                             b'error opening input', b'connection timed out',
-                             b'connection reset by peer'),
-        'decode_error': (b'error while decoding', b'error decoding',
-                         b'corrupt input packet', b'packet corrupt'),
-    }
-    for code, needles in patterns.items():
-        if any(needle in text for needle in needles):
-            counts[code] = min(1_000_000, counts.get(code, 0)+1)
-
-
 class _PendingSpawn:
     """Per-schedule placeholder stored in ``_active`` while the background
     spawn is still working.  A unique instance per ``schedule()`` call lets
     the spawn thread detect that its entry was ``release()``-d (or replaced)
     in the meantime and abort instead of resurrecting a zombie entry."""
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.media_transport = None
+        self.file_token = uuid.uuid4().hex
+
+
+class _AudioSpawnCancelled(Exception):
+    pass
 
 
 class AudioDownloader:
@@ -184,6 +179,7 @@ class AudioDownloader:
         self._active: dict[str, "AudioHandle | _PendingSpawn"] = {}
         self._lock = threading.Lock()
         self._reporter = reporter
+        self._startup_failures = {}
         os.makedirs(self._dir, exist_ok=True)
 
     @property
@@ -206,6 +202,7 @@ class AudioDownloader:
         with self._lock:
             if sub_id in self._active:
                 return
+            self._startup_failures.pop(sub_id, None)
             self._active[sub_id] = pending
 
         threading.Thread(
@@ -221,27 +218,59 @@ class AudioDownloader:
             if self._active.get(sub_id) is pending:
                 self._active.pop(sub_id, None)
 
+    def _record_startup_failure(self, sub_id, pending, diagnostics):
+        with self._lock:
+            if self._active.get(sub_id) is not pending: return
+            self._startup_failures[sub_id] = diagnostics
+            while len(self._startup_failures) > 128:
+                self._startup_failures.pop(next(iter(self._startup_failures)))
+
+    def startup_failure(self, sub_id):
+        with self._lock:
+            return copy.deepcopy(self._startup_failures.get(str(sub_id), {}))
+
     def _spawn_when_ready(self, client, course_id: str, sub_id: str,
                           pending: _PendingSpawn, preserve_timestamps=False):
         transport = None
+        def check_pending():
+            with self._lock:
+                if pending.cancelled.is_set() or self._active.get(sub_id) is not pending:
+                    raise _AudioSpawnCancelled()
         try:
-            self._sem.acquire()
+            while not self._sem.acquire(timeout=.05):
+                check_pending()
             try:
+                phase = 'media_lookup'
+                check_pending()
                 url = client.get_video_url(course_id, sub_id)
+                check_pending()
                 if not url:
+                    from src.api.playback_diagnostics import attach_lookup
+                    self._record_startup_failure(sub_id, pending,
+                        attach_lookup(startup_diagnostics(phase), client, course_id, sub_id))
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
                 if preserve_timestamps:
-                    transport = SignedRangeRelay(client,url).start()
+                    phase = 'media_transport_start'
+                    transport = SignedRangeRelay(client,url,allow_session_refresh=True,
+                                                 cache_bytes=16*1024*1024)
+                    with self._lock:
+                        if self._active.get(sub_id) is not pending: raise _AudioSpawnCancelled()
+                        pending.media_transport = transport
+                    transport.start()
+                    check_pending()
                     vpn_url, headers = transport.url, ''
-                    # Three bounded upstream connect/read attempts can take
-                    # about 77s; allow them to finish before FFmpeg gives up.
-                    network_options = ['-rw_timeout','90000000']
+                    # Bounded range recovery, old-session probes and one 75s
+                    # fresh authentication fit within the 180s network window.
+                    # The existing 5-minute PCM-stall gate still applies.
+                    network_options = ['-rw_timeout','180000000']
                 else:
                     vpn_url, headers = client.get_stream_params(url)
+                    check_pending()
                     network_options = ['-reconnect','1','-reconnect_streamed','1','-reconnect_delay_max','5']
-                path = os.path.join(self._dir, f"{sub_id}.raw")
+                # A cancelled generation's cleanup cannot delete a replacement.
+                path = os.path.join(self._dir, f"{pending.file_token}.raw")
                 if os.path.exists(path):
                     os.remove(path)
 
@@ -260,6 +289,8 @@ class AudioDownloader:
                     "-f", "f32le",
                     path,
                 ]
+                phase = 'decoder_spawn'
+                check_pending()
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -269,12 +300,13 @@ class AudioDownloader:
                 # for diagnostics if ffmpeg dies.
                 stderr_chunks: list[bytes] = []
                 decode_error_counts: dict[str, int] = {}
+                error_scanner = DecodeErrorScanner(decode_error_counts)
                 stderr_done = threading.Event()
 
                 def _drain():
                     try:
                         for chunk in proc.stderr:
-                            record_decode_errors(chunk, decode_error_counts)
+                            error_scanner.feed(chunk)
                             stderr_chunks.append(chunk)
                             if len(stderr_chunks) > 2048:
                                 # Preserve the input header (Duration) and a
@@ -328,9 +360,6 @@ class AudioDownloader:
                             pass
                     return
 
-                if self._reporter:
-                    self._reporter.audio_prefetch_start(sub_id)
-
                 # Background monitor: release the semaphore slot when
                 # ffmpeg exits.  We do NOT pop from _active here — that's
                 # the caller's job (via release()).
@@ -338,13 +367,21 @@ class AudioDownloader:
                     target=self._monitor, args=(handle,),
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
-            except Exception:
-                if transport is not None: transport.close()
+                if self._reporter:
+                    try: self._reporter.audio_prefetch_start(sub_id)
+                    except Exception: pass  # Display must not orphan a decoder.
+            except Exception as error:
+                from src.api.playback_diagnostics import attach_lookup
+                self._record_startup_failure(sub_id, pending,
+                    attach_lookup(startup_diagnostics(phase, error, transport), client, course_id, sub_id))
+                if transport is not None:
+                    try: transport.close()
+                    except Exception: pass  # Preserve the original spawn error.
                 self._pop_if_mine(sub_id, pending)
                 self._sem.release()
                 raise
         except Exception as e:
-            if self._reporter:
+            if self._reporter and not isinstance(e, _AudioSpawnCancelled) and not pending.cancelled.is_set():
                 self._reporter.audio_prefetch_failed(sub_id, e)
 
     def _monitor(self, handle: AudioHandle):
@@ -389,7 +426,12 @@ class AudioDownloader:
         """
         sub_id = str(sub_id)
         with self._lock:
+            self._startup_failures.pop(sub_id, None)
             handle = self._active.pop(sub_id, None)
+            if isinstance(handle, _PendingSpawn): handle.cancelled.set()
+        if isinstance(handle, _PendingSpawn):
+            if handle.media_transport is not None: handle.media_transport.close()
+            return
         if not isinstance(handle, AudioHandle):
             return
         proc = handle.process
@@ -414,6 +456,7 @@ class AudioDownloader:
             sub_ids = list(self._active.keys())
         for sub_id in sub_ids:
             self.release(sub_id)
+        with self._lock: self._startup_failures.clear()
 
 
 # ── Scheduler — single façade ──────────────────────────────────────────────

@@ -1,0 +1,137 @@
+name: iCourse Resource Acquisition Validation
+'on':
+  push:
+    branches: [codex/global-runner-pool]
+    paths: [.github/workflows/qwen_production_resources.yml]
+  workflow_dispatch:
+    inputs:
+      recipient_public_key:
+        description: Ephemeral recipient public key for private selection and diagnostics
+        required: true
+        type: string
+      selection_source_run_id:
+        description: Reuse the frozen four-course selection from an ended resource run
+        default: ''
+        type: string
+      resource_slots:
+        description: Frozen slots to fetch (0 to 3, comma separated; blank means all)
+        default: ''
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ${{ github.event_name == 'push' && format('icourse-resource-registration-{0}', github.run_id)
+    || format('icourse-data-{0}', github.repository) }}
+  cancel-in-progress: false
+  queue: max
+env:
+  GH_TOKEN: ${{ github.token }}
+  DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+  QWEN_PRODUCTION_TASK: 'true'
+  RESOURCE_SELECTION_SOURCE_RUN_ID: ${{ inputs.selection_source_run_id }}
+  RESOURCE_SLOTS: ${{ inputs.resource_slots }}
+  RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+  StuId: ${{ secrets.STUID }}
+  UISPsw: ${{ secrets.UISPSW }}
+jobs:
+  register:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ''
+      DB_ENCRYPTION_KEY: ''
+      StuId: ''
+      UISPsw: ''
+    steps:
+    - run: echo 'Resource-only entry registered; no acquisition on push'
+  plan:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
+    outputs:
+      tasks: ${{ steps.plan.outputs.tasks }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - id: plan
+      run: python -m scripts.production_resource_fetch plan
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-selection
+        path: ${{ runner.temp }}/qwen-shards/out/selection.enc
+        retention-days: 7
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-selection-private-export
+        path: ${{ runner.temp }}/qwen-shards/out/selection-export.enc
+        retention-days: 7
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-selection-audit
+        path: ${{ runner.temp }}/qwen-shards/out/selection-audit.json
+        retention-days: 7
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-authentication-audit
+        path: ${{ runner.temp }}/qwen-shards/out/authentication-audit.json
+        retention-days: 7
+        if-no-files-found: ignore
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  fetch:
+    needs: plan
+    if: ${{ needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.tasks) }}
+    env:
+      COURSE_SLOT: ${{ matrix.task_slot }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: ./.github/actions/qwen-pilot-runtime
+    - name: Fetch original selected audio; no recognition or publishing
+      run: python -m scripts.production_resource_fetch fetch
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-result-${{ matrix.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/resource-result.enc
+        retention-days: 7
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-audit-${{ matrix.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/resource-audit.json
+        retention-days: 7
+        if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: icourse-resource-audio-${{ matrix.task_slot }}
+        path: ${{ runner.temp }}/qwen-shards/out/resource-audio*.enc
+        retention-days: 7
+        compression-level: 0
+        if-no-files-found: ignore
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}

@@ -158,7 +158,7 @@ class SharedQueueTests(unittest.TestCase):
             self.assertEqual(len(blocks), 1); self.assertEqual(len(load(blocks[0])), 960000)
             checkpoint([decoded(blocks[0])])
         model.recognize_blocks.side_effect = recognize
-        with patch('scripts.shared_asr_worker.shards.seal') as seal, patch('scripts.shared_asr_worker.shards.root', return_value=Path('/unused')):
+        with tempfile.TemporaryDirectory() as tmp, patch('scripts.shared_asr_worker.shards.seal') as seal, patch('scripts.shared_asr_worker.shards.root', return_value=Path(tmp)):
             report = run_worker(plan, files, store, 0, 2, transcriber=model)
             model.recognize_blocks.assert_called_once(); self.assertEqual(seal.call_count, 3)
             self.assertEqual(report['decoded_chunk_ids'], [1])
@@ -179,7 +179,7 @@ class SharedQueueTests(unittest.TestCase):
                 saved.append(json.loads(files['local.json']))
         model = MagicMock()
         model.recognize_blocks.side_effect = lambda blocks, load, checkpoint, **kw: checkpoint([decoded(blocks[0])])
-        with patch('scripts.shared_asr_worker.shards.seal', side_effect=seal), patch('scripts.shared_asr_worker.shards.root', return_value=Path('/unused')):
+        with tempfile.TemporaryDirectory() as tmp, patch('scripts.shared_asr_worker.shards.seal', side_effect=seal), patch('scripts.shared_asr_worker.shards.root', return_value=Path(tmp)):
             with patch.object(SharedQueue, 'finish', side_effect=ConnectionError('transport failed')):
                 with self.assertRaises(ConnectionError):
                     run_worker(plan, {'chunk-0.flac': blob}, store, 0, 1, transcriber=model)
@@ -214,7 +214,7 @@ class SharedQueueTests(unittest.TestCase):
         from src.ai.qwen_transcriber import QwenTranscriber
         qwen = QwenTranscriber.__new__(QwenTranscriber)
         qwen.last_vad_windows = []; qwen._init = MagicMock()
-        qwen._recognize = MagicMock(side_effect=lambda samples: {'text': '矩阵'})
+        qwen._recognize = MagicMock(side_effect=lambda samples, **kwargs: {'text': '矩阵'})
         qwen.release_model = MagicMock()
         block = {'chunk_id': 0, 'start': 0, 'end': 1}
         for _ in range(2):
@@ -308,9 +308,9 @@ class SharedQueueTests(unittest.TestCase):
         child = yaml.safe_load((ROOT/'.github/workflows/qwen_production_lecture.yml').read_text())
         scheduled = yaml.safe_load((ROOT/'.github/workflows/check.yml').read_text())
         self.assertIn('shared', caller['on']['workflow_dispatch']['inputs']['shard_mode']['options'])
-        self.assertEqual(caller['on']['workflow_dispatch']['inputs']['shard_mode']['default'], '2')
+        self.assertEqual(caller['on']['workflow_dispatch']['inputs']['shard_mode']['default'], 'shared')
         self.assertFalse(caller['on']['workflow_dispatch']['inputs']['automatic_terms']['default'])
-        self.assertEqual(scheduled['jobs']['check']['with']['shard_mode'], '2')
+        self.assertEqual(scheduled['jobs']['check']['with']['shard_mode'], 'shared')
         self.assertFalse(scheduled['jobs']['check']['with']['automatic_terms'])
         self.assertEqual(child['jobs']['gather']['needs'], ['prepare', 'asr'])
         self.assertEqual(caller['jobs']['lecture']['strategy']['max-parallel']*child['jobs']['asr']['strategy']['max-parallel'], 15)

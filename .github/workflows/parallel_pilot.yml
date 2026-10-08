@@ -8,13 +8,17 @@ name: iCourse Parallel Pilot
   workflow_dispatch:
     inputs:
       validation_course_id:
-        description: Validate one playable lecture from this course (requires no publication or email)
+        description: Validate latest playable lecture per course, comma-separated IDs (max 5; no publication/email)
         type: string
         default: ''
       validation_lecture_rank:
         description: Reverse rank among actual playable recordings (1 latest, 2 penultimate)
         type: number
         default: 1
+      validation_lecture_ranks:
+        description: Optional ranks for one isolated course, e.g. 1,2 (max 5; keep single rank at 1)
+        type: string
+        default: ''
       validation_before_date:
         description: Select only recordings strictly before this date (YYYY-MM-DD)
         type: string
@@ -23,18 +27,22 @@ name: iCourse Parallel Pilot
         description: Explicitly reacquire the exact failed preparation selection and frozen glossary from this completed run
         type: string
         default: ''
+      validation_selection_run_id:
+        description: Explicit fresh pre-ASR trial with the exact frozen selections of an ended pool run
+        type: string
+        default: ''
       automatic_terms:
         description: Enable evidence-bounded automatic glossary
         type: boolean
         default: false
       shard_mode:
-        description: Fixed two/auto shards, or shared dynamic block queue (1-3 workers by pending audio)
+        description: Fixed two/auto shards, or shared global Runner pool (up to six workers per lecture)
         type: choice
         options:
         - '2'
         - auto
         - shared
-        default: '2'
+        default: shared
       publish_results:
         description: Publish encrypted lecture results to the data branch
         type: boolean
@@ -51,10 +59,16 @@ name: iCourse Parallel Pilot
       validation_lecture_rank:
         type: number
         default: 1
+      validation_lecture_ranks:
+        type: string
+        default: ''
       validation_before_date:
         type: string
         default: ''
       validation_source_run_id:
+        type: string
+        default: ''
+      validation_selection_run_id:
         type: string
         default: ''
       automatic_terms:
@@ -62,7 +76,7 @@ name: iCourse Parallel Pilot
         default: false
       shard_mode:
         type: string
-        default: '2'
+        default: shared
       publish_results:
         type: boolean
         default: false
@@ -119,6 +133,7 @@ concurrency:
     || inputs.caller_holds_lock && format('icourse-subrun-{0}', github.run_id)
     || format('icourse-data-{0}', github.repository) }}
   cancel-in-progress: false
+  queue: max
 jobs:
   register:
     if: ${{ github.event_name == 'push' }}
@@ -132,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
       actions: read
     env:
       DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
@@ -152,11 +167,14 @@ jobs:
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
       VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
+      VALIDATION_LECTURE_RANKS: ${{ inputs.validation_lecture_ranks }}
       VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
       VALIDATION_SOURCE_RUN_ID: ${{ inputs.validation_source_run_id }}
+      VALIDATION_SELECTION_RUN_ID: ${{ inputs.validation_selection_run_id }}
       AUTO_COURSE_TERMS: ${{ inputs.automatic_terms }}
       PUBLISH_RESULTS: ${{ inputs.publish_results }}
       SEND_EMAIL: ${{ inputs.send_email }}
+      SHARD_MODE: ${{ inputs.shard_mode }}
     outputs:
       tasks: ${{ steps.plan.outputs.tasks }}
       count: ${{ steps.plan.outputs.count }}
@@ -181,7 +199,9 @@ jobs:
       if: ${{ always() }}
       with:
         name: qwen-production-plan-audit
-        path: ${{ runner.temp }}/qwen-shards/out/plan-audit.json
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/plan-audit.json
+          ${{ runner.temp }}/qwen-shards/out/pipeline-failure.json
         retention-days: 7
         overwrite: true
         if-no-files-found: ignore
@@ -193,12 +213,20 @@ jobs:
         retention-days: 7
         overwrite: true
         if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-pool-audit
+        path: ${{ runner.temp }}/qwen-shards/out/pool-audit.json
+        retention-days: 7
+        overwrite: true
+        if-no-files-found: ignore
     - name: clean
       run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   lecture:
     needs: plan
-    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' && inputs.shard_mode != 'shared' }}
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -227,7 +255,9 @@ jobs:
     needs:
     - plan
     - lecture
-    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
+    - pool
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success'
+      && (inputs.shard_mode != 'shared' || needs.plan.outputs.count == '0' || needs.pool.outputs.all_ended == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -251,6 +281,7 @@ jobs:
       SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
       RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
       RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+      POOL_ARTIFACTS: ${{ inputs.shard_mode == 'shared' && needs.plan.outputs.count != '0' && 'true' || 'false' }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -280,6 +311,58 @@ jobs:
         compression-level: 0
         overwrite: true
         if-no-files-found: ignore
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-pool-failures
+        path: ${{ runner.temp }}/qwen-shards/out/pool-failures.enc
+        retention-days: 7
+        compression-level: 0
+        overwrite: true
+        if-no-files-found: ignore
     - name: clean
       run: python -m scripts.production_qwen clean
       if: ${{ always() }}
+  pool:
+    name: 课堂并发进度（获取 → 识别 → 汇总）
+    concurrency:
+      group: icourse-runner-controller-${{ github.repository }}
+      cancel-in-progress: false
+    needs: plan
+    if: ${{ needs.plan.result == 'success' && needs.plan.outputs.count != '0' && inputs.shard_mode == 'shared' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      all_ended: ${{ steps.controller.outputs.all_ended }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      POOL_ARTIFACTS: 'true'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome requests
+    - name: 实时课堂进度（展开查看块数与 Worker 链接）
+      id: controller
+      run: python -m scripts.production_pool
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: qwen-production-pool-audit
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/pool-audit.json
+          ${{ runner.temp }}/qwen-shards/out/pool-progress.json
+        retention-days: 7
+        overwrite: true
+        if-no-files-found: ignore
+    - name: clean
+      if: ${{ always() }}
+      run: python -m scripts.production_qwen clean

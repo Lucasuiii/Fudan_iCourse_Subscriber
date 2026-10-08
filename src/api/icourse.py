@@ -5,11 +5,14 @@ Provides access to course details, lecture lists, video URLs,
 and video downloads through WebVPN.
 """
 
+import copy
+import threading
 import hashlib
 import os
 import re
 import time
 import uuid
+import requests
 from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 from src.runtime import config
@@ -55,10 +58,25 @@ def fetch_ppt_image(client: "ICourseClient", item: dict,
 class ICourseClient:
     """Client for the iCourse API, operating through WebVPN."""
 
-    def __init__(self, vpn_session: WebVPNSession):
+    def __init__(self, vpn_session: WebVPNSession, *, media_reauth_factory=None):
         self.vpn = vpn_session
         self.base_url = config.ICOURSE_BASE
         self._userinfo = None
+        self._media_reauth_factory = media_reauth_factory
+        self._media_owned_session = None
+        self.media_auth_audit = {}
+        self._video_lookup_audits = {}
+        self._video_lookup_lock = threading.Lock()
+
+    def video_lookup_diagnostics(self, course_id, sub_id):
+        with self._video_lookup_lock:
+            return copy.deepcopy(self._video_lookup_audits.get((str(course_id), str(sub_id)), {}))
+
+    def _record_video_lookup(self, course_id, sub_id, audit):
+        with self._video_lookup_lock:
+            self._video_lookup_audits[(str(course_id), str(sub_id))] = copy.deepcopy(audit)
+            while len(self._video_lookup_audits) > 128:
+                self._video_lookup_audits.pop(next(iter(self._video_lookup_audits)))
 
     def get_userinfo(self) -> dict:
         """Get current user info (id, tenant_id, phone, account).
@@ -88,6 +106,145 @@ class ICourseClient:
             return resp.status_code == 200 and resp.json().get("code") in (0, 200)
         except Exception:
             return False
+
+    def fork_for_media(self):
+        # Authentication recovery belongs to this download, not concurrent PPT
+        # requests or another lecture sharing the original client.
+        value = copy.copy(self)
+        value._userinfo = dict(self.get_userinfo())
+        value._media_owned_session = None
+        value.media_auth_audit = {}
+        return value
+
+    def close_media_session(self):
+        if self._media_owned_session is not None:
+            self._media_owned_session.close()
+            self._media_owned_session = None
+
+    def _verified_media_user(self, vpn, *, audit=None):
+        audit = self.media_auth_audit if audit is None else audit
+        response = vpn.get(f'{self.base_url}/userapi/v1/infosimple',
+                           allow_redirects=False, timeout=10)
+        try:
+            audit['api_status'] = response.status_code
+            if response.status_code != 200: return None
+            payload = response.json()
+            if payload.get('code') not in (0, 200): return None
+            user = payload.get('params') or payload.get('data')
+            if not isinstance(user, dict) or not user.get('id'): return None
+            for key in ('id', 'tenant_id'):
+                if (self._userinfo and self._userinfo.get(key) is not None
+                        and str(self._userinfo[key]) != str(user.get(key))):
+                    audit['failure'] = 'identity_mismatch'
+                    return None
+            return user
+        finally:
+            response.close()
+
+    def refresh_media_session(self) -> bool:
+        """Probe existing SSO only. Password recovery is separately opt-in."""
+        self.media_auth_audit = {'stage': 'existing_session'}
+        try:
+            portal = config.ICOURSE_BASE if getattr(self.vpn, 'access_mode', None) == 'direct' else config.WEBVPN_BASE
+            response = self.vpn.session.get(portal+'/', allow_redirects=False, timeout=5)
+            try:
+                self.media_auth_audit['portal_status'] = response.status_code
+                if response.status_code != 200:
+                    self.media_auth_audit['failure'] = 'portal_unavailable'
+                    return False
+            finally:
+                response.close()
+            user = self._verified_media_user(self.vpn)
+            if user is None:
+                self.media_auth_audit.setdefault('failure', 'api_verification_failed')
+                return False
+            self._userinfo = user
+            return True
+        except requests.exceptions.SSLError:
+            self.media_auth_audit['failure'] = 'auth_tls_error'
+            return False
+        except Exception:
+            self.media_auth_audit['failure'] = 'existing_session_exception'
+            return False
+
+    def reauthenticate_media_session(self, stopped, *, timeout=75):
+        """Bounded fresh login; rejected/late sessions are never adopted."""
+        if (self._media_reauth_factory is None or stopped.is_set()
+                or self.media_auth_audit.get('failure') in ('identity_mismatch', 'auth_tls_error')):
+            return False
+        cancelled = threading.Event()
+        deadline = time.monotonic()+timeout
+        ready = threading.Event()
+        lock = threading.Lock()
+        result = {}
+        previous_failure = self.media_auth_audit.pop('failure', None)
+        if previous_failure: self.media_auth_audit['existing_failure'] = previous_failure
+        self.media_auth_audit.update(stage='fresh_session', reauth_attempts=1,
+                                     reauth_successes=0)
+        def authenticate():
+            candidate = None
+            phase = 'fresh_session_factory'
+            audit = {}
+            try:
+                candidate = self._media_reauth_factory(cancelled, deadline)
+                if cancelled.is_set() or stopped.is_set() or time.monotonic() >= deadline: return
+                phase = 'media_identity_verification'
+                for key, attribute in (('probe_attempts','auth_probe_attempts'),
+                                       ('probe_transient_failures','auth_probe_transient_failures')):
+                    value = getattr(candidate,attribute,None)
+                    if type(value) is int and 0 <= value <= 3: audit[key] = value
+                user = self._verified_media_user(candidate, audit=audit)
+                if user is None:
+                    audit.setdefault('failure','api_verification_failed')
+                    audit['failure_phase'] = phase
+                if user is None: return
+                with lock:
+                    if not cancelled.is_set() and not stopped.is_set() and time.monotonic() < deadline:
+                        result.update(vpn=candidate, user=user)
+                        candidate = None
+            except Exception as error:
+                from src.api.webvpn import authentication_failure
+                audit.update(authentication_failure(error, phase))
+            finally:
+                if candidate is not None: candidate.session.close()
+                with lock:
+                    # An abandoned auth worker cannot mutate the public audit
+                    # after the caller has published timeout/cancellation.
+                    if not cancelled.is_set() and not stopped.is_set() and time.monotonic() < deadline:
+                        result['audit'] = audit
+                ready.set()
+        threading.Thread(target=authenticate, daemon=True).start()
+        while not ready.wait(.05):
+            if stopped.is_set() or time.monotonic() >= deadline: break
+        with lock:
+            cancelled.set()
+            self.media_auth_audit.update(result.get('audit',{}))
+            candidate = result.get('vpn')
+            if candidate is None or stopped.is_set() or time.monotonic() >= deadline:
+                if candidate is not None: candidate.session.close()
+                self.media_auth_audit.setdefault('failure',
+                    'media_auth_cancelled' if stopped.is_set() else
+                    'media_auth_deadline' if time.monotonic() >= deadline else 'fresh_session_unavailable')
+                self.media_auth_audit.setdefault('failure_phase','fresh_session_factory')
+                return False
+            # Session stays usable after recovery; keep its cancellation separate
+            # from the finished auth wait and retain a lifetime request deadline.
+            if hasattr(candidate.session, 'cancelled'):
+                candidate.session.cancelled = stopped
+                candidate.session.deadline = float('inf')
+            self.vpn = candidate
+            self._userinfo = result['user']
+            self._media_owned_session = candidate.session
+            self.media_auth_audit.pop('failure', None)
+            self.media_auth_audit.update(stage='verified', reauth_successes=1)
+            return True
+
+    def trusted_media_login_urls(self) -> tuple[str, ...]:
+        """Exact WebVPN SSO routes; no request or credential access here."""
+        from src.runtime.media_protocol import LOGIN_PATHS
+        route = (lambda url: url) if getattr(self.vpn, 'access_mode', None) == 'direct' else get_vpn_url
+        return tuple(route(config.IDP_BASE + path) for path in LOGIN_PATHS
+                     if not path.startswith('/wengine-vpn/'))
 
     def sign_video_url(
         self, video_url: str, now: int | None = None
@@ -439,9 +596,11 @@ class ICourseClient:
         data = resp.json()
 
         if data.get("code") != 0:
-            raise RuntimeError(
+            error = RuntimeError(
                 f"API error for sub {sub_id}: {data.get('msg')}"
             )
+            error.playback_api_code = data.get('code')
+            raise error
 
         return data.get("data", {})
 
@@ -469,9 +628,11 @@ class ICourseClient:
         payload = data.get("data") or {}
 
         if data.get("code") != 0 and not payload:
-            raise RuntimeError(
+            error = RuntimeError(
                 f"API error for sub-info {sub_id}: {data.get('msg')}"
             )
+            error.playback_api_code = data.get('code')
+            raise error
 
         return payload
 
@@ -492,12 +653,18 @@ class ICourseClient:
 
         Returns the signed video URL string, or None if no source yields one.
         """
+        from src.api.playback_diagnostics import lookup_error
+        audit = {'sources': [], 'url_found': False}
+        self._record_video_lookup(course_id, sub_id, audit)
         try:
             info = self.get_sub_info(course_id, sub_id)
+            audit['sources'].append({'source': 'sub_info', 'result': 'payload'})
         except Exception as e:
+            audit['sources'].append({'source': 'sub_info', **lookup_error(e)})
             print(f"    Sub-info unavailable ({type(e).__name__}); "
                   "falling back to sub-detail")
             info = {}
+        self._record_video_lookup(course_id, sub_id, audit)
 
         # Get server timestamp for signing
         now = info.get("now")
@@ -544,18 +711,26 @@ class ICourseClient:
         if not base_url:
             try:
                 detail = self.get_sub_detail(course_id, sub_id)
+                audit['sources'].append({'source': 'sub_detail', 'result': 'payload'})
                 content = detail.get("content", {})
                 playback = content.get("playback", {})
                 if playback and playback.get("url"):
                     base_url = playback["url"]
-            except Exception:
-                pass
+            except Exception as error:
+                audit['sources'].append({'source': 'sub_detail', **lookup_error(error)})
 
+        audit['url_found'] = bool(base_url)
+        self._record_video_lookup(course_id, sub_id, audit)
         if not base_url:
             print("    No video URL found (tried all configured sources)")
             return None
 
-        return self.sign_video_url(base_url, now=now)
+        try:
+            return self.sign_video_url(base_url, now=now)
+        except Exception as error:
+            audit['sources'].append({'source': 'signing', **lookup_error(error)})
+            self._record_video_lookup(course_id, sub_id, audit)
+            raise
 
     def get_stream_params(self, video_url: str) -> tuple[str, str]:
         """Get WebVPN URL and HTTP headers for direct streaming (e.g., ffmpeg).
@@ -563,10 +738,11 @@ class ICourseClient:
         Returns:
             (vpn_url, http_headers) where http_headers is ffmpeg-compatible.
         """
-        vpn_url = get_vpn_url(video_url)
-        cookies = "; ".join(
-            f"{c.name}={c.value}" for c in self.vpn.session.cookies
-        )
+        vpn_url = video_url if getattr(self.vpn, 'access_mode', None) == 'direct' else get_vpn_url(video_url)
+        if getattr(self.vpn, 'access_mode', None) == 'direct':
+            cookies = self.vpn.session.prepare_request(requests.Request('GET', video_url)).headers.get('Cookie', '')
+        else:
+            cookies = "; ".join(f"{c.name}={c.value}" for c in self.vpn.session.cookies)
         headers = f"Cookie: {cookies}\r\nUser-Agent: {config.USER_AGENT}\r\n"
         return vpn_url, headers
 

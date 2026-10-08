@@ -425,7 +425,9 @@ def worker():
             transcriber = QwenTranscriber()
             transcriber.set_terms(manifest['recognition_terms'])
             transcriber.recognize_blocks(remaining, load, checkpoint=checkpoint)
-        report['complete'] = True
+        from scripts.qwen_sharding import incomplete_row
+        report['complete'] = not any(incomplete_row(r) for r in report['chunks'])
+        # A static worker also drains all blocks before reporting incompleteness.
         validate_result(manifest, report, shard_id, require_complete=True)
     except Exception as error:
         report['error_type'] = type(error).__name__

@@ -67,11 +67,14 @@ jobs:
     uses: ./.github/workflows/parallel_pilot.yml
     with:
       automatic_terms: false
-      shard_mode: '2'
+      shard_mode: shared
       publish_results: true
       send_email: true
       caller_holds_lock: true
     secrets: inherit
+    permissions:
+      contents: write
+      actions: write
 'on':
   schedule:
   - cron: 7 9 * * *
@@ -80,3 +83,4 @@ jobs:
 concurrency:
   group: icourse-data-${{ github.repository }}
   cancel-in-progress: false
+  queue: max

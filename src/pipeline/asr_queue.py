@@ -6,7 +6,7 @@ may reclaim old unfinished claims only after the prior attempt has ended.
 import copy
 import math
 import uuid
-from scripts.qwen_sharding import fingerprint, validate_plan, validate_result
+from scripts.qwen_sharding import fingerprint, validate_plan, validate_result, validate_block_row, incomplete_row
 
 
 def initial_queue(plan, completed=()):
@@ -17,7 +17,7 @@ def initial_queue(plan, completed=()):
         for row in result['chunks']:
             if str(row['chunk_id']) in rows:
                 raise ValueError('Duplicate seeded queue block')
-            rows[str(row['chunk_id'])] = {'status': 'complete', 'result': row}
+            rows[str(row['chunk_id'])] = {'status': 'failed' if incomplete_row(row) else 'complete', 'result': row}
     state = {'schema': 1, 'plan_hash': fingerprint(plan), 'revision': 0,
              'blocks': {str(b['chunk_id']): rows.get(str(b['chunk_id']), {'status': 'pending'})
                         for b in plan['blocks']}}
@@ -36,8 +36,11 @@ def validate_queue(plan, state):
         record = state['blocks'][str(block['chunk_id'])]
         if not isinstance(record, dict):
             raise ValueError('Invalid queue block')
-        if record.get('status') == 'complete':
+        if record.get('status') in ('complete','failed'):
             row = record.get('result', {})
+            validate_block_row(block,row)
+            if (record['status'] == 'failed') != incomplete_row(row):
+                raise ValueError('Queue status disagrees with recognition completeness')
             if (not isinstance(row, dict) or row.get('chunk_id') != block['chunk_id'] or type(row.get('chunk_id')) is not int
                     or row.get('start') != block['start'] or row.get('end') != block['end']
                     or not isinstance(row.get('text'), str)
@@ -93,13 +96,13 @@ class SharedQueue:
     def finish(self, block_id, token, row):
         def mutate(state):
             record = state['blocks'][str(block_id)]
-            if record['status'] == 'complete':
+            if record['status'] in ('complete','failed'):
                 if record['result'] == row:
                     return None, False  # Lost successful CAS response; exact idempotence.
                 raise ValueError('Completed result cannot be overwritten')
             if record['status'] != 'claimed' or record['token'] != token:
                 raise ValueError('Stale worker claim cannot publish a result')
-            state['blocks'][str(block_id)] = {'status': 'complete', 'result': row}
+            state['blocks'][str(block_id)] = {'status': 'failed' if incomplete_row(row) else 'complete', 'result': row}
             return None, True
         self.change(mutate)
 
@@ -123,13 +126,13 @@ class SharedQueue:
                     raise ValueError('Invalid dynamic local checkpoint')
                 seen.add(n)
                 record = state['blocks'][str(n)]
-                if record['status'] == 'complete':
+                if record['status'] in ('complete','failed'):
                     if record['result'] != row:
                         raise ValueError('Local result conflicts with committed result')
                 elif record['status'] == 'claimed' and record['attempt'] >= attempt:
                     raise ValueError('Local checkpoint cannot override an active claim')
                 else:
-                    state['blocks'][str(n)] = {'status': 'complete', 'result': row}
+                    state['blocks'][str(n)] = {'status': 'failed' if incomplete_row(row) else 'complete', 'result': row}
                     changed = True
             return None, changed
         self.change(mutate)
@@ -146,9 +149,9 @@ class SharedQueue:
         # those audit groups do not restrict which worker may claim each block.
         for shard in self.plan['shards']:
             rows = [state['blocks'][str(i)]['result'] for i in shard['chunk_ids']
-                    if state['blocks'][str(i)]['status'] == 'complete']
+                    if state['blocks'][str(i)]['status'] in ('complete','failed')]
             report = {'plan_hash': fingerprint(self.plan), 'shard_id': shard['shard_id'],
-                      'complete': len(rows) == len(shard['chunk_ids']), 'chunks': rows,
+                      'complete': len(rows) == len(shard['chunk_ids']) and not any(incomplete_row(r) for r in rows), 'chunks': rows,
                       'seconds': sum(r.get('decode_seconds', 0) for r in rows), 'attempts': [],
                       'execution': 'shared_queue', 'queue_revision': state['revision']}
             validate_result(self.plan, report, shard['shard_id'], require_complete=require_complete)

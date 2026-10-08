@@ -11,6 +11,8 @@ import re
 import subprocess
 import tempfile
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from scripts.coordination_transport import CoordinationError, RETRYABLE, read_with_retry, transport_code
+import time
 
 MAX_STATE = 2 * 1024 * 1024
 
@@ -43,7 +45,8 @@ class GitHubQueueStore:
         self.temp.cleanup()
 
     def head(self):
-        rows = self.command(['git', 'ls-remote', '--heads', self.remote, self.ref]).decode().splitlines()
+        rows = read_with_retry('git_ls_remote', lambda: self.command(
+            ['git', 'ls-remote', '--heads', self.remote, self.ref])).decode().splitlines()
         if not rows:
             return None  # Confirmed absence only; transport errors raise.
         if len(rows) != 1 or rows[0].split()[1] != self.ref:
@@ -66,7 +69,7 @@ class GitHubQueueStore:
         head = self.head()
         if head is None:
             return None, None
-        self.command(['git', 'fetch', '-q', '--depth=1', self.remote, head])
+        read_with_retry('git_fetch', lambda: self.command(['git', 'fetch', '-q', '--depth=1', self.remote, head]))
         paths = self.command(['git', 'ls-tree', '-r', '--name-only', head]).decode().splitlines()
         if paths != ['queue.enc']:
             raise ValueError('Unexpected queue tree')
@@ -81,13 +84,19 @@ class GitHubQueueStore:
         if previous:
             args += ['-p', previous]
         commit = self.command(args, b'Encrypted ASR queue checkpoint\n').decode().strip()
-        try:
-            self.command(['git', 'push', '-q', self.remote, commit+':'+self.ref])
-        except subprocess.CalledProcessError:
-            current = self.head()
-            if current == commit:
-                return True  # Remote succeeded but response was lost.
-            if current != previous:
-                return False  # Confirmed competing update only.
-            raise
-        return True
+        for attempt in range(1, 4):
+            try:
+                self.command(['git', 'push', '-q', self.remote, commit+':'+self.ref])
+                return True
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                # Reconcile even a timeout before replaying this exact commit.
+                # If the read fails too, the write outcome remains unknown.
+                current = self.head()
+                if current == commit:
+                    return True
+                if current != previous:
+                    return False
+                code = transport_code(error)
+                if code not in RETRYABLE or attempt == 3:
+                    raise CoordinationError('git_push', code, attempt) from error
+                time.sleep(2 * attempt)

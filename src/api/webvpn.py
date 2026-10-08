@@ -9,7 +9,7 @@ Handles:
 import html as html_mod
 import re
 from binascii import hexlify, unhexlify
-from urllib.parse import urlparse, urlencode, quote, urljoin
+from urllib.parse import urlparse, urlencode, quote, urljoin, urlsplit
 
 import requests
 from Crypto.Cipher import AES
@@ -25,6 +25,98 @@ class AuthenticationError(RuntimeError):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+AUTH_PHASES = frozenset(('login_service_probe', 'credentials', 'webvpn_context',
+    'webvpn_auth_methods', 'webvpn_public_key', 'webvpn_password_encrypt',
+    'webvpn_auth_execute', 'webvpn_ticket', 'webvpn_ticket_follow',
+    'webvpn_session_probe', 'icourse_portal_warmup', 'icourse_cas_context',
+    'icourse_auth_methods', 'icourse_public_key', 'icourse_password_encrypt',
+    'icourse_auth_execute', 'icourse_cas_ticket', 'icourse_ticket_follow',
+    'icourse_api_verification', 'fresh_session_factory', 'media_identity_verification',
+    'unknown'))
+AUTH_FAILURE_CODES = frozenset(('service_unavailable', 'cold_session',
+    'cas_context_missing', 'api_verification_failed', 'authentication_rejected',
+    'password_method_missing', 'service_redirect_untrusted', 'service_http_rejected',
+    'public_key_missing', 'login_token_missing', 'cas_ticket_missing',
+    'ticket_destination_untrusted', 'media_auth_cancelled', 'auth_read_timeout',
+    'auth_connect_timeout', 'auth_timeout', 'auth_tls_error', 'auth_connection_error',
+    'auth_invalid_response', 'auth_invalid_value', 'auth_internal_error'))
+AUTH_ERROR_TYPES = frozenset(('AuthenticationError', 'ReadTimeout', 'ConnectTimeout',
+    'Timeout', 'SSLError', 'ConnectionError', 'JSONDecodeError', 'ValueError',
+    'TypeError', 'RuntimeError', 'Exception'))
+
+
+def safe_auth_response(value):
+    """Carry only response shape, never headers, body, URL or auth context."""
+    if not isinstance(value, dict): return {}
+    clean = {}
+    status = value.get('http_status')
+    if type(status) is int and 100 <= status <= 599: clean['http_status'] = status
+    kind = value.get('body_kind')
+    if isinstance(kind, str) and kind in ('empty', 'html', 'json', 'other'):
+        clean['body_kind'] = kind
+    for key in ('challenge_hint', 'redirected'):
+        if type(value.get(key)) is bool: clean[key] = value[key]
+    return clean
+
+
+def authentication_failure(error, phase='unknown', vpn=None):
+    """Safe fixed fields, including a request that failed before any response."""
+    kinds = ((AuthenticationError, 'AuthenticationError', 'auth_internal_error'),
+             (requests.exceptions.ReadTimeout, 'ReadTimeout', 'auth_read_timeout'),
+             (requests.exceptions.ConnectTimeout, 'ConnectTimeout', 'auth_connect_timeout'),
+             (requests.exceptions.Timeout, 'Timeout', 'auth_timeout'),
+             (requests.exceptions.SSLError, 'SSLError', 'auth_tls_error'),
+             (requests.exceptions.ConnectionError, 'ConnectionError', 'auth_connection_error'),
+             (requests.exceptions.JSONDecodeError, 'JSONDecodeError', 'auth_invalid_response'),
+             (ValueError, 'ValueError', 'auth_invalid_value'),
+             (TypeError, 'TypeError', 'auth_internal_error'),
+             (RuntimeError, 'RuntimeError', 'auth_internal_error'))
+    error_type, code = 'Exception', 'auth_internal_error'
+    for kind, name, reason in kinds:
+        if isinstance(error, kind): error_type, code = name, reason; break
+    if isinstance(error, AuthenticationError) and isinstance(error.reason,str) and error.reason in AUTH_FAILURE_CODES:
+        code = error.reason
+    current = getattr(vpn, 'auth_phase', phase) if vpn is not None else phase
+    result = {'failure_phase': current if isinstance(current,str) and current in AUTH_PHASES else 'unknown',
+              'error_type': error_type, 'failure': code}
+    # Only the whitelisted snapshot is carried out of a discarded login Session.
+    inherited = getattr(error, 'auth_failure_diagnostics', None)
+    if isinstance(inherited, dict):
+        for key, allowed in (('failure_phase',AUTH_PHASES), ('error_type',AUTH_ERROR_TYPES),
+                             ('failure',AUTH_FAILURE_CODES)):
+            value = inherited.get(key)
+            if isinstance(value,str) and value in allowed: result[key] = value
+        for key in ('probe_attempts', 'probe_transient_failures'):
+            value = inherited.get(key)
+            if type(value) is int and 0 <= value <= 3: result[key] = value
+        response = safe_auth_response(inherited.get('response'))
+        if response: result['response'] = response
+        attempts = inherited.get('auth_attempts')
+        if type(attempts) is int and 1 <= attempts <= 10:
+            result['auth_attempts'] = attempts
+        history = inherited.get('attempt_failures')
+        if isinstance(history, list) and len(history) <= 10:
+            safe_history = []
+            for row in history:
+                if not isinstance(row, dict): continue
+                clean = {k: row[k] for k, allowed in (
+                    ('failure_phase', AUTH_PHASES), ('error_type', AUTH_ERROR_TYPES),
+                    ('failure', AUTH_FAILURE_CODES)) if isinstance(row.get(k), str) and row[k] in allowed}
+                for name in ('probe_attempts', 'probe_transient_failures'):
+                    value = row.get(name)
+                    if type(value) is int and 0 <= value <= 3: clean[name] = value
+                response = safe_auth_response(row.get('response'))
+                if response: clean['response'] = response
+                safe_history.append(clean)
+            result['attempt_failures'] = safe_history
+    if vpn is not None:
+        for key, attribute in (('probe_attempts','auth_probe_attempts'),
+                               ('probe_transient_failures','auth_probe_transient_failures')):
+            value = getattr(vpn,attribute,None)
+            if type(value) is int and 0 <= value <= 3: result[key] = value
+    return result
 
 
 def auth_observation(stage, response, data=None, **flags):
@@ -141,21 +233,83 @@ def get_ordinary_url(vpn_url: str) -> str:
 class WebVPNSession:
     """Manages a WebVPN session with full IDP authentication."""
 
-    def __init__(self):
+    def __init__(self, *, access_mode='webvpn'):
+        if access_mode not in ('webvpn', 'direct'):
+            raise ValueError('Invalid iCourse access mode')
+        self.access_mode = access_mode
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
         self.logged_in = False
         self.auth_diagnostics = []
+        self.auth_phase = 'unknown'
+
+    @property
+    def requires_webvpn_login(self):
+        return self.access_mode == 'webvpn'
+
+    def route_url(self, url):
+        return get_vpn_url(url) if self.requires_webvpn_login else url
+
+    @property
+    def portal_url(self):
+        return (config.WEBVPN_BASE if self.requires_webvpn_login else config.ICOURSE_BASE)+'/'
 
     def _record_icourse_auth(self, stage, response, data=None, **flags):
         self.auth_diagnostics.append(auth_observation(stage,response,data,**flags))
         self.auth_diagnostics = self.auth_diagnostics[-32:]
+
+    def _auth_json(self, response):
+        try:
+            return response.json()
+        except requests.exceptions.JSONDecodeError as error:
+            text = response.text[:100_000].strip().lower()
+            kind = ('empty' if not text else 'html' if text.startswith('<')
+                    else 'json' if text.startswith(('{', '[')) else 'other')
+            observed = auth_observation('invalid_json', response)
+            challenge = (observed['captcha_page_hint'] or observed['mfa_page_hint']
+                or bool(re.search(r'"(?:needverifycode|needmfa|needotp)"\s*:\s*true', text))
+                or any(hint in text for hint in ('one-time password', 'two-factor')))
+            audit = authentication_failure(error, vpn=self)
+            audit['response'] = safe_auth_response({
+                'http_status': response.status_code, 'body_kind': kind,
+                'challenge_hint': challenge,
+                'redirected': bool(response.history)})
+            error.auth_failure_diagnostics = audit
+            raise
+
+    def probe_login_service(self):
+        """Reachability before sending credentials; HTTP 200 is not login proof."""
+        from src.runtime.media_protocol import redirect_kind, redirect_observation
+        self.auth_phase = 'login_service_probe'
+        response = self.session.get(self.portal_url, allow_redirects=False,
+                                    timeout=(5, 5))
+        try:
+            self._record_icourse_auth('login_service_probe', response)
+            if response.status_code in (408, 429, 500, 502, 503, 504):
+                raise AuthenticationError('service_unavailable')
+            if response.status_code == 200:
+                return
+            if response.status_code in (301, 302, 303, 307, 308):
+                observed = redirect_observation(response)
+                if redirect_kind(response) == 'login' or (
+                        observed.get('authority') == 'same_origin'
+                        and observed.get('route') == 'vpn_control'
+                        and not observed.get('downgrade')
+                        and not observed.get('credential_authority')):
+                    return
+                raise AuthenticationError('service_redirect_untrusted')
+            raise AuthenticationError('service_http_rejected')
+        finally:
+            response.close()
 
     def login(self, student_id: str = None, password: str = None) -> bool:
         """Execute the full 7-step IDP authentication flow.
 
         Returns True on success, raises on failure.
         """
+        if not self.requires_webvpn_login:
+            raise AuthenticationError('direct_mode_requires_icourse_auth')
+        self.auth_phase = 'credentials'
         student_id = student_id or config.STUDENT_ID
         password = password or config.PASSWORD
 
@@ -175,6 +329,7 @@ class WebVPNSession:
         pub_key_pem = self._get_public_key()
 
         print("[4/7] Encrypting password...")
+        self.auth_phase = 'webvpn_password_encrypt'
         encrypted_password = self._encrypt_password(password, pub_key_pem)
 
         print("[5/7] Executing authentication...")
@@ -215,31 +370,34 @@ class WebVPNSession:
         student_id = student_id or config.STUDENT_ID
         password = password or config.PASSWORD
 
-        print("[*] Starting iCourse CAS authentication through WebVPN...")
+        route_label = "WebVPN" if self.requires_webvpn_login else "direct campus access"
+        print(f"[*] Starting iCourse CAS authentication ({route_label})...")
 
         # Pre-flight: probe the WebVPN portal.  A cold session redirects to
         # /login instantly (status 302); a hot session returns 200.  Fail
         # fast on cold — login_with_retry() in main.py will re-login.
+        self.auth_phase = 'icourse_portal_warmup'
         warmup = self.session.get(
-            config.WEBVPN_BASE + "/", allow_redirects=False, timeout=5,
+            self.portal_url, allow_redirects=False, timeout=5,
         )
         self._record_icourse_auth('portal_warmup',warmup)
         if warmup.status_code != 200:
             raise AuthenticationError('cold_session')
 
-        idp_vpn_base = get_vpn_url(config.IDP_BASE)
+        idp_vpn_base = self.route_url(config.IDP_BASE)
 
         # Step 1: Initiate CAS login via casapi.  Use allow_redirects=True
         # so requests follows the full redirect chain like a browser.
-        print("[1/7] Initiating CAS login via casapi...")
+        print(f"[1/7] Initiating CAS login via casapi...")
         casapi_url = (
             f"{config.ICOURSE_BASE}/casapi/index.php"
             f"?r=auth/login&school_login=1"
             f"&tenant_code={config.TENANT_CODE}"
             f"&forward={quote(config.ICOURSE_BASE + '/', safe='')}"
         )
-        vpn_url = get_vpn_url(casapi_url)
+        vpn_url = self.route_url(casapi_url)
 
+        self.auth_phase = 'icourse_cas_context'
         resp = self.session.get(vpn_url, allow_redirects=True, timeout=60)
         lck = None
         for source in [resp.url] + [
@@ -262,20 +420,21 @@ class WebVPNSession:
         print("    lck: OK")
 
         # Step 2: Query auth methods (through WebVPN)
-        print("[2/7] Querying auth methods (via WebVPN)...")
-        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/queryAuthMethods")
+        print(f"[2/7] Querying auth methods ({route_label})...")
+        url = self.route_url(f"{config.IDP_BASE}/idp/authn/queryAuthMethods")
+        self.auth_phase = 'icourse_auth_methods'
         resp = self.session.post(
             url,
             json={"lck": lck, "entityId": entity_id},
             headers={
                 "Content-Type": "application/json",
                 "Referer": f"{idp_vpn_base}/ac/",
-                "Origin": config.WEBVPN_BASE,
+                "Origin": config.WEBVPN_BASE if self.requires_webvpn_login else config.IDP_BASE,
             },
             timeout=60,
         )
         self._record_icourse_auth('auth_methods_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         auth_method_list = data.get("data", [])
         request_type = data.get("requestType", "chain_type")
 
@@ -291,15 +450,16 @@ class WebVPNSession:
         print("    authChainCode: OK")
 
         # Step 3: Get RSA public key (through WebVPN)
-        print("[3/7] Getting RSA public key (via WebVPN)...")
-        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/getJsPublicKey")
+        print(f"[3/7] Getting RSA public key ({route_label})...")
+        url = self.route_url(f"{config.IDP_BASE}/idp/authn/getJsPublicKey")
+        self.auth_phase = 'icourse_public_key'
         resp = self.session.get(
             url,
             headers={"Referer": f"{idp_vpn_base}/ac/"},
             timeout=60,
         )
         self._record_icourse_auth('public_key_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         pub_key_b64 = data.get("data", "")
         if not pub_key_b64:
             self._record_icourse_auth('public_key',resp,data,public_key_found=False)
@@ -308,12 +468,14 @@ class WebVPNSession:
         print("    Got RSA public key")
 
         # Step 4: Encrypt password
-        print("[4/7] Encrypting password...")
+        print(f"[4/7] Encrypting password...")
+        self.auth_phase = 'icourse_password_encrypt'
         encrypted_password = self._encrypt_password(password, pub_key_b64)
 
         # Step 5: Execute authentication (through WebVPN)
-        print("[5/7] Executing authentication (via WebVPN)...")
-        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/authExecute")
+        print(f"[5/7] Executing authentication ({route_label})...")
+        url = self.route_url(f"{config.IDP_BASE}/idp/authn/authExecute")
+        self.auth_phase = 'icourse_auth_execute'
         payload = {
             "authModuleCode": "userAndPwd",
             "authChainCode": auth_chain_code,
@@ -332,12 +494,12 @@ class WebVPNSession:
             headers={
                 "Content-Type": "application/json",
                 "Referer": f"{idp_vpn_base}/ac/",
-                "Origin": config.WEBVPN_BASE,
+                "Origin": config.WEBVPN_BASE if self.requires_webvpn_login else config.IDP_BASE,
             },
             timeout=60,
         )
         self._record_icourse_auth('auth_execute_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         self._record_icourse_auth('auth_execute',resp,data,
                                  login_token_found=bool(data.get('loginToken')))
 
@@ -350,14 +512,15 @@ class WebVPNSession:
         print("    loginToken: OK")
 
         # Step 6: Get CAS ticket (through WebVPN)
-        print("[6/7] Getting CAS ticket (via WebVPN)...")
-        url = get_vpn_url(f"{config.IDP_BASE}/idp/authCenter/authnEngine")
+        print(f"[6/7] Getting CAS ticket ({route_label})...")
+        url = self.route_url(f"{config.IDP_BASE}/idp/authCenter/authnEngine")
+        self.auth_phase = 'icourse_cas_ticket'
         resp = self.session.post(
             url,
             data={"loginToken": login_token},
             headers={
                 "Referer": f"{idp_vpn_base}/ac/",
-                "Origin": config.WEBVPN_BASE,
+                "Origin": config.WEBVPN_BASE if self.requires_webvpn_login else config.IDP_BASE,
             },
             timeout=60,
         )
@@ -380,11 +543,18 @@ class WebVPNSession:
         ticket_url = html_mod.unescape(ticket_match.group(1))
         print("    Ticket extracted.")
 
-        # Step 7: Follow ticket to iCourse (through WebVPN)
-        print("[7/7] Following ticket to iCourse (via WebVPN)...")
-        if not ticket_url.startswith(config.WEBVPN_BASE):
-            ticket_url = get_vpn_url(ticket_url)
+        if not self.requires_webvpn_login:
+            target, expected = urlsplit(ticket_url), urlsplit(config.ICOURSE_BASE)
+            if (target.username or target.password
+                    or (target.scheme, target.netloc) != (expected.scheme, expected.netloc)):
+                raise AuthenticationError('ticket_destination_untrusted')
 
+        # Step 7: Follow ticket to iCourse (through WebVPN)
+        print(f"[7/7] Following ticket to iCourse ({route_label})...")
+        if self.requires_webvpn_login and not ticket_url.startswith(config.WEBVPN_BASE):
+            ticket_url = self.route_url(ticket_url)
+
+        self.auth_phase = 'icourse_ticket_follow'
         resp = self.session.get(
             ticket_url, allow_redirects=True, timeout=90
         )
@@ -392,9 +562,10 @@ class WebVPNSession:
         print(f"    Status: {resp.status_code}")
 
         # Verify by making a test API call
-        test_url = get_vpn_url(
+        test_url = self.route_url(
             f"{config.ICOURSE_BASE}/userapi/v1/infosimple"
         )
+        self.auth_phase = 'icourse_api_verification'
         resp = self.session.get(test_url, timeout=60)
         self._record_icourse_auth('api_verification_http',resp)
         if resp.status_code == 200:
@@ -403,8 +574,9 @@ class WebVPNSession:
                 verified = str(user_data.get('code')) in ('0','200')
                 self._record_icourse_auth('api_verification',resp,user_data,verified=verified)
                 if verified:
+                    self.logged_in = True
                     print("    Verified: login OK")
-                    print("[*] iCourse authentication successful!")
+                    print(f"[*] iCourse authentication successful!")
                     return True
             except Exception:
                 pass
@@ -415,13 +587,13 @@ class WebVPNSession:
 
     def get(self, url: str, **kwargs) -> requests.Response:
         """GET request through WebVPN. Converts URL automatically."""
-        vpn_url = get_vpn_url(url)
+        vpn_url = self.route_url(url)
         kwargs.setdefault("timeout", 60)
         return self.session.get(vpn_url, **kwargs)
 
     def post(self, url: str, **kwargs) -> requests.Response:
         """POST request through WebVPN. Converts URL automatically."""
-        vpn_url = get_vpn_url(url)
+        vpn_url = self.route_url(url)
         kwargs.setdefault("timeout", 60)
         return self.session.post(vpn_url, **kwargs)
 
@@ -439,6 +611,7 @@ class WebVPNSession:
 
     def _get_auth_context(self) -> tuple[str, str]:
         """Step 1: GET authenticate endpoint, extract lck from redirect."""
+        self.auth_phase = 'webvpn_context'
         service_url = f"{config.WEBVPN_BASE}/login?cas_login=true"
         url = (
             f"{config.IDP_BASE}/idp/authCenter/authenticate"
@@ -459,9 +632,7 @@ class WebVPNSession:
         lck_match = re.search(r"[?&]lck=([^&]+)", location)
         self._record_icourse_auth('webvpn_context',resp,context_found=bool(lck_match))
         if not lck_match:
-            raise RuntimeError(
-                f"Failed to extract lck from redirect (status={resp.status_code})"
-            )
+            raise AuthenticationError('cas_context_missing')
 
         lck = lck_match.group(1)
         entity_id = config.WEBVPN_BASE
@@ -472,6 +643,7 @@ class WebVPNSession:
         self, lck: str, entity_id: str
     ) -> tuple[str, str]:
         """Step 2: Query available authentication methods."""
+        self.auth_phase = 'webvpn_auth_methods'
         url = f"{config.IDP_BASE}/idp/authn/queryAuthMethods"
         resp = self.session.post(
             url,
@@ -484,7 +656,7 @@ class WebVPNSession:
             timeout=60,
         )
         self._record_icourse_auth('webvpn_auth_methods_http',resp)
-        data = resp.json()
+        data = self._auth_json(resp)
         # data["data"] is a list of auth methods; pick the userAndPwd one
         # authChainCode for userAndPwd is in the list items;
         # requestType is at the top level
@@ -499,13 +671,14 @@ class WebVPNSession:
 
         self._record_icourse_auth('webvpn_auth_methods',resp,data,password_method_found=bool(auth_chain_code))
         if not auth_chain_code:
-            raise RuntimeError("Failed to get authChainCode")
+            raise AuthenticationError('password_method_missing')
 
         print("    authChainCode: OK")
         return auth_chain_code, request_type
 
     def _get_public_key(self) -> str:
         """Step 3: Get RSA public key for password encryption."""
+        self.auth_phase = 'webvpn_public_key'
         url = f"{config.IDP_BASE}/idp/authn/getJsPublicKey"
         resp = self.session.get(
             url,
@@ -514,11 +687,11 @@ class WebVPNSession:
             },
             timeout=60,
         )
-        data = resp.json()
+        data = self._auth_json(resp)
         pub_key_b64 = data.get("data", "")
         self._record_icourse_auth('webvpn_public_key',resp,data,public_key_found=bool(pub_key_b64))
         if not pub_key_b64:
-            raise RuntimeError("Failed to get public key")
+            raise AuthenticationError('public_key_missing')
 
         print("    Got RSA public key")
         return pub_key_b64
@@ -546,6 +719,7 @@ class WebVPNSession:
         request_type: str,
     ) -> str:
         """Step 5: Execute authentication and get loginToken."""
+        self.auth_phase = 'webvpn_auth_execute'
         url = f"{config.IDP_BASE}/idp/authn/authExecute"
         payload = {
             "authModuleCode": "userAndPwd",
@@ -569,23 +743,22 @@ class WebVPNSession:
             },
             timeout=60,
         )
-        data = resp.json()
+        data = self._auth_json(resp)
         self._record_icourse_auth('webvpn_auth_execute',resp,data,
                                  login_token_found=bool(data.get('loginToken')))
         if str(data.get("code")) != "200":
-            raise RuntimeError(
-                f"Authentication failed (code={data.get('code')})"
-            )
+            raise AuthenticationError('authentication_rejected')
         # loginToken is at top level, not nested under "data"
         login_token = data.get("loginToken", "")
         if not login_token:
-            raise RuntimeError("No loginToken in response")
+            raise AuthenticationError('login_token_missing')
 
         print("    loginToken: OK")
         return login_token
 
     def _get_cas_ticket(self, login_token: str) -> str:
         """Step 6: Exchange loginToken for a CAS ticket URL."""
+        self.auth_phase = 'webvpn_ticket'
         url = f"{config.IDP_BASE}/idp/authCenter/authnEngine"
         resp = self.session.post(
             url,
@@ -612,9 +785,7 @@ class WebVPNSession:
 
         self._record_icourse_auth('webvpn_ticket',resp,ticket_found=bool(ticket_match))
         if not ticket_match:
-            raise RuntimeError(
-                f"Failed to extract ticket URL (response length: {len(html)})"
-            )
+            raise AuthenticationError('cas_ticket_missing')
 
         ticket_url = ticket_match.group(1)
         # Unescape HTML entities (e.g., &amp; -> &)
@@ -624,6 +795,7 @@ class WebVPNSession:
 
     def _establish_session(self, ticket_url: str):
         """Follow a one-use CAS ticket once; recovery requires a fresh ticket."""
+        self.auth_phase = 'webvpn_ticket_follow'
         try:
             resp = self.session.get(ticket_url, allow_redirects=True, timeout=60)
         except requests.exceptions.Timeout:
@@ -646,6 +818,7 @@ class WebVPNSession:
         raise AuthenticationError('cold_session')
 
     def _verify_webvpn_session(self):
+        self.auth_phase = 'webvpn_session_probe'
         # A ticket endpoint may return a login page with HTTP 200. Neither
         # that status nor the mere presence of a stale cookie proves login.
         try:

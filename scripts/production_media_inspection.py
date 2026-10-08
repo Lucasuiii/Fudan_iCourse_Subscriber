@@ -25,7 +25,7 @@ ENTRIES = ('format=start_time,duration,size:'
 
 def safe_probe_errors(stderr):
     """Diagnostic reason codes only, never echo a signed URL or header."""
-    from src.runtime.scheduler import record_decode_errors
+    from src.runtime.audio_preparation import record_decode_errors
     counts = {}
     record_decode_errors(stderr, counts)
     lowered = stderr.lower()
@@ -274,7 +274,7 @@ def probe_relay_late_packets(client, signed_url, retained_seconds, stream):
 def inspect():
     import base64
     from scripts import production_qwen as pipeline, sharded_qwen_pilot as shards
-    from scripts.production_result_export import encrypt, identity
+    from scripts.production_result_export import encrypt, identity, validate_inspection_source
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
     run, slot = os.environ['SOURCE_RUN_ID'], int(os.environ['SOURCE_SLOT'])
@@ -288,8 +288,7 @@ def inspect():
         info = json.loads(subprocess.check_output(['gh', 'api',
             f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run}'],
             stderr=subprocess.PIPE, timeout=60))
-        if info['status'] != 'completed' or info['path'].split('@')[0] != '.github/workflows/parallel_pilot.yml':
-            raise ValueError('Source must be a completed formal pilot')
+        validate_inspection_source(info, run, slot)
         payload['source_commit'] = info['head_sha']
         stage = 'retained_artifact'
         target = pipeline.root()/'media-inspection-source'

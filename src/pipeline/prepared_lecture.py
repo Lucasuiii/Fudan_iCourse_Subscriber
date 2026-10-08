@@ -46,17 +46,22 @@ def validate_material(material, course_id, sub_id):
             or not isinstance(material.get('recognition_terms'), list)):
         raise ValueError('Invalid prepared lecture identity or material')
     duration = material.get('audio_seconds')
-    if not isinstance(duration, (float, int)) or not math.isfinite(duration) or duration <= 0:
-        raise ValueError('Invalid prepared audio duration')
-    expected = material.get('media_seconds') or 0
-    # The production downloader has no three-hour sampling cap. Reject a
-    # substantial known shortfall rather than publish a partial classroom.
-    if expected > 0 and duration < expected - max(120, expected * .05):
-        raise ValueError('Prepared audio is incomplete relative to media duration')
+    validate_audio_duration(duration, material.get('media_seconds'))
     for segment in material['segments']:
         if (not isinstance(segment.get('text'), str)
                 or not 0 <= segment['start_ms'] < segment['end_ms'] <= round(duration*1000)):
             raise ValueError('Prepared segment changed the source timeline')
+
+
+def validate_audio_duration(duration, media_seconds):
+    """The same completeness gate runs before cloud repair and final assembly."""
+    if not isinstance(duration, (float, int)) or not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Invalid prepared audio duration')
+    expected = media_seconds or 0
+    # The production downloader has no three-hour sampling cap. Reject a
+    # substantial known shortfall rather than publish a partial classroom.
+    if expected > 0 and duration < expected - max(120, expected * .05):
+        raise ValueError('Prepared audio is incomplete relative to media duration')
 
 
 def cached_material(db, lecture):

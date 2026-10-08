@@ -358,7 +358,8 @@ class LectureRunner:
         """
         prepared = getattr(self, '_prepared_asr', None)
         if prepared is not None:
-            self._transcript_source = 'local_asr'
+            self._transcript_source = ('hybrid_asr' if any(
+                r.get('quality_state') == 'doubao_fallback' for r in prepared['full_chunks']) else 'local_asr')
             self._asr_actual_duration = prepared['audio_seconds']
             self._asr_expected_duration = prepared.get('media_seconds') or 0.0
             self._asr_audio_path = prepared.get('audio_path')
