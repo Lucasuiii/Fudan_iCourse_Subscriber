@@ -65,6 +65,18 @@ class ICourseClient:
         self._media_reauth_factory = media_reauth_factory
         self._media_owned_session = None
         self.media_auth_audit = {}
+        self._video_lookup_audits = {}
+        self._video_lookup_lock = threading.Lock()
+
+    def video_lookup_diagnostics(self, course_id, sub_id):
+        with self._video_lookup_lock:
+            return copy.deepcopy(self._video_lookup_audits.get((str(course_id), str(sub_id)), {}))
+
+    def _record_video_lookup(self, course_id, sub_id, audit):
+        with self._video_lookup_lock:
+            self._video_lookup_audits[(str(course_id), str(sub_id))] = copy.deepcopy(audit)
+            while len(self._video_lookup_audits) > 128:
+                self._video_lookup_audits.pop(next(iter(self._video_lookup_audits)))
 
     def get_userinfo(self) -> dict:
         """Get current user info (id, tenant_id, phone, account).
@@ -581,9 +593,11 @@ class ICourseClient:
         data = resp.json()
 
         if data.get("code") != 0:
-            raise RuntimeError(
+            error = RuntimeError(
                 f"API error for sub {sub_id}: {data.get('msg')}"
             )
+            error.playback_api_code = data.get('code')
+            raise error
 
         return data.get("data", {})
 
@@ -611,9 +625,11 @@ class ICourseClient:
         payload = data.get("data") or {}
 
         if data.get("code") != 0 and not payload:
-            raise RuntimeError(
+            error = RuntimeError(
                 f"API error for sub-info {sub_id}: {data.get('msg')}"
             )
+            error.playback_api_code = data.get('code')
+            raise error
 
         return payload
 
@@ -634,12 +650,18 @@ class ICourseClient:
 
         Returns the signed video URL string, or None if no source yields one.
         """
+        from src.api.playback_diagnostics import lookup_error
+        audit = {'sources': [], 'url_found': False}
+        self._record_video_lookup(course_id, sub_id, audit)
         try:
             info = self.get_sub_info(course_id, sub_id)
+            audit['sources'].append({'source': 'sub_info', 'result': 'payload'})
         except Exception as e:
+            audit['sources'].append({'source': 'sub_info', **lookup_error(e)})
             print(f"    Sub-info unavailable ({type(e).__name__}); "
                   "falling back to sub-detail")
             info = {}
+        self._record_video_lookup(course_id, sub_id, audit)
 
         # Get server timestamp for signing
         now = info.get("now")
@@ -686,18 +708,26 @@ class ICourseClient:
         if not base_url:
             try:
                 detail = self.get_sub_detail(course_id, sub_id)
+                audit['sources'].append({'source': 'sub_detail', 'result': 'payload'})
                 content = detail.get("content", {})
                 playback = content.get("playback", {})
                 if playback and playback.get("url"):
                     base_url = playback["url"]
-            except Exception:
-                pass
+            except Exception as error:
+                audit['sources'].append({'source': 'sub_detail', **lookup_error(error)})
 
+        audit['url_found'] = bool(base_url)
+        self._record_video_lookup(course_id, sub_id, audit)
         if not base_url:
             print("    No video URL found (tried all configured sources)")
             return None
 
-        return self.sign_video_url(base_url, now=now)
+        try:
+            return self.sign_video_url(base_url, now=now)
+        except Exception as error:
+            audit['sources'].append({'source': 'signing', **lookup_error(error)})
+            self._record_video_lookup(course_id, sub_id, audit)
+            raise
 
     def get_stream_params(self, video_url: str) -> tuple[str, str]:
         """Get WebVPN URL and HTTP headers for direct streaming (e.g., ffmpeg).

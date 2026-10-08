@@ -229,7 +229,9 @@ class AudioDownloader:
                 phase = 'media_lookup'
                 url = client.get_video_url(course_id, sub_id)
                 if not url:
-                    self._record_startup_failure(sub_id, pending, startup_diagnostics(phase))
+                    from src.api.playback_diagnostics import attach_lookup
+                    self._record_startup_failure(sub_id, pending,
+                        attach_lookup(startup_diagnostics(phase), client, course_id, sub_id))
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
@@ -346,7 +348,9 @@ class AudioDownloader:
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
             except Exception as error:
-                self._record_startup_failure(sub_id, pending, startup_diagnostics(phase, error, transport))
+                from src.api.playback_diagnostics import attach_lookup
+                self._record_startup_failure(sub_id, pending,
+                    attach_lookup(startup_diagnostics(phase, error, transport), client, course_id, sub_id))
                 if transport is not None: transport.close()
                 self._pop_if_mine(sub_id, pending)
                 self._sem.release()
