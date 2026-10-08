@@ -3,67 +3,7 @@ permissions:
   actions: read
   contents: write
 jobs:
-  schedule_gate:
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.decide.outputs.should_run }}
-    steps:
-    - name: Decide whether the fallback should run
-      id: decide
-      env:
-        EVENT_NAME: ${{ github.event_name }}
-        EVENT_SCHEDULE: ${{ github.event.schedule }}
-        CURRENT_RUN_ID: ${{ github.run_id }}
-        GH_TOKEN: ${{ github.token }}
-        REPOSITORY: ${{ github.repository }}
-      run: |
-        # Manual runs and the 17:07 primary run always continue.
-        if [ "$EVENT_NAME" != "schedule" ] || \
-           [ "$EVENT_SCHEDULE" != "7 12 * * *" ]; then
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        # At 20:07, skip the expensive pipeline only when a useful scheduled
-        # run has already appeared today in Beijing time. A queued/running
-        # primary counts; a completed primary counts only when successful.
-        day_start_utc=$(python3 - <<'PY'
-        from datetime import datetime, timezone
-        from zoneinfo import ZoneInfo
-
-        now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        print(start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        PY
-        )
-
-        if ! runs_json=$(gh api --method GET \
-            "repos/$REPOSITORY/actions/workflows/check.yml/runs" \
-            -f event=schedule -f branch=main -f per_page=100); then
-          echo "::warning::Could not inspect today's scheduled runs; running fallback."
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        prior_useful_runs=$(printf '%s' "$runs_json" | jq \
-          --arg current "$CURRENT_RUN_ID" \
-          --arg cutoff "$day_start_utc" \
-          '[.workflow_runs[] | select(
-            (.id | tostring) != $current and
-            .created_at >= $cutoff and
-            (.status != "completed" or .conclusion == "success")
-          )] | length')
-
-        if [ "$prior_useful_runs" -gt 0 ]; then
-          echo "A scheduled run already started today; skipping 20:07 fallback."
-          echo "should_run=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "No useful scheduled run started today; running 20:07 fallback."
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
-        fi
   check:
-    needs: schedule_gate
-    if: needs.schedule_gate.outputs.should_run == 'true'
     uses: ./.github/workflows/parallel_pilot.yml
     with:
       automatic_terms: false
@@ -78,7 +18,6 @@ jobs:
 'on':
   schedule:
   - cron: 7 9 * * *
-  - cron: 7 12 * * *
   workflow_dispatch: null
 concurrency:
   group: icourse-data-${{ github.repository }}

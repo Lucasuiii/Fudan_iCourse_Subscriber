@@ -227,7 +227,7 @@ class CoordinationRecoveryTests(unittest.TestCase):
         self.assertNotIn('private', json.dumps(audit))
         for vpn in sessions: vpn.session.close.assert_called_once()
 
-    def test_every_data_lock_entrant_keeps_pending_runs_and_schedule_is_unchanged(self):
+    def test_every_data_lock_entrant_keeps_pending_runs_and_daily_primary(self):
         entrants = []
         for path in (ROOT/'.github/workflows').glob('*.yml'):
             data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
@@ -238,7 +238,7 @@ class CoordinationRecoveryTests(unittest.TestCase):
             self.assertEqual(concurrency['cancel-in-progress'], 'false', path.name)
         self.assertIn('check.yml', entrants); self.assertIn('parallel_pilot.yml', entrants)
         check = yaml.load((ROOT/'.github/workflows/check.yml').read_text(), Loader=yaml.BaseLoader)
-        self.assertEqual(check['on']['schedule'], [{'cron': '7 9 * * *'}, {'cron': '7 12 * * *'}])
+        self.assertEqual(check['on']['schedule'], [{'cron': '7 9 * * *'}])
         self.assertTrue(check['jobs']['check']['with']['caller_holds_lock'])
 
 
