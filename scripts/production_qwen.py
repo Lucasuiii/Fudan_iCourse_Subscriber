@@ -905,7 +905,7 @@ def prepare():
                 windows = prepare_audio_stream(transcriber, handle, specification)
                 specification.setdefault('prepare_timings', {})['audio_and_vad_seconds'] = time.monotonic()-began_vad
                 duration = transcriber.last_audio_duration
-                media = transcriber.last_media_duration or 0
+                media = transcriber.last_media_duration
                 specification.update(audio_seconds=duration, media_seconds=media,
                     vad_windows=transcriber.last_vad_windows, full_chunks=[{'start':a,'end':b} for a,b in windows])
                 specification['prepare_phase'] = 'audio_validation'
@@ -913,7 +913,7 @@ def prepare():
                 if abs(specification['audio_seconds']-duration) > 1/16000:
                     raise ValueError('VAD input differs from retained PCM samples')
                 validate_prepared_audio(specification)
-                media = specification.get('media_seconds') or 0
+                media = specification.get('media_seconds')
                 flac = root()/'lecture.flac'
                 digest = specification['audio_diagnostics']['audio_sha256']
                 plan = build_audio_plan({'selection': {'course_id': course, 'sub_id': sub_id},

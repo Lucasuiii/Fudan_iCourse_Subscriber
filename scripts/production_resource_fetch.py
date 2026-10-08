@@ -3,6 +3,7 @@ from contextlib import redirect_stdout, redirect_stderr
 import base64
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -37,7 +38,7 @@ def save_result(row, slot):
     pipeline.out('resource-result.enc').write_bytes(encrypt(
         shards.encoded(row), recipient, os.environ['GITHUB_RUN_ID'], slot))
     # Only the fixed safe audit is public; lesson names/IDs remain encrypted.
-    pipeline.out('resource-audit.json').write_bytes(shards.encoded(row['audit']))
+    pipeline.out('resource-audit.json').write_bytes(shards.encoded(public_resource_audit(row['audit'])))
 
 
 def select_latest(client, db, courses):
@@ -56,9 +57,33 @@ def select_latest(client, db, courses):
 
 def selection_audit(rows):
     return {'resource_only': True, 'course_count': len(rows), 'courses': [
-        dict(task_slot=r['task_slot'], course_id=r['course_id'], status=r['status'],
-             **(r['task'][2]['_validation'] if r['status'] == 'selected' else
-                {'error_type': r['error_type']})) for r in rows]}
+        public_resource_audit(dict(task_slot=r['task_slot'], status=r['status'],
+            **({'error_code': 'selection_failed'} if r['status'] != 'selected' else {}))) for r in rows]}
+
+
+def public_resource_audit(audit):
+    """Explicit public schema: never copy provider fields or nested diagnostics."""
+    result = {}
+    if type(audit.get('task_slot')) is int and audit['task_slot'] in range(4):
+        result['task_slot'] = audit['task_slot']
+    if audit.get('status') in ('selected', 'selection_failed', 'complete', 'failed', 'selecting'):
+        result['status'] = audit['status']
+    if audit.get('phase') in ('authentication', 'audio_startup', 'audio_download',
+            'audio_retention', 'audio_validation', 'complete'):
+        result['phase'] = audit['phase']
+    for key in ('resource_only', 'publication', 'emailed', 'audio_retained'):
+        if type(audit.get(key)) is bool: result[key] = audit[key]
+    if type(audit.get('model_calls')) is int and audit['model_calls'] >= 0:
+        result['model_calls'] = audit['model_calls']
+    seconds = audit.get('seconds')
+    if type(seconds) in (float, int) and math.isfinite(seconds) and seconds >= 0:
+        result['seconds'] = seconds
+    if 'error_code' in audit:
+        codes = {'selection_failed', 'audio_startup_failed', 'incomplete_audio', 'audio_decode_errors',
+            'audio_diagnostics_incomplete', 'audio_sample_metadata_invalid', 'preparation_deadline',
+            'preparation_stalled', 'auth_invalid_response', 'authentication_failed', 'coordination_failure'}
+        result['error_code'] = audit['error_code'] if audit['error_code'] in codes else 'resource_failure'
+    return result
 
 
 def requested_slots():

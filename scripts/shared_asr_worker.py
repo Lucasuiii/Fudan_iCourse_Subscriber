@@ -41,6 +41,11 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
     began = time.monotonic()
     decoded = []
     local_rows = list(previous_rows)
+    input_audio_bytes = sum(len(files[f'chunk-{b["chunk_id"]}.flac']) for b in plan['blocks']
+                            if f'chunk-{b["chunk_id"]}.flac' in files)
+    input_audio_blocks = sum(f'chunk-{b["chunk_id"]}.flac' in files for b in plan['blocks'])
+    claimed_audio_bytes = 0
+    claimed_audio_blocks = 0
     role = f'shared-local-{worker_id}'
     def save_local():
         shards.seal({'local.json': shards.encoded({'plan_hash': fingerprint(plan),
@@ -66,6 +71,8 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
                     transcriber.set_terms(plan['recognition_terms'])
                 phase = 'audio_validate'
                 blob = files[f'chunk-{block["chunk_id"]}.flac']
+                claimed_audio_bytes += len(blob)
+                claimed_audio_blocks += 1
                 if hashlib.sha256(blob).hexdigest() != block['flac_sha256']:
                     raise ValueError('Original audio block hash changed')
                 def load(_):
@@ -114,6 +121,9 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
         from scripts.production_qwen import failure_code
         from scripts.coordination_transport import diagnostic
         audit = {'worker_id': worker_id, 'run_attempt': attempt,
+                 'input_audio_bytes': input_audio_bytes, 'input_audio_blocks': input_audio_blocks,
+                 'claimed_audio_bytes': claimed_audio_bytes, 'claimed_audio_blocks': claimed_audio_blocks,
+                 'unused_input_audio_bytes': max(0, input_audio_bytes-claimed_audio_bytes),
                  'phase': phase if failure else 'cleanup' if cleanup_errors else 'complete',
                  'local_completed_blocks': sum(not r.get('missing_intervals') for r in local_rows),
                  'local_terminal_blocks': len(local_rows), 'queue_snapshot_saved': snapshot_saved,
@@ -134,6 +144,6 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
         except Exception:
             if primary is None: raise
         if failure is None and cleanup_errors: raise cleanup_errors[0]
-    return {'decoded_chunk_ids': decoded,
+    return {**audit, 'decoded_chunk_ids': decoded,
             'failed_chunk_ids': [r['chunk_id'] for r in local_rows if r.get('missing_intervals')], 'seconds': time.monotonic()-began,
             'worker_id': worker_id, 'run_attempt': attempt}

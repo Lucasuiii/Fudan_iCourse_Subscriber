@@ -80,11 +80,15 @@ def execute():
         else:
             pipeline.artifact(f'qwen-production-state-{ticket["slot"]}', pipeline.root()/'inbox', required=True)
         download_seconds = time.monotonic()-began
+        # Only numeric sizes are public; artifact names and paths stay private.
+        input_files = [p for p in (pipeline.root()/'inbox').rglob('*') if p.is_file() and not p.is_symlink()]
+        input_bytes = sum(p.stat().st_size for p in input_files)
         began = time.monotonic()
         command = {'prepare': 'prepare', 'asr': 'worker', 'gather': 'gather', 'publish': 'publish'}[mode]
         result = subprocess.run([sys.executable, '-m', 'scripts.production_qwen', command], env=env)
         pipeline.out('stage-audit.json').write_text(json.dumps({'stage': mode, 'task_slot': ticket['slot'],
-            'worker_id': ticket['worker'], 'parent_attempt': ticket['attempt'], 'input_download_seconds': download_seconds, 'pipeline_seconds': time.monotonic()-began,
+            'worker_id': ticket['worker'], 'parent_attempt': ticket['attempt'], 'input_download_seconds': download_seconds,
+            'input_bundle_bytes': input_bytes, 'input_file_count': len(input_files), 'pipeline_seconds': time.monotonic()-began,
             'return_code': result.returncode}))
     if result.returncode: raise SystemExit(result.returncode)
 

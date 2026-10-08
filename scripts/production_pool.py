@@ -6,6 +6,7 @@ outcome is unknown is never repeated and continues to occupy its reservation.
 """
 from __future__ import annotations
 import json
+import copy
 import math
 import os
 import re
@@ -26,6 +27,15 @@ TARGET_SECONDS = 75 * 60
 DEFAULT_RTF = 2.0
 WORKFLOW = 'qwen_production_stage.yml'
 TERMINAL = {'success', 'failure', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale', 'neutral'}
+# Only explicit CLI HTTP responses proving rejection release a reservation.
+# 408/429, server failures, invalid replies and lost responses remain unknown.
+DISPATCH_REJECTIONS = frozenset((400, 401, 403, 404, 405, 410, 422))
+
+
+class DispatchRejected(CoordinationError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__('github_dispatch', 'authorization' if status in (401, 403) else 'command_failed', 1)
 
 
 class PoolStore(GitHubQueueStore):
@@ -61,8 +71,9 @@ def claim_owner(state, owner_store, *, open_pool=store_for, inspect_parent=None,
         previous = open_pool(owner['run_id'])
         try:
             old_revision, old = read_state(previous)
+            before = copy.deepcopy(old)
             (poll or Actions(old).poll)(old)
-            save(previous, old_revision, old)
+            save_if_changed(previous, old_revision, old, before)
             if any(t['status'] != 'completed' for t in old['tickets']):
                 raise ValueError('Previous pool children active or dispatch outcome unknown')
         finally: previous.close()
@@ -128,6 +139,9 @@ def validate(state):
                 or (t.get('run') and not str(t['run']).isdigit())):
             raise ValueError('Invalid stage reservation')
         identities.add(t['nonce'])
+        if 'dispatch_rejected_http' in t and (t['dispatch_rejected_http'] not in DISPATCH_REJECTIONS
+                or t['status'] != 'completed' or t.get('run') is not None or t.get('conclusion') != 'failure'):
+            raise ValueError('Invalid rejected dispatch reservation')
         if t['status'] != 'completed': active.append(t)
     if len(active) > MAX_JOBS:
         raise ValueError('Runner budget exceeded')
@@ -154,6 +168,12 @@ def save(store, revision, state):
         raise ValueError('Another controller changed the runner journal')
 
 
+def save_if_changed(store, revision, state, before):
+    validate(state)
+    if state != before:
+        save(store, revision, state)
+
+
 def api(path, *, payload=None, allow_404=False):
     args = ['gh', 'api', path]
     if payload is not None: args += ['--method', 'POST', '--input', '-']
@@ -171,6 +191,12 @@ def api(path, *, payload=None, allow_404=False):
         return request()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
         from scripts.coordination_transport import transport_code
+        if path.endswith('/dispatches') and isinstance(error, subprocess.CalledProcessError):
+            raw = error.stderr or ''
+            if isinstance(raw, bytes): raw = raw.decode(errors='replace')
+            statuses = re.findall(r'\(HTTP ([0-9]{3})\)', raw)
+            if len(statuses) == 1 and int(statuses[0]) in DISPATCH_REJECTIONS:
+                raise DispatchRejected(int(statuses[0])) from error
         raise CoordinationError('github_dispatch', transport_code(error), 1) from error
 
 
@@ -282,6 +308,8 @@ class Actions:
             if not runs:
                 if t.get('run'): raise ValueError('Registered child run disappeared')
                 continue  # Reservation stays charged, never re-dispatched.
+            if 'dispatch_rejected_http' in t:
+                raise ValueError('Rejected dispatch unexpectedly has a child run')
             r = runs[0]
             if r['head_sha'] != state['sha'] or r['path'].split('@')[0] != '.github/workflows/'+WORKFLOW:
                 raise ValueError('Stage workflow source mismatch')
@@ -357,12 +385,14 @@ def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.slee
     acquire(identity, store.key)
     began = clock(); actions.source_ref()  # Freeze before any model/prepare job dispatch.
     revision, state = read_state(store)
+    before = copy.deepcopy(state)
     # Poll prior runs before accepting a recovery generation.
     actions.poll(state)
     if attempt > 1: recover(state, attempt)
-    save(store, revision, state)
+    save_if_changed(store, revision, state, before)
     while clock()-began < timeout:
         revision, state = read_state(store)
+        before = copy.deepcopy(state)
         actions.poll(state)
         works = {}
         for raw, course in state['courses'].items():
@@ -373,7 +403,7 @@ def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.slee
             if course['phase'] == 'asr' and int(raw) not in works:
                 works[int(raw)] = get_work(int(raw), course, attempt)
         refresh_phases(state, works)
-        validate(state); save(store, revision, state)
+        save_if_changed(store, revision, state, before)
         show_progress(progress, state, works)
         if all(c['phase'] in ('done', 'failed') for c in state['courses'].values()):
             return state
@@ -397,7 +427,18 @@ def controller(store, actions, *, attempt, clock=time.monotonic, sleep=time.slee
             ticket = reserve(state, *choice[:2], attempt, worker=choice[2])
             if ticket is None: break
             save(store, revision, state)  # Durable reservation before dispatch.
-            actions.dispatch(ticket, 'codex/runner-source-'+state['run_id'])
+            try:
+                actions.dispatch(ticket, 'codex/runner-source-'+state['run_id'])
+            except DispatchRejected as error:
+                # Stop this parent, but persist proof that no child was accepted.
+                # Recovery may create a new nonce; uncertain POSTs never get here.
+                revision, state = read_state(store)
+                rejected = next(t for t in state['tickets'] if t['nonce'] == ticket['nonce'])
+                if rejected['status'] != 'reserved' or rejected.get('run') is not None:
+                    raise ValueError('Dispatch reservation changed during rejection') from error
+                rejected.update(status='completed', conclusion='failure', dispatch_rejected_http=error.status)
+                save(store, revision, state)
+                raise
             # Successful response still leaves a reservation until discoverable.
         show_progress(progress, state, works)
         sleep(30)
@@ -440,6 +481,7 @@ def public_audit(state, ended, error=None):
         'Shared queue disappeared': 'block_queue_missing',
         'Registered child run disappeared': 'child_run_missing',
         'Duplicate stage dispatch; manual resolution required': 'duplicate_dispatch',
+        'Rejected dispatch unexpectedly has a child run': 'dispatch_rejection_conflict',
         'Stage workflow source mismatch': 'child_source_mismatch',
         'Controller budget exhausted; child runs remain preserved': 'controller_deadline',
         'GitHub stage API failed; response withheld': 'github_api_failure',
@@ -447,7 +489,7 @@ def public_audit(state, ended, error=None):
     }
     result = {'protocol': 1, 'parent_run_id': state['run_id'], 'all_ended': ended,
             'error_code': reasons.get(str(error), 'controller_failure') if error else None,
-            'children': [{k: t.get(k) for k in ('slot', 'stage', 'worker', 'attempt', 'run', 'status', 'conclusion')}
+            'children': [{k: t.get(k) for k in ('slot', 'stage', 'worker', 'attempt', 'run', 'status', 'conclusion', 'dispatch_rejected_http')}
                          for t in state['tickets']]}
     if diagnostic(error):
         result.update(error_code='coordination_failure', coordination=diagnostic(error))
@@ -474,7 +516,9 @@ def main():
         error = failure
         raise
     finally:
-        try: _, state = read_state(store)
+        try:
+            _, state = read_state(store)
+            ended = all(t['status'] == 'completed' for t in state['tickets'])
         except Exception: pass  # Still retain a safe failure marker on transport errors.
         show_progress(progress, state, {}, final=True, error=error is not None)
         pipeline.out('pool-audit.json').write_text(json.dumps(public_audit(state, ended, error)))

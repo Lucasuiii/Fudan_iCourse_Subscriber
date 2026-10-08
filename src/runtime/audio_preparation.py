@@ -56,7 +56,7 @@ def collect_decode_diagnostics(handle, *, media_seconds=None, interrupted=False,
     complete = done is None or done.wait(timeout=5)
     pcm = Path(handle.path)
     size = pcm.stat().st_size if pcm.exists() else 0
-    if not media_seconds:
+    if media_seconds is None:
         stderr = b''.join(handle.stderr_chunks).decode(errors='replace')
         match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
         if match:
@@ -86,6 +86,9 @@ def validate_prepared_audio(specification):
             or diagnostics.get('source_transport', {}).get('terminal_error_code')):
         raise ValueError('Production audio has read or decode errors')
     duration, media = specification['audio_seconds'], specification.get('media_seconds')
+    timing = specification.get('preparation_timing', {})
+    if media is None and timing and timing.get('stream_eof') is not True:
+        raise ValueError('Production audio diagnostics are incomplete')
     if (type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0
             or media is not None and (type(media) not in (int, float) or not math.isfinite(media) or media <= 0)
             or diagnostics.get('pcm_sample_aligned') is False):
