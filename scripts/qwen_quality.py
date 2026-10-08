@@ -28,6 +28,33 @@ def low_information(text):
 
 
 @contextmanager
+def generation_audit(model):
+    """Count actual generated IDs before Qwen strips special tokens/text prefixes."""
+    original=model.model.generate
+    had_override=('generate' in model.model.__dict__ or
+                  not any('generate' in cls.__dict__ for cls in type(model.model).__mro__))
+    calls=[]
+    def generate(*args,**kwargs):
+        output=original(*args,**kwargs)
+        inputs=kwargs.get('input_ids')
+        sequences=getattr(output,'sequences',output)
+        if inputs is None or len(sequences.shape)!=2 or len(inputs.shape)!=2:
+            raise RuntimeError('Unable to inspect Qwen generation completion')
+        count=int(sequences.shape[1]-inputs.shape[1])
+        limit=kwargs.get('max_new_tokens',model.max_new_tokens)
+        if count<0 or type(limit) is not int or limit<=0:
+            raise RuntimeError('Unable to inspect Qwen generation completion')
+        calls.append({'generated_tokens':count,'token_limit':limit})
+        return output
+    model.model.generate=generate
+    try:
+        yield calls
+    finally:
+        if had_override: model.model.generate=original
+        else: del model.model.generate
+
+
+@contextmanager
 def bounded_retry(model, criteria_list, *, seconds=60, tokens=256, clock=time.perf_counter):
     """Cooperative decoding deadline, checked after each generation step.
 
@@ -38,7 +65,8 @@ def bounded_retry(model, criteria_list, *, seconds=60, tokens=256, clock=time.pe
     state = {'timed_out': False}
     original = model.model.generate
     original_tokens = model.max_new_tokens
-    had_override = 'generate' in model.model.__dict__
+    had_override = ('generate' in model.model.__dict__ or
+                    not any('generate' in cls.__dict__ for cls in type(model.model).__mro__))
 
     def stop(input_ids, scores, **kwargs):
         state['timed_out'] = state['timed_out'] or clock() >= deadline

@@ -317,13 +317,14 @@ def workload(slot, course, attempt):
     finally: store.close()
     if queue is None: raise ValueError('Shared queue disappeared')
     validate_queue(plan, queue)
-    pending, remaining, rows = [], [], []
+    pending, remaining, rows, failed = [], [], [], []
     for b in plan['blocks']:
         row = queue['blocks'][str(b['chunk_id'])]
         if row['status'] == 'complete': rows.append(row['result']); continue
+        if row['status'] == 'failed': failed.append(row['result']); continue
         remaining.append(b)
         if row['status'] == 'pending' or row.get('attempt', attempt) < attempt: pending.append(b)
-    return {'complete': not remaining, 'pending_blocks': len(pending), 'remaining_blocks': len(remaining),
+    return {'complete': not remaining and not failed, 'settled': not remaining, 'failed_blocks': len(failed), 'pending_blocks': len(pending), 'remaining_blocks': len(remaining),
             'remaining_seconds': sum(b['end']-b['start'] for b in remaining),
             'worker_cap': len(plan['shards']), 'rtf': estimate_rtf(rows, plan.get('runner_policy', {}).get('cost_rtf', DEFAULT_RTF)), 'attempt': attempt}
 
@@ -341,7 +342,7 @@ def refresh_phases(state, works):
         if any(t['conclusion'] != 'success' for t in relevant):
             course['phase'] = 'failed'; course.pop('plan', None); continue
         if phase == 'prepare': course['phase'] = 'asr'
-        elif phase == 'asr' and works.get(slot, {}).get('complete'): course['phase'] = 'gather'
+        elif phase == 'asr' and (works.get(slot, {}).get('complete') or works.get(slot, {}).get('settled')): course['phase'] = 'gather'
         elif phase == 'gather': course['phase'] = 'publish'
         elif phase == 'publish': course['phase'] = 'done'; course.pop('plan', None)
 

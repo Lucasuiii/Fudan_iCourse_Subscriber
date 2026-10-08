@@ -34,7 +34,7 @@ def initialize(plan, files):
 def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, timeout=19500, previous_rows=()):
     """Dependencies injected for multi-worker/concurrent recovery verification."""
     import soundfile as sf
-    from src.ai.qwen_transcriber import QwenTranscriber
+    from src.ai.qwen_transcriber import QwenTranscriber, QwenTokenBudgetError
     if type(worker_id) is not int or not 0 <= worker_id < len(plan['shards']):
         raise ValueError('Invalid dynamic worker slot')
     queue = SharedQueue(plan, store)
@@ -46,7 +46,7 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
         shards.seal({'local.json': shards.encoded({'plan_hash': fingerprint(plan),
                     'worker_id': worker_id, 'chunks': local_rows})}, role, shards.root()/'out'/'shared-local.enc')
     save_local()
-    phase = 'restore'; failure = None; cleanup_errors = []
+    phase = 'restore'; failure = None; cleanup_errors = []; active_block = None
     try:
         queue.restore_rows(previous_rows, attempt)
         while True:
@@ -57,6 +57,7 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
             if claim is None:
                 break  # Other workers finish their claims; no idle poll/model init.
             block, token = claim
+            active_block = {k:block[k] for k in ('chunk_id','start','end')}
             saved_locally = False
             try:
                 if transcriber is None:
@@ -114,9 +115,17 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
         from scripts.coordination_transport import diagnostic
         audit = {'worker_id': worker_id, 'run_attempt': attempt,
                  'phase': phase if failure else 'cleanup' if cleanup_errors else 'complete',
-                 'local_completed_blocks': len(local_rows), 'queue_snapshot_saved': snapshot_saved,
+                 'local_completed_blocks': sum(not r.get('missing_intervals') for r in local_rows),
+                 'local_terminal_blocks': len(local_rows), 'queue_snapshot_saved': snapshot_saved,
+                 'active_block': active_block if failure else None,
+                 'block_diagnostics': [{'chunk_id':r['chunk_id'], 'start':r['start'], 'end':r['end'],
+                     'quality_state':r.get('quality_state'),
+                     'recognition_attempts':r.get('recognition_attempts',[]),
+                     'missing_intervals':r.get('missing_intervals',[])}
+                     for r in local_rows if r.get('recognition_attempts') or r.get('missing_intervals')],
                  'error_code': failure_code(primary) if primary else None,
                  'secondary_error_codes': [failure_code(e) for e in cleanup_errors]}
+        if isinstance(primary,QwenTokenBudgetError): audit['recognition_failure'] = primary.diagnostic
         if diagnostic(primary): audit['coordination'] = diagnostic(primary)
         target = shards.root()/'out'/'worker-audit.json'
         try:
@@ -125,5 +134,6 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
         except Exception:
             if primary is None: raise
         if failure is None and cleanup_errors: raise cleanup_errors[0]
-    return {'decoded_chunk_ids': decoded, 'seconds': time.monotonic()-began,
+    return {'decoded_chunk_ids': decoded,
+            'failed_chunk_ids': [r['chunk_id'] for r in local_rows if r.get('missing_intervals')], 'seconds': time.monotonic()-began,
             'worker_id': worker_id, 'run_attempt': attempt}

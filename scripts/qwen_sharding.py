@@ -158,6 +158,30 @@ def validate_plan(plan):
         raise ValueError('Missing or duplicate block allocation')
 
 
+def incomplete_row(row):
+    return bool(row.get('missing_intervals')) or row.get('quality_state') == 'missing_audio'
+
+
+def validate_block_row(block, row):
+    if (not isinstance(row, dict) or type(row.get('chunk_id')) is not int
+            or row['chunk_id'] != block['chunk_id']
+            or row.get('start') != block['start'] or row.get('end') != block['end']
+            or not isinstance(row.get('text'), str)):
+        raise ValueError('Result changed original timestamps or text format')
+    gaps=row.get('missing_intervals', [])
+    if not isinstance(gaps,list) or (row.get('quality_state') == 'missing_audio' and not gaps):
+        raise ValueError('Missing recognition requires explicit audio intervals')
+    previous=block['start']
+    for gap in gaps:
+        if (not isinstance(gap,dict) or any(type(gap.get(k)) not in (int,float)
+                or not math.isfinite(gap[k]) for k in ('start','end'))
+                or not previous <= gap['start'] < gap['end'] <= block['end']
+                or gap.get('error_code') not in ('qwen_token_budget','retry_timeout',
+                    'unresolved_context_echo','worker_deadline')):
+            raise ValueError('Invalid missing recognition interval')
+        previous=gap['end']
+
+
 def validate_result(plan, result, shard_id, *, require_complete=False):
     validate_plan(plan)
     if type(shard_id) is not int or not 0 <= shard_id < len(plan['shards']):
@@ -172,13 +196,12 @@ def validate_result(plan, result, shard_id, *, require_complete=False):
         if type(n) is not int or n not in expected or n in seen:
             raise ValueError('Unexpected or duplicate result block')
         block = plan['blocks'][n]
-        if (row.get('start') != block['start'] or row.get('end') != block['end']
-                or not isinstance(row.get('text'), str)):
-            raise ValueError('Result changed original timestamps or text format')
+        validate_block_row(block,row)
         seen.add(n)
-    if result.get('complete') is True and seen != expected:
+    missing=any(incomplete_row(row) for row in result['chunks'])
+    if result.get('complete') is True and (seen != expected or missing):
         raise ValueError('Shard claimed success with missing blocks')
-    if require_complete and (result.get('complete') is not True or seen != expected):
+    if require_complete and (result.get('complete') is not True or seen != expected or missing):
         raise ValueError('Shard incomplete; summary forbidden')
     return seen
 

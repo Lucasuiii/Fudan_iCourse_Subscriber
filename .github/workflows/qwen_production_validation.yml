@@ -30,6 +30,10 @@ name: Qwen Production Pipeline Validation
         description: One auth-only probe with encrypted stage diagnostics; no media, database or models
         type: boolean
         default: false
+      inspect_block_failures:
+        description: Read ended worker claim history; export block IDs and intervals only, no recognition
+        type: boolean
+        default: false
   push:
     branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool]
     paths:
@@ -120,7 +124,7 @@ permissions:
   contents: read
 jobs:
   export:
-    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication && !inputs.inspect_block_failures }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -152,7 +156,7 @@ jobs:
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   inspect-audio:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication && !inputs.inspect_block_failures }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -187,7 +191,7 @@ jobs:
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   inspect-source-metadata:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_source_metadata && !inputs.inspect_audio && !inputs.inspect_authentication }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_source_metadata && !inputs.inspect_audio && !inputs.inspect_authentication && !inputs.inspect_block_failures }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -224,7 +228,7 @@ jobs:
     - run: python -m scripts.production_qwen clean
       if: ${{ always() }}
   inspect-authentication:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_authentication && !inputs.inspect_audio && !inputs.inspect_source_metadata }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_authentication && !inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_block_failures }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -253,6 +257,36 @@ jobs:
         if-no-files-found: ignore
     - run: python -c "import os,shutil; shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'],'qwen-shards'),ignore_errors=True)"
       if: ${{ always() }}
+  inspect-block-failures:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_block_failures && !inputs.inspect_audio && !inputs.inspect_source_metadata && !inputs.inspect_authentication && !inputs.include_transcript }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_SLOT: ${{ inputs.source_slot }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome
+    - run: python -m scripts.production_block_inspection
+    - uses: actions/upload-artifact@v4
+      with:
+        name: qwen-block-inspection
+        path: ${{ runner.temp }}/qwen-shards/out/block-inspection.json
+        retention-days: 7
+        if-no-files-found: error
+    - run: python -c "import os,shutil; shutil.rmtree(os.path.join(os.environ['RUNNER_TEMP'],'qwen-shards'),ignore_errors=True)"
+      if: ${{ always() }}
   validate:
     if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
@@ -277,6 +311,6 @@ jobs:
     - name: Authentication verification and bounded HTTP source diagnostics
       run: PYTHONPATH=tests python -m unittest test_webvpn_auth_diagnostics test_auth_recovery test_production_byte_ranges test_media_transport test_media_session test_media_acquisition
     - name: Coordination retries, primary errors and pre-worker diagnostics
-      run: PYTHONPATH=tests python -m unittest test_coordination_recovery
+      run: PYTHONPATH=tests python -m unittest test_coordination_recovery test_qwen_block_recovery
     - name: Assignment focus, local screenshot OCR boundaries and shared cloud quota
       run: PYTHONPATH=tests python -m unittest test_homework_review test_homework_vision test_doubao_asr test_shared_asr_queue test_production_pool test_automatic_glossary test_summarizer_prompt

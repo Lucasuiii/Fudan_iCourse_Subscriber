@@ -86,6 +86,7 @@ def failure_code(error):
     if isinstance(error, CoordinationError): return 'coordination_failure'
     reasons = {
         'Qwen chunk reached its token budget': 'qwen_token_budget',
+        'Qwen recognition incomplete; missing audio intervals': 'qwen_missing_intervals',
         'Incomplete Qwen audio block': 'qwen_incomplete_block',
         'Shared worker time budget reached': 'worker_deadline',
         'Qwen shard timeout': 'worker_deadline',
@@ -561,13 +562,13 @@ def shared_local_checkpoints(plan):
     return saved
 
 
-def shared_results(plan):
+def shared_results(plan, *, require_complete=True):
     """Read-only complete original blocks for gather and private export."""
     from scripts.shared_asr_worker import store_for
     from src.pipeline.asr_queue import SharedQueue
     store = store_for(plan)
     try:
-        return SharedQueue(plan, store).results()
+        return SharedQueue(plan, store).results(require_complete=require_complete)
     finally:
         store.close()
 
@@ -1040,6 +1041,7 @@ def gather():
     course, lecture = spec['course_id'], spec['lecture']; sub_id = str(lecture['sub_id'])
     material = spec.get('material')
     initial_errors = db.get_lecture(sub_id).get('error_count') or 0
+    missing_intervals = []
 
     def checkpoint():
         row = db.get_lecture(sub_id)
@@ -1099,7 +1101,8 @@ def gather():
                 homework_vision_call_statuses=[c['status'] for c in review.get('homework', {}).get('vision_calls', [])],
                 homework_vision_frame_count=sum(len(c.get('images', [])) for c in review.get('homework', {}).get('vision_calls', [])),
                 homework_vision_image_count=sum(c.get('image_count', 0) for c in review.get('homework', {}).get('vision_calls', [])),
-                asr_complete=bool(material and material.get('complete')))
+                missing_intervals=missing_intervals,
+                asr_complete=bool(material and material.get('complete') and not missing_intervals))
             out('validation-result.json').write_bytes(shards.encoded(audit))
     db.checkpoint = checkpoint
     try:
@@ -1109,14 +1112,22 @@ def gather():
             from src.pipeline.prepared_lecture import assemble_material
             plan = spec['plan']
             if plan.get('execution') == 'shared_queue':
-                results = shared_results(plan)  # All original blocks must be complete.
+                results = shared_results(plan, require_complete=False)
             else:
                 results = []
                 for shard in plan['shards']:
                     path = root()/'results'/f'qwen-production-asr-{slot}-{shard["shard_id"]}'/'worker-result.enc'
                     result = read_json(decode(path, f'result-{shard["shard_id"]}')['result.json'])
-                    validate_result(plan, result, shard['shard_id'], require_complete=True)
+                    validate_result(plan, result, shard['shard_id'])
                     results.append(result)
+            missing_intervals = [dict(gap,chunk_id=row['chunk_id'])
+                for result in results for row in result['chunks']
+                for gap in row.get('missing_intervals',[])]
+            if missing_intervals:
+                from src.ai.qwen_transcriber import IncompleteQwenRecognitionError
+                raise IncompleteQwenRecognitionError(missing_intervals)
+            for result in results:
+                validate_result(plan,result,result['shard_id'],require_complete=True)
             if hashlib.sha256(files['lecture.flac']).hexdigest() != plan['audio_sha256']:
                 raise ValueError('Prepared audio hash changed')
             flac = root()/'lecture.flac'; flac.write_bytes(files['lecture.flac'])
