@@ -595,11 +595,17 @@ class ScopedPublicationTests(unittest.TestCase):
 
 
 class FormalWorkflowTests(unittest.TestCase):
-    def test_scheduled_entry_uses_same_bounded_pipeline_and_retains_cron(self):
+    def test_daily_primary_and_manual_entry_use_same_bounded_pipeline(self):
         caller=yaml.load((ROOT/'.github/workflows/check.yml').read_text(),Loader=yaml.BaseLoader)
         formal=yaml.load((ROOT/'.github/workflows/parallel_pilot.yml').read_text(),Loader=yaml.BaseLoader)
         child=yaml.load((ROOT/'.github/workflows/qwen_production_lecture.yml').read_text(),Loader=yaml.BaseLoader)
-        self.assertEqual([v['cron'] for v in caller['on']['schedule']],['7 9 * * *','7 12 * * *'])
+        self.assertEqual([v['cron'] for v in caller['on']['schedule']],['7 9 * * *'])
+        self.assertIn('workflow_dispatch',caller['on'])
+        self.assertEqual(set(caller['jobs']),{'check'})
+        self.assertNotIn('needs',caller['jobs']['check'])
+        self.assertNotIn('if',caller['jobs']['check'])
+        self.assertEqual(caller['jobs']['check']['with']['publish_results'],'true')
+        self.assertEqual(caller['jobs']['check']['with']['send_email'],'true')
         self.assertEqual(caller['jobs']['check']['uses'],'./.github/workflows/parallel_pilot.yml')
         self.assertIn('concurrency',caller);self.assertIn('concurrency',formal);self.assertNotIn('concurrency',child)
         self.assertEqual(caller['jobs']['check']['with']['caller_holds_lock'],'true')
