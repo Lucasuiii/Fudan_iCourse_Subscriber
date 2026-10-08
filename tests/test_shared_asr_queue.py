@@ -214,7 +214,7 @@ class SharedQueueTests(unittest.TestCase):
         from src.ai.qwen_transcriber import QwenTranscriber
         qwen = QwenTranscriber.__new__(QwenTranscriber)
         qwen.last_vad_windows = []; qwen._init = MagicMock()
-        qwen._recognize = MagicMock(side_effect=lambda samples: {'text': '矩阵'})
+        qwen._recognize = MagicMock(side_effect=lambda samples, **kwargs: {'text': '矩阵'})
         qwen.release_model = MagicMock()
         block = {'chunk_id': 0, 'start': 0, 'end': 1}
         for _ in range(2):

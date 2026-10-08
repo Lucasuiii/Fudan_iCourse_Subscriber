@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from enum import Enum
 from http.client import IncompleteRead
 import re
+import ssl
 import threading
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
 import requests
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import ReadTimeoutError, SSLError as UrllibSSLError
 
 
 class MediaTransportError(RuntimeError):
@@ -26,14 +27,18 @@ class MediaTransportError(RuntimeError):
 def connection_failure_code(error):
     """Inspect bounded exception types, never parse or retain provider messages."""
     pending = [error]
+    observed = []
     for _ in range(8):
         if not pending: break
         current = pending.pop()
-        if isinstance(current, IncompleteRead): return 'upstream_premature_eof'
-        if isinstance(current, (TimeoutError, requests.exceptions.Timeout, ReadTimeoutError)):
-            return 'upstream_timeout'
+        observed.append(current)
         pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
         if current.__cause__ is not None: pending.append(current.__cause__)
+    if any(isinstance(e, (ssl.SSLError, requests.exceptions.SSLError, UrllibSSLError)) for e in observed):
+        return 'upstream_tls_error'
+    if any(isinstance(e, IncompleteRead) for e in observed): return 'upstream_premature_eof'
+    if any(isinstance(e, (TimeoutError, requests.exceptions.Timeout, ReadTimeoutError)) for e in observed):
+        return 'upstream_timeout'
     return 'upstream_connection_error'
 
 

@@ -157,6 +157,7 @@ class SignedRangeRelay:
         with self._audit_lock:
             self._audit['media_auth'] = dict(getattr(self.client, 'media_auth_audit', {}))
         if self._stop.is_set(): raise MediaTransportError('stopped')
+        if self._audit['media_auth'].get('failure') == 'auth_tls_error': self._fail('upstream_tls_error')
         if not success: self._fail('media_session_unavailable')
         self._count('session_refresh_successes')
 

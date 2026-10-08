@@ -21,8 +21,10 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: icourse-resource-acquisition
+  group: ${{ github.event_name == 'push' && format('icourse-resource-registration-{0}', github.run_id)
+    || format('icourse-data-{0}', github.repository) }}
   cancel-in-progress: false
+  queue: max
 env:
   GH_TOKEN: ${{ github.token }}
   DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}

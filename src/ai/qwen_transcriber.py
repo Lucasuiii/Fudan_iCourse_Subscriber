@@ -1,6 +1,7 @@
 """Qwen-only CPU recognizer: bounded two-minute blocks, silence-aware VAD."""
 from __future__ import annotations
 import gc
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import re
@@ -84,12 +85,17 @@ class QwenTranscriber:
         self._model=None
         gc.collect()
 
-    def _recognize(self, samples, *, unhinted=False):
+    def _recognize(self, samples, *, unhinted=False, deadline=None):
         import torch
         from transformers import StoppingCriteriaList
         context=('术语：'+'、'.join(self._terms)) if self._terms and not unhinted else ''
-        with generation_audit(self._model) as generations, torch.inference_mode():
+        limit = (bounded_retry(self._model,StoppingCriteriaList,
+                    seconds=max(0,deadline-time.monotonic()),tokens=NORMAL_TOKENS,
+                    clock=time.monotonic) if deadline is not None else nullcontext({'timed_out':False}))
+        with limit as state, generation_audit(self._model) as generations, torch.inference_mode():
             result=self._model.transcribe(audio=(samples,RATE),context=context,language='Chinese')[0]
+        if state['timed_out'] or deadline is not None and time.monotonic() >= deadline:
+            return {'text':'','quality_state':'retry_timeout'}
         row={'text':result.text,'quality_state':'recognized'}
         def check(result, phase, limit, generations):
             tokens=len(self._model.processor.tokenizer.encode(result.text,add_special_tokens=False))
@@ -99,7 +105,11 @@ class QwenTranscriber:
                     capped['generated_tokens'] if capped else None)
         check(result,'normal',NORMAL_TOKENS,generations)
         if context and context_echo(result.text,context):
-            with bounded_retry(self._model,StoppingCriteriaList) as state, \
+            if deadline is not None and time.monotonic() >= deadline:
+                return {'text':'','quality_state':'retry_timeout'}
+            with bounded_retry(self._model,StoppingCriteriaList,
+                    seconds=min(60,max(0,deadline-time.monotonic())) if deadline is not None else 60,
+                    clock=time.monotonic) as state, \
                     generation_audit(self._model) as generations, torch.inference_mode():
                 result=self._model.transcribe(audio=(samples,RATE),context='',language='Chinese')[0]
             check(result,'unhinted_echo_retry',UNHINTED_TOKENS,generations)
@@ -139,7 +149,9 @@ class QwenTranscriber:
                     if state['timed_out']:
                         row={'text':'','quality_state':'retry_timeout'}
                 else:
-                    row=self._recognize(samples[a:b])
+                    row=self._recognize(samples[a:b],deadline=deadline)
+                if time.monotonic() >= deadline:
+                    row={'text':'','quality_state':'retry_timeout'}
                 if row.get('quality_state') in ('retry_timeout','unresolved_context_echo'):
                     issue={'error_code':row['quality_state']}
                 else:
@@ -257,7 +269,7 @@ class QwenTranscriber:
                 raise TimeoutError('Qwen shard timeout')
             self._init()
             for i, block in enumerate(blocks):
-                if time.monotonic()-began>timeout:
+                if time.monotonic()-began>=timeout:
                     raise TimeoutError('Qwen shard timeout')
                 samples=load_samples(block)
                 expected=round(block['end']*RATE)-round(block['start']*RATE)

@@ -160,6 +160,9 @@ class ICourseClient:
                 return False
             self._userinfo = user
             return True
+        except requests.exceptions.SSLError:
+            self.media_auth_audit['failure'] = 'auth_tls_error'
+            return False
         except Exception:
             self.media_auth_audit['failure'] = 'existing_session_exception'
             return False
@@ -167,7 +170,7 @@ class ICourseClient:
     def reauthenticate_media_session(self, stopped, *, timeout=75):
         """Bounded fresh login; rejected/late sessions are never adopted."""
         if (self._media_reauth_factory is None or stopped.is_set()
-                or self.media_auth_audit.get('failure') == 'identity_mismatch'):
+                or self.media_auth_audit.get('failure') in ('identity_mismatch', 'auth_tls_error')):
             return False
         cancelled = threading.Event()
         deadline = time.monotonic()+timeout

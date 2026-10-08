@@ -82,7 +82,7 @@ def run_worker(plan, files, store, worker_id, attempt, *, transcriber=None, time
                     phase = 'remote_checkpoint'
                     queue.finish(block['chunk_id'], token, rows[0])
                 phase = 'recognize'
-                transcriber.recognize_blocks([block], load, timeout=max(1, timeout-(time.monotonic()-began)),
+                transcriber.recognize_blocks([block], load, timeout=max(0, timeout-(time.monotonic()-began)),
                     checkpoint=completed, keep_model=True)
                 decoded.append(block['chunk_id'])
             except BaseException:
