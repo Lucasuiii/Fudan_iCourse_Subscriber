@@ -241,6 +241,74 @@ class ClassroomSelectionTests(unittest.TestCase):
         with patch.dict(os.environ, {'VALIDATION_LECTURE_RANK': '2', 'VALIDATION_COURSE_ID': ''}):
             with self.assertRaises(ValueError): pipeline.validation_course()
 
+    def test_multiple_ranks_are_bounded_unique_and_only_allowed_for_one_isolated_course(self):
+        with patch.dict(os.environ, {'VALIDATION_COURSE_ID':'10', 'COURSE_IDS':'10,20',
+                'VALIDATION_LECTURE_RANK':'1', 'VALIDATION_LECTURE_RANKS':'1,2',
+                'VALIDATION_BEFORE_DATE':'', 'VALIDATION_SOURCE_RUN_ID':'',
+                'VALIDATION_SELECTION_RUN_ID':'', 'PUBLISH_RESULTS':'false', 'SEND_EMAIL':'false'}):
+            self.assertEqual(pipeline.validation_ranks(), [1,2])
+            self.assertEqual(pipeline.validation_course(), '10')
+            for raw in ('1,1', '01,1', '0,2', '1,11', '1,,2', '1.0,2', '١,2', '1,2,3,4,5,6'):
+                with self.subTest(raw=raw), patch.dict(os.environ, {'VALIDATION_LECTURE_RANKS':raw}):
+                    with self.assertRaises(ValueError): pipeline.validation_ranks()
+            for change in ({'VALIDATION_COURSE_ID':''}, {'VALIDATION_COURSE_ID':'10,20'},
+                           {'VALIDATION_SOURCE_RUN_ID':'99'}, {'VALIDATION_LECTURE_RANK':'2'},
+                           {'PUBLISH_RESULTS':'true'}, {'SEND_EMAIL':'true'}):
+                with self.subTest(change=change), patch.dict(os.environ,change):
+                    with self.assertRaises(ValueError): pipeline.validation_course()
+
+    def test_same_course_two_lectures_share_one_pool_and_keep_frozen_slots_on_rerun(self):
+        from test_shared_asr_queue import MemoryStore
+        store=MemoryStore(None)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+                'RUNNER_TEMP':tmp,'GITHUB_RUN_ID':'99','GITHUB_RUN_ATTEMPT':'1',
+                'GITHUB_SHA':'a'*40,'GITHUB_REPOSITORY':'owner/repo',
+                'COURSE_SLOT':'0','DB_ENCRYPTION_KEY':'k'*32,'QWEN_PRODUCTION_TASK':'true',
+                'VALIDATION_COURSE_ID':'10','COURSE_IDS':'10','SHARD_MODE':'shared',
+                'VALIDATION_LECTURE_RANK':'1','VALIDATION_LECTURE_RANKS':'1,2',
+                'VALIDATION_BEFORE_DATE':'','VALIDATION_SOURCE_RUN_ID':'','VALIDATION_SELECTION_RUN_ID':'',
+                'AUTO_COURSE_TERMS':'false','PUBLISH_RESULTS':'false','SEND_EMAIL':'false'}), \
+             patch('scripts.production_pool.store_for',return_value=store):
+            root=pipeline.root();db=database(root/'history-fixture.db',summary='历史摘要')
+            db.insert_lecture('2','10','前一堂','2026-09-29')
+            db.update_summary('2','前一堂历史摘要','test');db.mark_processed('2')
+            original=snapshot(db,root/'original.db');db.conn.close()
+            client=MagicMock();client.get_course_detail.return_value={'title':'概率论','lectures':[
+                {'sub_id':'1','date':'2026-10-04'},{'sub_id':'2','date':'2026-09-29'}]}
+            client.get_video_url.return_value='https://private.example/recording'
+            fake_main=SimpleNamespace(login_with_retry=lambda:None,_enumerate_lectures=MagicMock(),
+                _crawl_semester_catalog=MagicMock())
+            with patch.dict('sys.modules',{'main':fake_main}), patch.object(pipeline,'artifact',return_value=False), \
+                 patch.object(pipeline,'load_remote',side_effect=lambda path:path.write_bytes(original)), \
+                 patch('src.api.icourse.ICourseClient',return_value=client), patch.object(pipeline,'write_outputs'):
+                pipeline.plan()
+            saved=pipeline.decode(root/'out'/'queue.enc','queue');tasks=json.loads(saved['queue.json'])
+            self.assertEqual([(t[0],t[2]['sub_id'],t[2]['_validation']['playable_rank']) for t in tasks],
+                [('10','1',1),('10','2',2)])
+            self.assertEqual(store.state['task_count'],2)
+            self.assertEqual(set(store.state['courses']),{'0','1'})
+            (root/'fresh.db').write_bytes(saved['database.db']);db=Database(str(root/'fresh.db'))
+            self.assertIsNone(db.get_lecture('1')['summary']);self.assertIsNone(db.get_lecture('2')['summary'])
+            db.conn.close()
+            (root/'preserved.db').write_bytes(saved['history.db']);db=Database(str(root/'preserved.db'))
+            self.assertEqual(db.get_lecture('1')['summary'],'历史摘要')
+            self.assertEqual(db.get_lecture('2')['summary'],'前一堂历史摘要');db.conn.close()
+            audit=json.loads((root/'out'/'validation-selection.json').read_text())
+            self.assertEqual([(r['task_slot'],r['course_id'],r['playable_rank']) for r in audit['courses']],
+                [(0,'10',1),(1,'10',2)])
+            self.assertNotIn('sub_id',json.dumps(audit));self.assertNotIn('https:',json.dumps(audit))
+            with patch.dict(os.environ,{'GITHUB_RUN_ATTEMPT':'2'}), patch.object(pipeline,'artifact',return_value=True), \
+                 patch.object(pipeline,'decode',return_value=saved), patch.object(pipeline,'latest_validation_task') as select, \
+                 patch.object(pipeline,'write_outputs'):
+                pipeline.plan();select.assert_not_called()
+                for changes in ({'VALIDATION_LECTURE_RANKS':'2,1'},{'VALIDATION_LECTURE_RANKS':'1'}):
+                    with patch.dict(os.environ,changes):
+                        with self.assertRaises(ValueError): pipeline.plan()
+                tampered=dict(saved,**{'queue.json':pipeline.shards.encoded(list(reversed(tasks)))})
+                with patch.object(pipeline,'decode',return_value=tampered):
+                    with self.assertRaises(ValueError): pipeline.plan()
+            fake_main._enumerate_lectures.assert_not_called();fake_main._crawl_semester_catalog.assert_not_called()
+
     def test_rerun_cannot_change_the_selected_recording_rank(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             'RUNNER_TEMP': tmp, 'VALIDATION_COURSE_ID': '38404', 'VALIDATION_LECTURE_RANK': '2',

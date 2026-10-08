@@ -225,6 +225,7 @@ def validate_checkpoint_age(saved, run, slot, *, prior_only=False):
 def validation_course():
     course = os.environ.get('VALIDATION_COURSE_ID', '').strip()
     rank = validation_rank()
+    ranks = validation_ranks()
     source = os.environ.get('VALIDATION_SOURCE_RUN_ID', '').strip()
     selection_source = os.environ.get('VALIDATION_SELECTION_RUN_ID', '').strip()
     if selection_source and (not selection_source.isascii() or not selection_source.isdigit()):
@@ -233,14 +234,17 @@ def validation_course():
         raise ValueError('Conflicting validation sources')
     if source and (not source.isascii() or not source.isdigit()):
         raise ValueError('Invalid validation source run')
-    if not course and (rank != 1 or validation_before_date() or source or selection_source):
+    if not course and (rank != 1 or os.environ.get('VALIDATION_LECTURE_RANKS', '').strip()
+                       or validation_before_date() or source or selection_source):
         raise ValueError('Recording rank is only allowed in isolated course validation')
     if course:
         courses = [item.strip() for item in course.split(',')]
         if (len(courses) > 5 or len(set(courses)) != len(courses)
                 or any(not item.isascii() or not item.isdigit() for item in courses)):
             raise ValueError('Invalid validation courses')
-        if source and len(courses) != 1:
+        if len(ranks) > 1 and len(courses) != 1:
+            raise ValueError('Multiple recording ranks require exactly one validation course')
+        if source and (len(courses) != 1 or len(ranks) != 1):
             raise ValueError('Source-run validation requires exactly one course')
         course = ','.join(courses)
         if os.environ.get('PUBLISH_RESULTS') != 'false' or os.environ.get('SEND_EMAIL') != 'false':
@@ -255,6 +259,20 @@ def validation_rank():
     if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 10:
         raise ValueError('Invalid reverse recording rank')
     return int(raw)
+
+
+def validation_ranks():
+    raw = os.environ.get('VALIDATION_LECTURE_RANKS', '').strip()
+    if not raw: return [validation_rank()]
+    if validation_rank() != 1:
+        raise ValueError('Conflicting validation recording ranks')
+    values = [part.strip() for part in raw.split(',')]
+    if (not 1 <= len(values) <= 5 or any(not v.isascii() or not v.isdigit()
+            or not 1 <= int(v) <= 10 for v in values)):
+        raise ValueError('Invalid validation recording ranks')
+    ranks = [int(v) for v in values]
+    if len(set(ranks)) != len(ranks): raise ValueError('Duplicate validation recording ranks')
+    return ranks
 
 
 def validation_before_date():
@@ -415,6 +433,7 @@ def plan():
         verify_previous_pool()  # Also gate legacy mode after an orphaned pool.
     requested = validation_course()
     courses = requested.split(',') if requested else []
+    requested_recordings = [(course, rank) for course in courses for rank in validation_ranks()]
     # On a workflow rerun keep opaque slot identities and exact selections fixed.
     if artifact('qwen-production-queue', root()/'previous'):
         files = decode(root()/'previous'/'queue.enc', 'queue')
@@ -438,8 +457,8 @@ def plan():
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
             if courses:
-                selections = [latest_validation_task(client, db, course, rank=validation_rank(),
-                                                    before_date=validation_before_date()) for course in courses]
+                selections = [latest_validation_task(client, db, course, rank=rank,
+                                                    before_date=validation_before_date()) for course, rank in requested_recordings]
                 history = snapshot(db, root()/'history.db')
                 # A separate scratch database forces this authorized lecture
                 # through ASR even when production already has a summary.
@@ -469,13 +488,13 @@ def plan():
     if len(tasks) > MAX_TASKS or len(set(identities)) != len(identities):
         raise ValueError('Invalid or duplicate lecture queue')
     if courses:
-        if len(tasks) != len(courses) or [str(t[0]) for t in tasks] != courses:
+        if len(tasks) != len(requested_recordings) or [str(t[0]) for t in tasks] != [c for c, _ in requested_recordings]:
             raise ValueError('Validation queue does not match the requested courses')
         from src.runtime.session_rules import lecture_is_selected
         from src.runtime import config
-        for course, task in zip(courses, tasks):
+        for (course, rank), task in zip(requested_recordings, tasks):
             lecture = task[2]; audit = lecture.get('_validation')
-            if (not audit or audit.get('playable_rank', 1) != validation_rank()
+            if (not audit or audit.get('playable_rank', 1) != rank
                     or audit.get('before_date', '') != validation_before_date()
                     or (validation_before_date() and str(lecture.get('date', '')) >= validation_before_date())):
                 raise ValueError('Validation queue does not match the requested recording')
@@ -1315,6 +1334,10 @@ def main():
         audit = {'mode': mode if mode in ('plan', 'prepare', 'worker', 'gather', 'publish', 'deliver', 'finalize') else 'unknown',
                  'error_code': failure_code(error)}
         if diagnostic(error): audit['coordination'] = diagnostic(error)
+        if isinstance(getattr(error, 'auth_failure_diagnostics', None), dict):
+            from src.api.webvpn import authentication_failure
+            audit['authentication'] = authentication_failure(error)
+            audit['error_code'] = audit['authentication']['failure']
         try: out('pipeline-failure.json').write_bytes(shards.encoded(audit))
         except Exception: pass  # Preserve the processing exception on a full disk.
         raise

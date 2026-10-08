@@ -15,6 +15,10 @@ name: iCourse Parallel Pilot
         description: Reverse rank among actual playable recordings (1 latest, 2 penultimate)
         type: number
         default: 1
+      validation_lecture_ranks:
+        description: Optional ranks for one isolated course, e.g. 1,2 (max 5; keep single rank at 1)
+        type: string
+        default: ''
       validation_before_date:
         description: Select only recordings strictly before this date (YYYY-MM-DD)
         type: string
@@ -55,6 +59,9 @@ name: iCourse Parallel Pilot
       validation_lecture_rank:
         type: number
         default: 1
+      validation_lecture_ranks:
+        type: string
+        default: ''
       validation_before_date:
         type: string
         default: ''
@@ -160,6 +167,7 @@ jobs:
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       VALIDATION_COURSE_ID: ${{ inputs.validation_course_id }}
       VALIDATION_LECTURE_RANK: ${{ inputs.validation_lecture_rank }}
+      VALIDATION_LECTURE_RANKS: ${{ inputs.validation_lecture_ranks }}
       VALIDATION_BEFORE_DATE: ${{ inputs.validation_before_date }}
       VALIDATION_SOURCE_RUN_ID: ${{ inputs.validation_source_run_id }}
       VALIDATION_SELECTION_RUN_ID: ${{ inputs.validation_selection_run_id }}
@@ -191,7 +199,9 @@ jobs:
       if: ${{ always() }}
       with:
         name: qwen-production-plan-audit
-        path: ${{ runner.temp }}/qwen-shards/out/plan-audit.json
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/plan-audit.json
+          ${{ runner.temp }}/qwen-shards/out/pipeline-failure.json
         retention-days: 7
         overwrite: true
         if-no-files-found: ignore

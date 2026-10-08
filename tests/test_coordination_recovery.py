@@ -94,6 +94,26 @@ class CoordinationRecoveryTests(unittest.TestCase):
         self.assertEqual(upload['if'], '${{ always() }}')
         self.assertIn('/out/stage-failure.json', upload['with']['path'])
 
+    def test_parent_plan_authentication_failure_retains_fixed_phases_and_is_uploaded(self):
+        error = requests.exceptions.ReadTimeout('private-password-cookie-ticket')
+        error.auth_failure_diagnostics = {'failure_phase':'webvpn_context','error_type':'ReadTimeout',
+            'failure':'auth_read_timeout','auth_attempts':3}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ,{'RUNNER_TEMP':tmp}), \
+             patch('sys.argv',['production_qwen','plan']), patch.object(pipeline,'plan',side_effect=error):
+            with self.assertRaises(requests.exceptions.ReadTimeout): pipeline.main()
+            audit=json.loads(pipeline.out('pipeline-failure.json').read_text())
+        self.assertEqual(audit['authentication']['failure_phase'],'webvpn_context')
+        self.assertEqual(audit['authentication']['auth_attempts'],3)
+        self.assertEqual(audit['error_code'],'auth_read_timeout')
+        self.assertNotIn('private',json.dumps(audit))
+        workflow=yaml.load((ROOT/'.github/workflows/parallel_pilot.yml').read_text(),Loader=yaml.BaseLoader)
+        upload=next(s for s in workflow['jobs']['plan']['steps']
+            if s.get('with',{}).get('name')=='qwen-production-plan-audit')
+        self.assertEqual(upload['if'],'${{ always() }}')
+        self.assertIn('/out/pipeline-failure.json',upload['with']['path'])
+        self.assertEqual(workflow['jobs']['plan']['env']['VALIDATION_LECTURE_RANKS'],
+            '${{ inputs.validation_lecture_ranks }}')
+
     def test_real_git_lost_push_response_and_transient_rejection_keep_same_commit(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'GITHUB_REPOSITORY': 'test/repo'}):
             remote = str(Path(tmp)/'remote.git')
