@@ -35,7 +35,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool, codex/history-refresh]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
@@ -48,6 +48,9 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/qwen_*.py'
     - 'src/data/checkpoint_database.py'
     - 'tests/test_refactor_boundaries.py'
+    - 'scripts/history_refresh.py'
+    - 'scripts/history_review_client.py'
+    - 'tests/test_history_refresh.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'
     - 'scripts/qwen_sharding.py'
@@ -101,6 +104,9 @@ name: Qwen Production Pipeline Validation
     - 'src/ai/qwen_*.py'
     - 'src/data/checkpoint_database.py'
     - 'tests/test_refactor_boundaries.py'
+    - 'scripts/history_refresh.py'
+    - 'scripts/history_review_client.py'
+    - 'tests/test_history_refresh.py'
     - 'src/runtime/scheduler.py'
     - 'src/runtime/media_transport.py'
     - 'src/runtime/media_protocol.py'
@@ -322,6 +328,8 @@ jobs:
         sudo apt-get install -y ffmpeg
     - name: Core imports, explicit checkpoints and stable command entry
       run: PYTHONPATH=tests python -m unittest test_refactor_boundaries
+    - name: Historical preview, encrypted approval, backup and atomic replacement
+      run: PYTHONPATH=tests python -m unittest test_history_refresh
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Prepared audio volumes, artifact transfer and failure retention

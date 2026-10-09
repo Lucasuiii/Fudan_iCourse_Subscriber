@@ -20,10 +20,15 @@ def authorize(parent, nonce, actual_run, *, read, inspect, sleep=time.sleep):
     if info['run_attempt'] != 1:
         raise ValueError('Rerun the parent workflow, not a single pool child')
     parent_info = inspect(parent)
-    if parent_info['path'].split('@')[0] not in ('.github/workflows/check.yml', '.github/workflows/parallel_pilot.yml'):
+    parent_path = parent_info['path'].split('@')[0]
+    if parent_path not in ('.github/workflows/check.yml', '.github/workflows/parallel_pilot.yml',
+                           '.github/workflows/history_refresh.yml'):
         raise ValueError('Unauthorized parent workflow')
     for _ in range(12):
         state = read(); pool.validate(state)
+        if parent_path == '.github/workflows/history_refresh.yml' and (
+                state['task_count'] > 5 or any(v != 'false' for v in state['flags'].values())):
+            raise ValueError('Historical parent must use an isolated bounded preview')
         if state['run_id'] != parent or state['sha'] != info['head_sha'] or state['sha'] != parent_info['head_sha']:
             raise ValueError('Frozen stage source mismatch')
         if info['path'].split('@')[0] != '.github/workflows/'+pool.WORKFLOW or info['display_title'] != f'icourse-stage-{parent}-{nonce}':

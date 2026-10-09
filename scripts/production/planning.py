@@ -214,6 +214,11 @@ def latest_validation_task(runtime, client, db, course, *, today=None, rank=1, b
 
 
 def plan(runtime):
+    historical = os.environ.get('HISTORY_REFRESH_TARGETS', '').strip()
+    if historical:
+        from scripts import history_refresh
+        selected = history_refresh.policy.request(historical)
+        history_refresh.isolated_flags()
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         from scripts.production_pool import verify_previous_pool
         verify_previous_pool()  # Also gate legacy mode after an orphaned pool.
@@ -239,10 +244,13 @@ def plan(runtime):
         from src.runtime.reporter import Reporter
         db = runtime.Database(str(runtime.root()/'queue.db'))
         try:
-            db.conn.close(); runtime.load_remote(runtime.root()/'queue.db'); db = runtime.Database(str(runtime.root()/'queue.db'))
+            db.conn.close(); revision = runtime.load_remote(runtime.root()/'queue.db'); db = runtime.Database(str(runtime.root()/'queue.db'))
             reporter = Reporter()
             client = ICourseClient(login_with_retry())
-            if courses:
+            if historical:
+                files = history_refresh.selection(runtime, client, db, revision, selected)
+                tasks = runtime.read_json(files['queue.json'])
+            elif courses:
                 selections = [runtime.latest_validation_task(client, db, course, rank=rank,
                                                     before_date=runtime.validation_before_date()) for course, rank in requested_recordings]
                 history = runtime.snapshot(db, runtime.root()/'history.db')
@@ -264,15 +272,22 @@ def plan(runtime):
                 tasks = [t for t in tasks if (db.get_lecture(str(t[2]['sub_id'])).get('error_count') or 0) < 3]
             if len(tasks) > runtime.MAX_TASKS:
                 raise ValueError('Queue exceeds 256 tasks; narrow the subscribed course scope')
-            files = {'queue.json': runtime.shards.encoded(tasks), 'database.db': runtime.snapshot(db, runtime.root()/'snapshot.db')}
-            if courses: files['history.db'] = history
-            else: files['enumeration.json'] = runtime.shards.encoded(enumeration.public_audit())
+            if not historical:
+                files = {'queue.json': runtime.shards.encoded(tasks), 'database.db': runtime.snapshot(db, runtime.root()/'snapshot.db')}
+                if courses: files['history.db'] = history
+                else: files['enumeration.json'] = runtime.shards.encoded(enumeration.public_audit())
         finally:
             db.conn.close()
     tasks = runtime.read_json(files['queue.json'])
     identities = [(str(t[0]), str(t[2]['sub_id'])) for t in tasks]
     if len(tasks) > runtime.MAX_TASKS or len(set(identities)) != len(identities):
         raise ValueError('Invalid or duplicate lecture queue')
+    if historical:
+        history_refresh.validate_queue(files, selected)
+        runtime.out('plan-audit.json').write_bytes(runtime.shards.encoded({
+            'mode': 'historical_preview', 'lecture_count': len(tasks), 'publication': False, 'email': False}))
+    elif 'history-refresh.json' in files:
+        raise ValueError('Historical queue requires explicit original selection')
     if courses:
         if len(tasks) != len(requested_recordings) or [str(t[0]) for t in tasks] != [c for c, _ in requested_recordings]:
             raise ValueError('Validation queue does not match the requested courses')
