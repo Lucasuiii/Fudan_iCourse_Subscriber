@@ -62,4 +62,3 @@ def worker(runtime):
     if runtime.artifact(f'qwen-production-asr-{os.environ["COURSE_SLOT"]}-{shard_id}', runtime.root()/'previous'):
         shutil.copyfile(runtime.root()/'previous'/'worker-result.enc', runtime.out('worker-result.enc'))
     runtime.shards.worker()
-

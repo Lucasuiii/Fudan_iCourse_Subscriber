@@ -179,4 +179,3 @@ def gather(runtime):
         raise
     finally:
         db.conn.close()
-

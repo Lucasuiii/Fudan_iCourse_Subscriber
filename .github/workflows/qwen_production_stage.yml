@@ -55,37 +55,12 @@ jobs:
       if: ${{ steps.authorize.outputs.stage == 'prepare' || steps.authorize.outputs.stage == 'gather' }}
       with:
         inference: ${{ steps.authorize.outputs.stage == 'gather' && 'true' || 'false' }}
-    - run: |-
-        python -m pip install cryptography soundfile
-        if [ "$SHARD_ID" != '-1' ]; then
-          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install qwen-asr==0.0.6 --no-deps
-          python -m pip install transformers==4.57.6 accelerate==1.12.0 nagisa==0.2.11 soynlp==0.0.493 librosa qwen-omni-utils sox
-        fi
+    - uses: ./.github/actions/qwen-asr-runtime
       if: ${{ steps.authorize.outputs.stage == 'asr' }}
-    - uses: actions/cache@v4
       with:
-        path: ~/.cache/huggingface/hub
-        key: qwen-production-asr-7278e1e-cpu-v1
-      if: ${{ steps.authorize.outputs.stage == 'asr' }}
-    - name: Execute reserved pipeline stage
-      if: ${{ steps.authorize.outcome == 'success' && steps.authorize.outputs.stage != 'gather' }}
-      run: python -m scripts.production_pool_stage execute
-      env:
-        COURSE_IDS: ${{ steps.authorize.outputs.stage != 'asr' && secrets.COURSE_IDS || '' }}
-        DOUBAO_ASR_API_KEY: ${{ steps.authorize.outputs.stage != 'asr' && secrets.DOUBAO_ASR_API_KEY || '' }}
-        TAVILY_API_KEY: ${{ steps.authorize.outputs.stage != 'asr' && secrets.TAVILY_API_KEY || '' }}
-        DASHSCOPE_API_KEY: ${{ steps.authorize.outputs.stage != 'asr' && secrets.DASHSCOPE_API_KEY || '' }}
-        SMTP_PASSWORD: ${{ steps.authorize.outputs.stage != 'asr' && secrets.SMTP_PASSWORD || '' }}
-        DEEPSEEK_API_KEY: ${{ steps.authorize.outputs.stage != 'asr' && secrets.DEEPSEEK_API_KEY || '' }}
-        GEMINI_API_KEY: ${{ steps.authorize.outputs.stage != 'asr' && secrets.GEMINI_API_KEY || '' }}
-        DASHSCOPE_BASE_URL: ${{ steps.authorize.outputs.stage != 'asr' && secrets.DASHSCOPE_BASE_URL || '' }}
-        DEEPSEEK_BASE_URL: ${{ steps.authorize.outputs.stage != 'asr' && secrets.DEEPSEEK_BASE_URL || '' }}
-        GEMINI_BASE_URL: ${{ steps.authorize.outputs.stage != 'asr' && secrets.GEMINI_BASE_URL || '' }}
-        StuId: ${{ steps.authorize.outputs.stage != 'asr' && secrets.STUID || '' }}
-        UISPsw: ${{ steps.authorize.outputs.stage != 'asr' && secrets.UISPSW || '' }}
-    - name: Finalize through LectureRunner with saved quota
-      if: ${{ steps.authorize.outcome == 'success' && steps.authorize.outputs.stage == 'gather' }}
+        inference: ${{ env.SHARD_ID != '-1' }}
+    - name: ${{ steps.authorize.outputs.stage == 'gather' && 'Finalize through LectureRunner with saved quota' || 'Execute reserved pipeline stage' }}
+      if: ${{ steps.authorize.outcome == 'success' }}
       run: python -m scripts.production_pool_stage execute
       env:
         COURSE_IDS: ${{ steps.authorize.outputs.stage != 'asr' && secrets.COURSE_IDS || '' }}

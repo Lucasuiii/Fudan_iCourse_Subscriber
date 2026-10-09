@@ -315,4 +315,3 @@ def plan(runtime):
         runtime.out('plan-audit.json').write_bytes(files['enumeration.json'])
     runtime.write_outputs(tasks={'include': [{'task_slot': i} for i in range(len(tasks))]}, count=len(tasks))
     print(f'Planned {len(tasks)} lectures; at most 5 active pipelines and 15 runners', flush=True)
-

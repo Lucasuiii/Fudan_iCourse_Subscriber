@@ -152,4 +152,3 @@ def finalize(runtime):
     if runtime.read_json(queue.get('enumeration.json', b'{}')).get('failed_course_count', 0):
         from src.runtime.enumeration import CourseEnumerationError
         raise CourseEnumerationError()
-

@@ -23,5 +23,3 @@ def desired_workers(seconds, blocks, rtf=DEFAULT_RTF):
             or not .25 <= rtf <= 10 or type(blocks) is not int or blocks < 0):
         raise ValueError('Invalid workload estimate')
     return min(MAX_WORKERS, blocks, max(1, math.ceil(seconds*rtf/TARGET_SECONDS))) if blocks else 0
-
-

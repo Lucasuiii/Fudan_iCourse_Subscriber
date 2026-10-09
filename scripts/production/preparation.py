@@ -437,4 +437,3 @@ def prepare(runtime):
     finally:
         if scheduler: scheduler.shutdown()
         db.conn.close()
-

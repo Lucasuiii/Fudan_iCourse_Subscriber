@@ -8,6 +8,7 @@ import unittest
 import sqlite3
 from contextlib import closing
 import tempfile
+import yaml
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -146,6 +147,40 @@ class OperationalStageTests(unittest.TestCase):
                            check=True, capture_output=True, text=True)
             self.assertFalse(inbox.parent.exists())
             self.assertEqual(keep.read_text(), 'preserve')
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def load(self, path):
+        return yaml.load((ROOT/path).read_text(), Loader=yaml.BaseLoader)
+
+    def test_stage_authorization_precedes_inference_and_private_credentials(self):
+        steps = self.load('.github/workflows/qwen_production_stage.yml')['jobs']['execute']['steps']
+        authorize = next(i for i, step in enumerate(steps) if step.get('id') == 'authorize')
+        for i, step in enumerate(steps):
+            if step.get('uses', '').startswith('./.github/actions/qwen-') or step.get('env'):
+                self.assertGreater(i, authorize)
+        execution = [step for step in steps if step.get('run') == 'python -m scripts.production_pool_stage execute']
+        self.assertEqual(len(execution), 1)
+        self.assertEqual(execution[0]['if'], "${{ steps.authorize.outcome == 'success' }}")
+        # This evaluated name is also a durable quota-recovery identity.
+        self.assertIn("stage == 'gather'", execution[0]['name'])
+        self.assertIn('Finalize through LectureRunner with saved quota', execution[0]['name'])
+        for value in execution[0]['env'].values():
+            self.assertIn("stage != 'asr'", value)
+
+    def test_finished_worker_skips_inference_without_changing_the_existing_cache(self):
+        for path, job in [('.github/workflows/qwen_production_stage.yml', 'execute'),
+                          ('.github/workflows/qwen_production_lecture.yml', 'asr')]:
+            step = next(s for s in self.load(path)['jobs'][job]['steps']
+                        if s.get('uses') == './.github/actions/qwen-asr-runtime')
+            self.assertEqual(step['with']['inference'], "${{ env.SHARD_ID != '-1' }}")
+        worker = self.load('.github/actions/qwen-asr-runtime/action.yml')['runs']['steps']
+        install = next(s for s in worker if s.get('uses') == './.github/actions/qwen-cpu-model')
+        self.assertIn("inputs.inference == 'true'", install['if'])
+        self.assertEqual(install['with']['extras'], 'true')
+        cache = next(s for s in worker if s.get('uses') == 'actions/cache@v4')
+        self.assertEqual(cache['with']['key'], 'qwen-production-asr-7278e1e-cpu-v1')
+        self.assertNotIn('if', cache)  # Cache behavior stays the same even for reused input.
 
 
 if __name__ == '__main__':

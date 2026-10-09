@@ -67,4 +67,3 @@ def validate_checkpoint_age(runtime, saved, run, slot, *, prior_only=False):
     stamp = int(runtime.read_json(saved.get('attempt.json', b'0')))
     if runtime.last_finalization_attempt(run, slot, prior_only=prior_only) > stamp:
         raise ValueError('A later finalization lost its quota checkpoint; automatic refund forbidden')
-
