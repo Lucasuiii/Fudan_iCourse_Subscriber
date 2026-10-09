@@ -2,8 +2,8 @@
 from __future__ import annotations
 import hashlib
 import math
-from scripts.qwen_sharding import validate_plan, validate_result, fingerprint
-from scripts.qwen_segmentation import deduplicated_chunk_rows
+from src.pipeline.qwen_plan import validate_plan, validate_result, fingerprint
+from src.ai.qwen_segmentation import deduplicated_chunk_rows
 
 
 def assemble_material(plan, results, *, audio_path=None, media_seconds=None):

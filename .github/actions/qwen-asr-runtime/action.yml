@@ -1,0 +1,19 @@
+name: Qwen ASR worker runtime
+description: Shared worker dependencies and cache; skip model install for completed input
+inputs:
+  inference:
+    description: Install models only when the worker has pending recognition
+    default: 'true'
+runs:
+  using: composite
+  steps:
+  - shell: bash
+    run: python -m pip install cryptography soundfile
+  - uses: ./.github/actions/qwen-cpu-model
+    if: ${{ inputs.inference == 'true' }}
+    with:
+      extras: 'true'
+  - uses: actions/cache@v4
+    with:
+      path: ~/.cache/huggingface/hub
+      key: qwen-production-asr-7278e1e-cpu-v1

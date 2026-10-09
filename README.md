@@ -166,6 +166,8 @@ GitHub Pages 部署是可选且**仅手动触发**：配置 Pages 后运行 **De
 
 ## 文档导航
 
+开发者可先阅读[处理链代码结构](docs/pipeline-architecture.md)，了解核心模块、运行入口与检查点边界。
+
 | 文档 | 内容 |
 | --- | --- |
 | [个人部署说明](PERSONAL_DEPLOYMENT.md) | Secrets、权限、私密筛选、数据操作和停用 |

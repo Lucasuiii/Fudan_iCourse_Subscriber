@@ -5,7 +5,7 @@ are incorporated into derived finalization rows, in their original time order.
 """
 import copy
 import math
-from scripts.qwen_sharding import fingerprint, validate_result
+from src.pipeline.qwen_plan import fingerprint, validate_result
 from src.ai.qwen_review_ledger import validate_ledger
 from src.ai.segment_rescue import MAX_CLOUD_SECONDS, MAX_CLOUD_CLIPS
 from src.ai.doubao_asr import rescue_intervals_pcm

@@ -42,6 +42,12 @@ name: Qwen Production Pipeline Validation
     - '.github/workflows/qwen_production_*.yml'
     - '.github/actions/qwen-pilot-runtime/**'
     - 'scripts/production_*.py'
+    - 'scripts/production/**'
+    - '.github/actions/qwen-cpu-model/**'
+    - '.github/actions/qwen-asr-runtime/**'
+    - 'src/ai/qwen_*.py'
+    - 'src/data/checkpoint_database.py'
+    - 'tests/test_refactor_boundaries.py'
     - 'scripts/asr_queue_store.py'
     - 'scripts/shared_asr_worker.py'
     - 'scripts/qwen_sharding.py'
@@ -89,6 +95,12 @@ name: Qwen Production Pipeline Validation
     - 'prompts/lecture_summary.md'
     - 'tests/test_summarizer_prompt.py'
     - 'scripts/production_*.py'
+    - 'scripts/production/**'
+    - '.github/actions/qwen-cpu-model/**'
+    - '.github/actions/qwen-asr-runtime/**'
+    - 'src/ai/qwen_*.py'
+    - 'src/data/checkpoint_database.py'
+    - 'tests/test_refactor_boundaries.py'
     - 'src/runtime/scheduler.py'
     - 'src/runtime/media_transport.py'
     - 'src/runtime/media_protocol.py'
@@ -308,6 +320,8 @@ jobs:
     - run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
+    - name: Core imports, explicit checkpoints and stable command entry
+      run: PYTHONPATH=tests python -m unittest test_refactor_boundaries
     - name: Isolated SQLite, encrypted artifacts and local Git conflict tests
       run: python -m unittest discover -s tests -p test_qwen_production_pipeline.py
     - name: Prepared audio volumes, artifact transfer and failure retention

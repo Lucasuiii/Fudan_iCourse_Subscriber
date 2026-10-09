@@ -116,7 +116,7 @@ def collect():
     print(f'Merged {received}/{len(courses)} encrypted course result(s).')
 
 
-def deliver():
+def deliver(*, database_factory=None):
     from main import _send_email, _send_failure_notices, _in_run_scope
     from src.api.emailer import Emailer
     from src.runtime.reporter import Reporter
@@ -125,7 +125,7 @@ def deliver():
     os.environ['PARALLEL_COURSE_SCOPE']='true'
     if not (config.SMTP_EMAIL and config.SMTP_PASSWORD and config.RECEIVER_EMAILS):
         raise ValueError('Mail is not configured')
-    db=Database('data/icourse.db')
+    db=(database_factory or Database)('data/icourse.db')
     try:
         reporter=Reporter()
         emailer=Emailer()
