@@ -35,7 +35,7 @@ name: Qwen Production Pipeline Validation
         type: boolean
         default: false
   push:
-    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool]
+    branches: [codex/qwen-production-pilot, codex/homework-board-evidence, codex/homework-direct-vision, codex/shared-asr-glossary, codex/vision-shared-validation, codex/prepare-checkpoint-repair, codex/prepare-acquisition-budget, codex/global-runner-pool, codex/history-refresh]
     paths:
     - '.github/workflows/check.yml'
     - '.github/workflows/parallel_pilot.yml'
