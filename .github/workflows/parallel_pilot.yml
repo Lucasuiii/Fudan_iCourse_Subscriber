@@ -53,6 +53,10 @@ name: iCourse Parallel Pilot
         default: false
   workflow_call:
     inputs:
+      historical_preview:
+        description: Read and mask exact targets from the dedicated historical caller event
+        type: boolean
+        default: false
       validation_course_id:
         type: string
         default: ''
@@ -182,6 +186,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+    - name: Mask exact historical selection before runtime setup
+      if: ${{ inputs.historical_preview }}
+      run: python -m scripts.history_refresh mask-selection
     - uses: ./.github/actions/qwen-pilot-runtime
     - name: plan
       run: python -m scripts.production_qwen plan

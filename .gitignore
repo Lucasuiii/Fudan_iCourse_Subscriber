@@ -52,3 +52,6 @@ db-viewer/
 # .github/
 # Shard inspection temp files
 _shard_inspect/
+
+# Local historical comparison keys and decrypted review files
+.history-refresh/

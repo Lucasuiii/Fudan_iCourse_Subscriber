@@ -1,0 +1,142 @@
+name: Historical Lecture Refresh
+'on':
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Preview first; apply only after decrypting and comparing the results
+        type: choice
+        options: [preview, apply]
+        default: preview
+      targets:
+        description: 'Preview only: {"course_id":"38404","lecture_ids":"123,456"}, at most five exact existing lecture IDs'
+        type: string
+        default: ''
+      recipient_public_key:
+        description: Preview only; base64 X25519 public key for private old/new comparison
+        type: string
+        default: ''
+      source_run_id:
+        description: Apply only; completed historical preview run ID
+        type: string
+        default: ''
+      approval_sha256:
+        description: Apply only; fingerprint from the reviewed encrypted comparison
+        type: string
+        default: ''
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: icourse-data-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+jobs:
+  validate:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Validate explicit operation before credentials or acquisition
+      run: python -m scripts.history_refresh inputs
+  preview:
+    needs: validate
+    if: ${{ inputs.action == 'preview' }}
+    uses: ./.github/workflows/parallel_pilot.yml
+    with:
+      historical_preview: true
+      automatic_terms: false
+      shard_mode: shared
+      publish_results: false
+      send_email: false
+      caller_holds_lock: true
+    secrets: inherit
+  review:
+    needs: [validate, preview]
+    if: ${{ inputs.action == 'preview' && needs.preview.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      QWEN_PRODUCTION_TASK: 'true'
+      RECIPIENT_PUBLIC_KEY: ${{ inputs.recipient_public_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome requests
+    - name: Validate completed stages and encrypt old/new comparison
+      run: python -m scripts.history_refresh review
+    - uses: actions/upload-artifact@v4
+      with:
+        name: icourse-history-review
+        path: |
+          ${{ runner.temp }}/qwen-shards/out/approval.enc
+          ${{ runner.temp }}/qwen-shards/out/comparison.enc
+        retention-days: 14
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      with:
+        name: icourse-history-review-audit
+        path: ${{ runner.temp }}/qwen-shards/out/history-audit.json
+        retention-days: 14
+        if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
+  apply:
+    needs: validate
+    if: ${{ inputs.action == 'apply' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DB_ENCRYPTION_KEY: ${{ secrets.DB_ENCRYPTION_KEY }}
+      COURSE_IDS: ${{ secrets.COURSE_IDS }}
+      COURSE_SESSION_EXCLUSIONS: ${{ secrets.COURSE_SESSION_EXCLUSIONS }}
+      QWEN_PRODUCTION_TASK: 'true'
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - run: python -m pip install cryptography pycryptodome requests
+    - name: Check approval, unchanged old results and stage atomic replacement
+      id: prepare
+      run: python -m scripts.history_refresh prepare-apply
+    - name: Save encrypted pre-replacement database before any publication
+      if: ${{ steps.prepare.outputs.changed == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: icourse-history-backup-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/qwen-shards/out/backup.enc
+        retention-days: 90
+        if-no-files-found: error
+    - name: Publish only if backup upload succeeded and database revision is unchanged
+      if: ${{ success() && steps.prepare.outputs.changed == 'true' }}
+      run: python -m scripts.history_refresh commit-apply
+    - uses: actions/upload-artifact@v4
+      if: ${{ success() && steps.prepare.outputs.changed == 'true' }}
+      with:
+        name: icourse-history-apply-audit
+        path: ${{ runner.temp }}/qwen-shards/out/history-audit.json
+        retention-days: 90
+        if-no-files-found: error
+    - run: python -m scripts.production_qwen clean
+      if: ${{ always() }}
