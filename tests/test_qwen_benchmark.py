@@ -6,6 +6,7 @@ from unittest.mock import Mock,patch
 
 from scripts.benchmark_qwen_asr import parse_request, auth_phase, configure_auth_session,sample_seconds,latest_request,summary_material,recognition_context,record_summary_response,selected_test_request,review_hotwords,infer_runtime_sample
 from scripts.qwen_segmentation import plan_chunks, plan_long_chunks, join_chunk_text
+from src.ai.course_glossary import course_terms
 
 
 class QwenBenchmarkTests(unittest.TestCase):
@@ -82,8 +83,13 @@ class QwenBenchmarkTests(unittest.TestCase):
                 selected_test_request()
 
     def test_probability_test_does_not_use_numerical_course_hints(self):
-        self.assertEqual(recognition_context('概率论'), '')
-        self.assertEqual(review_hotwords({'selection': {'course_title': '概率论'}}, {}), [])
+        terms = course_terms('概率论')
+        self.assertIn('条件概率', terms)
+        self.assertEqual(recognition_context('概率论'), '术语：' + '、'.join(terms))
+        self.assertEqual(review_hotwords({'selection': {'course_title': '概率论'}}, {}), terms)
+        self.assertNotIn('希尔伯特矩阵', recognition_context('概率论'))
+        self.assertEqual(recognition_context('其他课程'), '')
+        self.assertEqual(review_hotwords({'selection': {'course_title': '其他课程'}}, {}), [])
         with patch.dict('os.environ', {'LATEST_LECTURE': 'true'}):
             self.assertEqual(recognition_context(), '')
             self.assertEqual(review_hotwords({}, {}), [])
@@ -117,7 +123,7 @@ class QwenBenchmarkTests(unittest.TestCase):
 
     def test_full_runtime_uses_production_transcriber_and_retains_selected_course(self):
         t, reports=self.run_private_runtime()
-        t.set_terms.assert_called_once_with([])
+        t.set_terms.assert_called_once_with(course_terms('概率论'))
         t.transcribe_tail.assert_called_once()
         self.assertEqual(reports[-1]['source'], 'authorized_full_runtime')
         self.assertEqual(reports[-1]['selection']['course_title'], '概率论')
