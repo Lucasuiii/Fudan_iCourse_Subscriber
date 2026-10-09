@@ -23,6 +23,7 @@ from scripts.qwen_sharding import build_audio_plan, validate_plan, validate_resu
 from scripts.parallel_courses import configured_courses
 from scripts.production_db import load_remote, snapshot, lecture_snapshot, merge_lecture, publish
 from src.data.database import Database
+from src.data.checkpoint_database import CheckpointDatabase
 
 from src.runtime.audio_preparation import (PREPARE_STREAM_TIMEOUT, PREPARE_IDLE_TIMEOUT,
     collect_decode_diagnostics, validate_prepared_audio)
@@ -1002,22 +1003,6 @@ def worker():
     shards.worker()
 
 
-class CheckpointDatabase(Database):
-    """Re-encrypt committed SQLite state after each pipeline state transition."""
-    checkpoint = None
-
-    def __getattribute__(self, name):
-        value = super().__getattribute__(name)
-        if name in ('update_transcript', 'clear_transcript', 'update_summary', 'mark_processed',
-                    'clear_error', 'update_error'):
-            def mutation(*args, **kwargs):
-                result = value(*args, **kwargs)
-                if self.checkpoint: self.checkpoint()
-                return result
-            return mutation
-        return value
-
-
 def gather():
     slot = int(os.environ['COURSE_SLOT'])
     files = read_preparation(); spec = read_json(files['specification.json'])
@@ -1245,18 +1230,13 @@ def deliver():
             prior.conn.close(); current.conn.close()
     def mail_checkpoint(db):
         encode({'database.db': snapshot(db, root()/'mail-snapshot.db')}, 'mail', out('receipts.enc'))
-    original = {name: getattr(Database, name) for name in ('mark_emailed_batch', 'mark_failure_notified_batch')}
-    def wrapped(name):
-        def save(db, *args, **kwargs):
-            result = original[name](db, *args, **kwargs)
-            mail_checkpoint(db)
-            return result
-        return save
-    for name in original: setattr(Database, name, wrapped(name))
+    def mail_database(path):
+        db = CheckpointDatabase(str(path))
+        db.checkpoint = lambda: mail_checkpoint(db)
+        return db
     try:
-        send()
+        send(database_factory=mail_database)
     finally:
-        for name, method in original.items(): setattr(Database, name, method)
         db = Database(str(target))
         try:
             mail_checkpoint(db)
