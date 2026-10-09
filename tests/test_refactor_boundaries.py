@@ -1,5 +1,6 @@
 """Import and checkpoint boundaries, without models, campus access or SMTP."""
 import importlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -114,6 +115,37 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(emailed and notified)
             self.assertEqual(len(saves), 2)
             self.assertIs(Database.mark_emailed_batch, original)
+
+
+class OperationalStageTests(unittest.TestCase):
+    def test_stage_accepts_explicit_services_and_legacy_adapter_preserves_injection(self):
+        from scripts.production import planning
+        from scripts import production_qwen as pipeline
+        services = SimpleNamespace(validation_rank=lambda: 3)
+        with patch.dict(os.environ, {'VALIDATION_LECTURE_RANKS': ''}):
+            self.assertEqual(planning.validation_ranks(services), [3])
+            with patch.object(pipeline, 'validation_rank', return_value=2):
+                self.assertEqual(pipeline.validation_ranks(), [2])
+
+    def test_previous_pool_identity_uses_its_journal_before_legacy_history(self):
+        from scripts import production_qwen as pipeline
+        with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'POOL_ARTIFACTS': 'false',
+                                     'GITHUB_RUN_ID': '99'}), \
+             patch.object(pipeline, '_POOL_RUNS', {'77'}), \
+             patch('scripts.production_pool.finalization_attempt', return_value=2) as prior:
+            self.assertEqual(pipeline.last_finalization_attempt('77', 0), 2)
+        prior.assert_called_once_with('77', 0, False, allow_legacy=False)
+
+    def test_original_cli_cleans_only_its_runtime_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            keep = Path(tmp)/'unrelated.txt'; keep.write_text('preserve')
+            inbox = Path(tmp)/'qwen-shards'/'inbox'; inbox.mkdir(parents=True)
+            (inbox/'synthetic.enc').write_bytes(b'synthetic')
+            subprocess.run([sys.executable, '-m', 'scripts.production_qwen', 'clean'],
+                           cwd=ROOT, env=dict(os.environ, RUNNER_TEMP=tmp),
+                           check=True, capture_output=True, text=True)
+            self.assertFalse(inbox.parent.exists())
+            self.assertEqual(keep.read_text(), 'preserve')
 
 
 if __name__ == '__main__':
