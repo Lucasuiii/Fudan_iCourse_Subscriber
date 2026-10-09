@@ -28,8 +28,8 @@ def validate_ledger(state):
 
 
 def review_prepared(material, pages, summarizer, state, checkpoint, *, homework_ocr=None):
-    from scripts.qwen_quality import review_quality
-    from scripts.qwen_audio_alignment import align_suspects
+    from src.ai.qwen_quality import review_quality
+    from src.ai.qwen_audio_alignment import align_suspects
     from src.ai.doubao_asr import rescue_intervals_pcm
     validate_ledger(state)
     if state.get('complete'):

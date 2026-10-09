@@ -6,7 +6,7 @@ may reclaim old unfinished claims only after the prior attempt has ended.
 import copy
 import math
 import uuid
-from scripts.qwen_sharding import fingerprint, validate_plan, validate_result, validate_block_row, incomplete_row
+from src.pipeline.qwen_plan import fingerprint, validate_plan, validate_result, validate_block_row, incomplete_row
 
 
 def initial_queue(plan, completed=()):

@@ -10,7 +10,6 @@ import copy
 import math
 import os
 import re
-import statistics
 import subprocess
 import time
 import uuid
@@ -19,12 +18,8 @@ from scripts.asr_queue_store import GitHubQueueStore
 from scripts.coordination_transport import CoordinationError, diagnostic, read_json, read_with_retry
 from scripts.pool_progress import PoolProgress, show_progress
 
-MAX_TOTAL = 15
-MAX_JOBS = MAX_TOTAL - 1  # The controller itself consumes a Runner.
-MAX_COURSES = 5
-MAX_WORKERS = 6
-TARGET_SECONDS = 75 * 60
-DEFAULT_RTF = 2.0
+from src.pipeline.runner_budget import (MAX_TOTAL, MAX_JOBS, MAX_COURSES, MAX_WORKERS,
+    TARGET_SECONDS, DEFAULT_RTF, estimate_rtf, desired_workers)
 WORKFLOW = 'qwen_production_stage.yml'
 TERMINAL = {'success', 'failure', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale', 'neutral'}
 # Only explicit CLI HTTP responses proving rejection release a reservation.
@@ -93,21 +88,6 @@ def acquire_owner(state, key):
     owner = OwnerStore(key)
     try: claim_owner(state, owner)
     finally: owner.close()
-
-
-def estimate_rtf(rows, fallback=DEFAULT_RTF):
-    values = [r['decode_seconds']/(r['end']-r['start']) for r in rows
-              if isinstance(r.get('decode_seconds'), (int, float))
-              and math.isfinite(r['decode_seconds']) and r['decode_seconds'] > 0
-              and r['end'] > r['start']]
-    return min(10.0, max(.25, statistics.median(values))) if len(values) >= 5 else fallback
-
-
-def desired_workers(seconds, blocks, rtf=DEFAULT_RTF):
-    if (not math.isfinite(seconds) or seconds < 0 or not math.isfinite(rtf)
-            or not .25 <= rtf <= 10 or type(blocks) is not int or blocks < 0):
-        raise ValueError('Invalid workload estimate')
-    return min(MAX_WORKERS, blocks, max(1, math.ceil(seconds*rtf/TARGET_SECONDS))) if blocks else 0
 
 
 def initial_state(run, sha, task_count, flags):

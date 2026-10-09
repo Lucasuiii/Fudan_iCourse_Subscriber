@@ -9,12 +9,10 @@ import subprocess
 import time
 
 from src.runtime import config
-from scripts.qwen_segmentation import plan_long_chunks, deduplicated_chunk_rows
-from scripts.qwen_quality import context_echo, low_information, bounded_retry, generation_audit
+from src.ai.qwen_segmentation import plan_long_chunks, deduplicated_chunk_rows
+from src.ai.qwen_quality import context_echo, low_information, bounded_retry, generation_audit
 
-MODEL='Qwen/Qwen3-ASR-1.7B'
-REVISION='7278e1e70fe206f11671096ffdd38061171dd6e5'
-RATE=16000
+from src.ai.qwen_model import MODEL, REVISION, RATE
 NORMAL_TOKENS=2048
 UNHINTED_TOKENS=256
 RESCUE_SECONDS=600

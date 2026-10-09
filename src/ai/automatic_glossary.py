@@ -150,7 +150,7 @@ class AutomaticGlossary:
 
     def freeze(self, title, sub_id, *, lecture_date=None):
         from src.ai.course_glossary import course_terms
-        from scripts.qwen_sharding import fingerprint
+        from src.pipeline.qwen_plan import fingerprint
         lecture = self.db.get_lecture(str(sub_id)) or {}
         date = lecture_date or lecture.get('date')
         base = course_terms(title)

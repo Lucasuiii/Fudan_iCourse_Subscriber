@@ -545,8 +545,8 @@ class LectureRunner:
 
     def _refine_qwen(self, transcript, segments, ppt_pages, remaining, clips_left):
         """Exact quotes + whole-block alignment; uncertain variants stay separate."""
-        from scripts.qwen_quality import review_quality
-        from scripts.qwen_audio_alignment import align_suspects
+        from src.ai.qwen_quality import review_quality
+        from src.ai.qwen_audio_alignment import align_suspects
         if getattr(self, '_review_state', None) is not None:
             from src.ai.qwen_review_ledger import review_prepared
             material = review_prepared(self._prepared_asr, ppt_pages, self._summarizer,
